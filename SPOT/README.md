@@ -45,7 +45,7 @@ orchestration on remote *Linux environments*, *network appliances* and others, v
 
 # SPOT Documentation
 
-A QuickStart Guide and a more detailed Manual for SPOT can be found here: https://github.com/batranu79/SPOT/docs
+A QuickStart Guide and a more detailed Manual for SPOT can be found here: https://github.com/batranu79/SPOT/tree/main/docs
 
 # THIRD-PARTY
 
