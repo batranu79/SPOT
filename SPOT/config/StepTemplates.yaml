@@ -1,0 +1,183 @@
+Description: 
+RunbookSteps:
+    ##############################################
+    ### with all possible fields
+    Step1:
+        Type: PowershellCommandLocal
+        Description: 
+        Seq: 1
+        Conditions: 
+        RetryCount: 0
+        RetryDelay: 30
+        ContinueOnError: false
+        StepParameters:
+            CommandName: 
+            # CommandParameters: 
+            ExecPath: 
+            VariablesToPublish:
+        Disabled: false
+        
+    Step2:
+        Type: PowershellCommandRemote
+        Description: 
+        Seq: 2
+        Conditions: 
+        RetryCount: 0
+        RetryDelay: 30
+        ContinueOnError: false
+        StepParameters:
+            CommandName: 
+            # CommandParameters: 
+            RemoteComputer: 
+            Credential: 
+            ExecPath: 
+            VariablesToPublish:
+        Disabled: false
+
+    Step3:
+        Type: PowershellCommandRemoteSJ
+        Description: 
+        Seq: 3
+        Conditions: 
+        RetryCount: 0
+        RetryDelay: 30
+        ContinueOnError: false
+        StepParameters:
+            CommandName: 
+            # CommandParameters:
+            RemoteComputer: 
+            Credential: 
+            ExecPath: 
+            VariablesToPublish: 
+            # AsUser: 
+            # AsSystem: true
+        Disabled: false
+        
+    Step4:
+        Type: PowershellCommandRemoteWMI
+        Description: 
+        Seq: 4
+        Conditions: 
+        RetryCount: 0
+        RetryDelay: 30
+        ContinueOnError: false
+        StepParameters:
+            CommandName: 
+            # CommandParameters: 
+            RemoteComputer: 
+            Credential: 
+            ExecPath: 
+            VariablesToPublish: 
+        Disabled: false
+
+    Step5:
+        Type: PowershellCommandRemotePsExec
+        Description: 
+        Seq: 5
+        Conditions: 
+        RetryCount: 0
+        RetryDelay: 30
+        ContinueOnError: false
+        StepParameters:
+            CommandName: 
+            # CommandParameters:
+            RemoteComputer: 
+            Credential: 
+            ExecPath: 
+            VariablesToPublish: 
+            # AsSystem: true
+        Disabled: false
+
+    Step6:
+        Type: PowershellCommandRemoteOWMI
+        Description: 
+        Seq: 6
+        Conditions: 
+        RetryCount: 0
+        RetryDelay: 30
+        ContinueOnError: false
+        StepParameters:
+            CommandName: 
+            # CommandParameters: 
+            RemoteComputer: 
+            Credential: 
+            ExecPath: 
+            VariablesToPublish: 
+        Disabled: false
+        
+    TemplateRunbook6a:
+        Type: Runbook
+        Description: 
+        Seq: 10
+        Conditions: 
+        ContinueOnError: false
+        # RemoteParameters:
+        #     ExecFunction: 
+        #     RemoteComputer: 
+        #     Credential: 
+        Disabled: false
+
+    ##############################################
+    ### with minimal fields
+    Step11:
+        Type: PowershellCommandLocal
+        Seq: 11
+        StepParameters:
+            CommandName: 
+            # CommandParameters: 
+        
+    Step12:
+        Type: PowershellCommandRemote
+        Seq: 12
+        StepParameters:
+            CommandName: 
+            # CommandParameters: 
+            RemoteComputer: 
+            Credential: 
+
+    Step13:
+        Type: PowershellCommandRemoteSJ
+        Seq: 13
+        StepParameters:
+            CommandName: 
+            # CommandParameters:
+            RemoteComputer: 
+            Credential: 
+            # AsUser: 
+            # AsSystem: true
+        
+    Step14:
+        Type: PowershellCommandRemoteWMI
+        Seq: 14
+        StepParameters:
+            CommandName: 
+            # CommandParameters: 
+            RemoteComputer: 
+            Credential: 
+
+    Step15:
+        Type: PowershellCommandRemotePsExec
+        Seq: 15
+        StepParameters:
+            CommandName: 
+            # CommandParameters:
+            RemoteComputer: 
+            Credential: 
+            # AsSystem: true
+
+    Step16:
+        Type: PowershellCommandRemoteOWMI
+        Seq: 16
+        StepParameters:
+            CommandName: 
+            # CommandParameters: 
+            RemoteComputer: 
+            Credential: 
+        
+    TemplateRunbook16a:
+        Type: Runbook
+        Seq: 10
+        # RemoteParameters:
+        #     ExecFunction: 
+        #     RemoteComputer: 
+        #     Credential: 

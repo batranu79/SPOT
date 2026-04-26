@@ -1,0 +1,323 @@
+StepTypeDefinitions:
+    PowershellCommandLocal:
+        Type:   # reference to the parent property, which is the type of the runbook step (e.g. PowershellFunctionLocal)
+            _Mandatory: True
+            _Type: string
+        Disabled:   # marks the step to be skipped during runbook execution
+            _Mandatory: False
+            _Type: string
+        ContinueOnError:    # sets if the step should determine the entire runbook to stop in case of error. if not set, the default behavior is False
+            _Mandatory: False
+            _Type: string
+        Description:    # description of the step
+            _Mandatory: False
+            _Type: string 
+        Conditions:  # the conditions to be evalued to decide if the step is executed or skipped
+            _Mandatory: False
+            _Type: string[]
+        Seq:    # the sequence number in which the steps are to be executed; if the same sequence number is used multiple times, those steps are executed in parallel
+            _Mandatory: True
+            _Type: int
+        RetryCount:  # the number of retries to be attempted for this step, in case it is not successfull. if not set, the default is 0, no retries
+            _Mandatory: False
+            _Type: int
+        RetryDelay:  # the number of seconds to wait between retries, if they are configured. if not set, the default is 30 
+            _Mandatory: False
+            _Type: int
+        StepParameters: # the parameters needed for the function to be executed
+            _Mandatory: True
+            _Type: hashtable
+            
+            CommandName:   # the name of the command (script or function name) to be executed; it must be already loaded/available
+                _Mandatory: True
+                _Type: string
+            CommandParameters: # the parameters for the command to be executed
+                _Mandatory: False
+                _Type: hashtable
+            ExecPath: # the execution path for the payload script/function
+                _Mandatory: False
+                _Type: string
+            VariablesToPublish: # the variable names to be published; they can be any variables defined in the function
+                _Mandatory: False
+                _Type: string[]
+
+    PowershellCommandRemote:
+        Type:   # reference to the parent property, which is the type of the runbook step (e.g. PowershellFunctionLocal)
+            _Mandatory: True
+            _Type: string
+        Disabled:   # marks the step to be skipped during runbook execution
+            _Mandatory: False
+            _Type: string
+        ContinueOnError:    # sets if the step should determine the entire runbook to stop in case of error. if not set, the default behavior is False
+            _Mandatory: False
+            _Type: string
+        Description:    # description of the step
+            _Mandatory: False
+            _Type: string 
+        Conditions:  # the conditions to be evalued to decide if the step is executed or skipped
+            _Mandatory: False
+            _Type: string[]
+        Seq:    # the sequence number in which the steps are to be executed; if the same sequence number is used multiple times, those steps are executed in parallel
+            _Mandatory: True
+            _Type: int
+        RetryCount:  # the number of retries to be attempted for this step, in case it is not successfull. if not set, the default is 0, no retries
+            _Mandatory: False
+            _Type: int
+        RetryDelay:  # the number of seconds to wait between retries, if they are configured. if not set, the default is 30 
+            _Mandatory: False
+            _Type: int
+        StepParameters: # the parameters needed for the script to be executed
+            _Mandatory: True
+            _Type: hashtable
+            
+            CommandName: # the name of the command (script or function name) to be executed; it must be already loaded/available
+                _Mandatory: True
+                _Type: string
+            CommandParameters:   # the parameters for the command to be executed
+                _Mandatory: False
+                _Type: hashtable
+            ExecPath: # the execution path for the payload script/function
+                _Mandatory: False
+                _Type: string
+            VariablesToPublish: # the variable names to be published; they can be any variables defined in the script
+                _Mandatory: False
+                _Type: string[]
+            RemoteComputer: # the hostname or IP of the remote computer on which the script shall be executed
+                _Mandatory: True
+                _Type: string
+            Credential: # the credential to be used to connect to the remote computer
+                _Mandatory: True
+                _Type: System.Management.Automation.PSCredential
+
+    PowershellCommandRemoteSJ:
+        Type:   # reference to the parent property, which is the type of the runbook step (e.g. PowershellFunctionLocal)
+            _Mandatory: True
+            _Type: string
+        Disabled:   # marks the step to be skipped during runbook execution
+            _Mandatory: False
+            _Type: string
+        ContinueOnError:    # sets if the step should determine the entire runbook to stop in case of error. if not set, the default behavior is False
+            _Mandatory: False
+            _Type: string
+        Description:    # description of the step
+            _Mandatory: False
+            _Type: string
+        Conditions:  # the conditions to be evalued to decide if the step is executed or skipped
+            _Mandatory: False
+            _Type: string[]            
+        Seq:    # the sequence number in which the steps are to be executed; if the same sequence number is used multiple times, those steps are executed in parallel
+            _Mandatory: True
+            _Type: int
+        RetryCount:  # the number of retries to be attempted for this step, in case it is not successfull. if not set, the default is 0, no retries
+            _Mandatory: False
+            _Type: int
+        RetryDelay:  # the number of seconds to wait between retries, if they are configured. if not set, the default is 30 
+            _Mandatory: False
+            _Type: int
+        StepParameters: # the parameters needed for the script to be executed
+            _Mandatory: True
+            _Type: hashtable
+            
+            CommandName: # the name of the command (script or function name) to be executed; it must be already loaded/available
+                _Mandatory: True
+                _Type: string
+            CommandParameters:   # the parameters for the command to be executed
+                _Mandatory: False
+                _Type: hashtable
+            ExecPath: # the execution path for the payload script/function
+                _Mandatory: False
+                _Type: string
+            VariablesToPublish: # the variable names to be published; they can be any variables defined in the script
+                _Mandatory: False
+                _Type: string[]
+            RemoteComputer: # the hostname or IP of the remote computer on which the script shall be executed
+                _Mandatory: True
+                _Type: string
+            Credential: # the credential to be used to connect to the remote computer
+                _Mandatory: True
+                _Type: System.Management.Automation.PSCredential
+            AsUser: # the alternative credential to be used to execute the payload on the remote computer
+                _Mandatory: False
+                _Type: System.Management.Automation.PSCredential
+            AsSystem: # specify if the remote code is to be executed as local system on the target computer
+                _Mandatory: False
+                _Type: string
+
+    PowershellCommandRemoteWMI:
+        Type:   # reference to the parent property, which is the type of the runbook step (e.g. PowershellFunctionLocal)
+            _Mandatory: True
+            _Type: string
+        Disabled:   # marks the step to be skipped during runbook execution
+            _Mandatory: False
+            _Type: string
+        ContinueOnError:    # sets if the step should determine the entire runbook to stop in case of error. if not set, the default behavior is False
+            _Mandatory: False
+            _Type: string
+        Description:    # description of the step
+            _Mandatory: False
+            _Type: string
+        Conditions:  # the conditions to be evalued to decide if the step is executed or skipped
+            _Mandatory: False
+            _Type: string[]            
+        Seq:    # the sequence number in which the steps are to be executed; if the same sequence number is used multiple times, those steps are executed in parallel
+            _Mandatory: True
+            _Type: int
+        RetryCount:  # the number of retries to be attempted for this step, in case it is not successfull. if not set, the default is 0, no retries
+            _Mandatory: False
+            _Type: int
+        RetryDelay:  # the number of seconds to wait between retries, if they are configured. if not set, the default is 30 
+            _Mandatory: False
+            _Type: int
+        StepParameters: # the parameters needed for the script to be executed
+            _Mandatory: True
+            _Type: hashtable
+            
+            CommandName: # the name of the command (script or function name) to be executed; it must be already loaded/available
+                _Mandatory: True
+                _Type: string
+            CommandParameters:   # the parameters for the command to be executed
+                _Mandatory: False
+                _Type: hashtable
+            ExecPath: # the execution path for the payload script/function
+                _Mandatory: False
+                _Type: string
+            VariablesToPublish: # the variable names to be published; they can be any variables defined in the script
+                _Mandatory: False
+                _Type: string[]
+            RemoteComputer: # the hostname or IP of the remote computer on which the script shall be executed
+                _Mandatory: True
+                _Type: string
+            Credential: # the credential to be used to connect to the remote computer
+                _Mandatory: True
+                _Type: System.Management.Automation.PSCredential
+
+    PowershellCommandRemotePsExec:
+        Type:   # reference to the parent property, which is the type of the runbook step (e.g. PowershellFunctionLocal)
+            _Mandatory: True
+            _Type: string
+        Disabled:   # marks the step to be skipped during runbook execution
+            _Mandatory: False
+            _Type: string
+        ContinueOnError:    # sets if the step should determine the entire runbook to stop in case of error. if not set, the default behavior is False
+            _Mandatory: False
+            _Type: string
+        Description:    # description of the step
+            _Mandatory: False
+            _Type: string
+        Conditions:  # the conditions to be evalued to decide if the step is executed or skipped
+            _Mandatory: False
+            _Type: string[]            
+        Seq:    # the sequence number in which the steps are to be executed; if the same sequence number is used multiple times, those steps are executed in parallel
+            _Mandatory: True
+            _Type: int
+        RetryCount:  # the number of retries to be attempted for this step, in case it is not successfull. if not set, the default is 0, no retries
+            _Mandatory: False
+            _Type: int
+        RetryDelay:  # the number of seconds to wait between retries, if they are configured. if not set, the default is 30 
+            _Mandatory: False
+            _Type: int
+        StepParameters: # the parameters needed for the script to be executed
+            _Mandatory: True
+            _Type: hashtable
+            
+            CommandName: # the name of the command (script or function name) to be executed; it must be already loaded/available
+                _Mandatory: True
+                _Type: string
+            CommandParameters:   # the parameters for the command to be executed
+                _Mandatory: False
+                _Type: hashtable
+            ExecPath: # the execution path for the payload script/function
+                _Mandatory: False
+                _Type: string
+            VariablesToPublish: # the variable names to be published; they can be any variables defined in the script
+                _Mandatory: False
+                _Type: string[]
+            RemoteComputer: # the hostname or IP of the remote computer on which the script shall be executed
+                _Mandatory: True
+                _Type: string
+            Credential: # the credential to be used to connect to the remote computer
+                _Mandatory: True
+                _Type: System.Management.Automation.PSCredential
+            AsSystem: # specify if the remote code is to be executed as local system on the target computer
+                _Mandatory: False
+                _Type: string
+
+    PowershellCommandRemoteOWMI:
+        Type:   # reference to the parent property, which is the type of the runbook step (e.g. PowershellFunctionLocal)
+            _Mandatory: True
+            _Type: string
+        Disabled:   # marks the step to be skipped during runbook execution
+            _Mandatory: False
+            _Type: string
+        ContinueOnError:    # sets if the step should determine the entire runbook to stop in case of error. if not set, the default behavior is False
+            _Mandatory: False
+            _Type: string
+        Description:    # description of the step
+            _Mandatory: False
+            _Type: string
+        Conditions:  # the conditions to be evalued to decide if the step is executed or skipped
+            _Mandatory: False
+            _Type: string[]            
+        Seq:    # the sequence number in which the steps are to be executed; if the same sequence number is used multiple times, those steps are executed in parallel
+            _Mandatory: True
+            _Type: int
+        RetryCount:  # the number of retries to be attempted for this step, in case it is not successfull. if not set, the default is 0, no retries
+            _Mandatory: False
+            _Type: int
+        RetryDelay:  # the number of seconds to wait between retries, if they are configured. if not set, the default is 30 
+            _Mandatory: False
+            _Type: int
+        StepParameters: # the parameters needed for the script to be executed
+            _Mandatory: True
+            _Type: hashtable
+            
+            CommandName: # the name of the command (script or function name) to be executed; it must be already loaded/available
+                _Mandatory: True
+                _Type: string
+            CommandParameters:   # the parameters for the command to be executed
+                _Mandatory: False
+                _Type: hashtable
+            ExecPath: # the execution path for the payload script/function
+                _Mandatory: False
+                _Type: string
+            VariablesToPublish: # the variable names to be published; they can be any variables defined in the script
+                _Mandatory: False
+                _Type: string[]
+            RemoteComputer: # the hostname or IP of the remote computer on which the script shall be executed
+                _Mandatory: True
+                _Type: string
+            Credential: # the credential to be used to connect to the remote computer
+                _Mandatory: True
+                _Type: System.Management.Automation.PSCredential
+
+    Runbook:
+        Type:   # reference to the parent property, which is the type of the runbook step (e.g. PowershellFunctionLocal)
+            _Mandatory: True
+            _Type: string
+        Disabled:   # marks the step runbook to be skipped during runbook execution
+            _Mandatory: False
+            _Type: string
+        ContinueOnError:    # sets if the step should determine the entire (parent)runbook to stop in case of error. if not set, the default behavior is False
+            _Mandatory: False
+            _Type: string
+        Description:    # description of the step
+            _Mandatory: False
+            _Type: string
+        Conditions:  # the conditions to be evalued to decide if the step is executed or skipped
+            _Mandatory: False
+            _Type: string[]            
+        Seq:    # the sequence number in which the steps are to be executed; if the same sequence number is used multiple times, those steps are executed in parallel
+            _Mandatory: True
+            _Type: int
+        RemoteParameters: # the parameters needed for the runbook to be executed remotely
+            _Mandatory: False
+            _Type: hashtable
+            ExecFunction:  # if the runbook should be executed from a remote computer, this parameter sets the remote function to be used; default value is PowershellCommandLocal
+                _Mandatory: False
+                _Type: string
+            RemoteComputer: # the hostname or IP of the remote computer on which the script shall be executed
+                _Mandatory: False
+                _Type: string
+            Credential: # the credential to be used to connect to the remote computer
+                _Mandatory: False
+                _Type: System.Management.Automation.PSCredential
