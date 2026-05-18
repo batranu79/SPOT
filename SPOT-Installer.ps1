@@ -1,5 +1,6 @@
 # SPOT Installer Script 
 # v1.0 - 26.04.2026 - initial version
+# v1.1 - 17.05.2026 - fixed the "latest" SPOT Version detection; other minor improvements
 #
 #
 #
@@ -177,33 +178,27 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
     if ($SPOTVersion -eq "latest") {
         # detect what latest means
         $SpotURILatest = "https://www.powershellgallery.com/api/v2/package/spot"
-        try {
-            Invoke-WebRequest -Uri $SpotURILatest -MaximumRedirection 0 -ErrorAction Stop
-        }
-        catch [System.Net.WebException] {
-            $ex = $_.Exception
-            if ($ex.Response) {
-                $statusCode = [int]$ex.Response.StatusCode
-                if ($statusCode -in 301,302,303,307,308) {
-                    # this should be the redirect; getting the latest version number
-                    $SPOTVersion = ($ex.Response.Headers["Location"] -split '/')[-1]
-                    Write-Output " >> SPOT ""latest"" version translated to: $SPOTVersion."
-                }
-                else {
-                    # unsuccessful status code returned
-                    Write-Output " >> HTTP error while getting SPOT version data: $statusCode."
-                    return $false
-                }
+        $WebResponse = Invoke-WebRequest -Uri $SpotURILatest -MaximumRedirection 0 -ErrorAction SilentlyContinue
+        if ($WebResponse.StatusCode -in 301,302,303,307,308) {
+            try {
+                $PkgName = ($WebResponse.BaseResponse.Headers["Location"] -split '/')[-1]
             }
-            else {
-                # No HTTP response -> network issue
-                Write-Output " >> Network error while getting SPOT version data: $($ex.Status)."
+            catch {
+                Write-Output " >> ERROR: while parsing the HTTP response from the SPOT URL: $_"
                 return $false
             }
+            if ($PkgName -match "spot.(?<version>.*).nupkg") {
+                $SPOTVersion = $matches['version']
+                Write-Output " >> SPOT ""latest"" version translated to: $SPOTVersion"
+            }
+            else {
+                Write-Output " >> ERROR: unrecognized spot package name returned: $PkgName"
+                return $false
+            }
+            
         }
-        catch {
-            # anything unexpected
-            Write-Output " >> Unexpected error while getting SPOT version data: $_."
+        else {
+            Write-Output " >> ERROR: could not get SPOT version data automatically. Unsuccessful status code returned: $($WebResponse.StatusCode)"
             return $false
         }
     }
@@ -641,10 +636,18 @@ switch ($PSCmdlet.ParameterSetName) {
 
     'CreateSPOTPackage' {
         ####################
+        # convert the $SPOTPackagePath to  absolute
+        $SPOTPackagePath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($SPOTPackagePath)
+        
+        ####################
         # check the $SPOTPackagePath
         if (Test-Path -Path $SPOTPackagePath -PathType Leaf) {
-            Write-Output "The provided SPOT package path ""$SPOTPackagePath"" is detected. Cannot continue."
+            Write-Output "The provided SPOT package path ""$SPOTPackagePath"" already exists. Cannot continue."
             return $false
+        }
+        if ([System.IO.Path]::GetExtension($SPOTPackagePath) -ne '.zip') {
+            Write-Output " > WARNING: The provided SPOT package path ""$SPOTPackagePath"" does not have the "".zip"" extension."
+            Write-Output " >> Continuing as is. The file content will still be a zip archive."
         }
 
         ####################
@@ -664,6 +667,7 @@ switch ($PSCmdlet.ParameterSetName) {
 
         ####################
         # archive the SPOT thick package
+        Write-Output " > Creating the SPOT thick package archive at ""$SPOTPackagePath""."
         Create-Archive -TargetFolder $TempFolder.FullName -ZipPath $SPOTPackagePath
 
         ####################

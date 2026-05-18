@@ -1,5 +1,7 @@
 # SPOT Built-in Runbook Step Functions 
 # v1.0 - 26.04.2026 - initial version
+# v1.1 - 17.05.2026 - fixed the Upload-FolderSFTP recursive call; 
+#                   - updated the Execute-SSHScript and Execute-TelnetScript to work with the updated Replace-SPOTLineVars
 #
 #
 #
@@ -1007,11 +1009,7 @@ The logging is disabled and the path to the SshNet tool is specified, as they sh
                     }
                 }
                 # start the entire function again for this subfolder
-                $result = Upload-FolderContent -RemotePath "$RemotePath/$($ci.Name)" -LocalPath "$LocalPath\$($ci.Name)" -SFTPSession $SFTPSession
-                if (!$result) {
-                    Write-SPOTLog "ERROR: while uploading local folder ""$LocalPath\$($ci.Name)"": $_." -Output $false
-                    throw "Upload-FolderContents: error uploading folder!"
-                }
+                Upload-FolderContent -RemotePath "$RemotePath/$($ci.Name)" -LocalPath "$LocalPath\$($ci.Name)" -SFTPSession $SFTPSession
             }
             else {
                 # check if the file is already present remotely
@@ -1147,7 +1145,7 @@ The logging is disabled and the path to the SshNet tool is specified, as they sh
         $SshNetPath 
         )
 
-    # function to test the existence of a file path over SFTP; test result can be published in PV from this function's variable $result
+    # function to test the existence of a file path over SFTP; test result can be published in PV from this function's variable $TargetFileExists
     Write-SPOTLog "Starting function Test-FilePathSFTP with the parameters: TargetIP ""$TargetIP"", FilePath ""$FilePath"" and Credential ""$($Credential.UserName)""." -Output $OutputFlag
 
     #################################
@@ -1282,7 +1280,7 @@ The logging is disabled and the path to the SshNet tool is specified, as they sh
         $SshNetPath 
         )
 
-    # function to test the existence of a folder path over SFTP; test result can be published in PV from this function's variable $result
+    # function to test the existence of a folder path over SFTP; test result can be published in PV from this function's variable $TargetFolderExists
     Write-SPOTLog "Starting function Test-FolderPathSFTP with the parameters: TargetIP ""$TargetIP"", FolderPath ""$FolderPath"" and Credential ""$($Credential.UserName)""." -Output $OutputFlag
 
     #################################
@@ -2096,11 +2094,11 @@ Executes a SSH script on a remote device.
 
 .DESCRIPTION
 Connects to a remote device over SSH and executes a series of commands loaded from a local script file.
-Before executing the commands from the local script file, each line is checked for $OV, $SV or $PV references and they get replaced, in string only mode.
+Before executing the commands from the local script file, each line is checked for $RP, $OV, $SV or $PV references and they get replaced, in string only mode.
+For replacing the references, the respective variable collections must be specified with the RPars, SVars or PVars parameters.
+For example, if no $RP references or no #SV references are made in the SSH script, no RPars or no SVars parameters are needed or they can be specified with no value.
 Any secrets replaced in the commands may be visible in the log files.
-When executed inside SPOT locally, the $SecVars parameter is not needed as the $SVars built-in variable is available. Neither is the $SshNetPath parameter needed as it is detected.
-When executed inside SPOT remotely, the $SecVars parameter is needed as the $SVars built-in variable is not normally available. The same goes for the $SshNetPath parameter.
-To reference the entire set of $SVars for the $SecVars parameter in remote executions, the syntax "$SV:." can be used in the command parameter part in the SPOT runbook file.
+To reference the entire set of $SVars, the syntax "$SV:." can be used in the command parameter part in the SPOT runbook file. The same applies to $RP and $PV.
 To reference the SshNet tool for the $SshNetPath parameter in remote executions, the syntax "$RFO:SSHNET" can be used in the command parameter part in the SPOT runbook file.
 Each line may contain a prompt matching string at the beginning, split with "%_%" from the actual command. This is for the prompt after the command has been executed.
 The Timeout parameter is for lines without prompt matching string, to move on to reading the output after a command has been sent.
@@ -2136,8 +2134,14 @@ If this parameter is not specified or empty, the SSH key validation is not enabl
 .PARAMETER SshNetPath
 Specifies the local path to the Renci.SSHNet.dll file.
 
-.PARAMETER SecVars
+.PARAMETER SVars
 Specifies the collection of secrets from the Vault, for replacement inside script purposes.
+
+.PARAMETER PVars
+Specifies the collection of Published Variables, for replacement inside script purposes.
+
+.PARAMETER RPars
+Specifies the collection of Runbook Parameters, for replacement inside script purposes.
 
 .INPUTS
 None. You can't pipe objects to Execute-SSHScript.
@@ -2146,7 +2150,7 @@ None. You can't pipe objects to Execute-SSHScript.
 System.String. Execute-SSHScript may return only logging output. 
 
 .EXAMPLE
-PS> Execute-SSHScript -TargetIP "192.168.0.2" -ScriptPath "C:\temp\test.txt" -Timeout 10 -ExpectTimeout 20 -Credential $PSCredential -SshNetPath "C:\Program Files\WindowsPowerShell\Modules\SPOT\tools\SshNet\Renci.SshNet.dll" -SecVars $SecretVariables
+PS> Execute-SSHScript -TargetIP "192.168.0.2" -ScriptPath "C:\temp\test.txt" -Timeout 10 -ExpectTimeout 20 -Credential $PSCredential -SshNetPath "C:\Program Files\WindowsPowerShell\Modules\SPOT\tools\SshNet\Renci.SshNet.dll" -SVars $SecretVariables
 In this example the local script "C:\temp\test.txt" is executed line by line on the target device "192.168.0.2" over SSH.
 Any references to $OV, $SV or $PV inside the script are replaced by the function.
 After each line without prompt matching string, the function will wait 10 seconds for reading the output.
@@ -2205,7 +2209,15 @@ The path to the SshNet tool and the $SecVars are not specified, as it should whe
         [Parameter(Mandatory=$false)]
         [hashtable]
         # the collection of secrets from the Vault, for replacement inside script purposes
-        $SecVars 
+        $SVars, 
+        [Parameter(Mandatory=$false)]
+        [hashtable]
+        # the collection of Published Variables, for replacement inside script purposes
+        $PVars, 
+        [Parameter(Mandatory=$false)]
+        [hashtable]
+        # the collection of Runbook Parameters, for replacement inside script purposes
+        $RPars
         )
     
     # the scripts called by this function should contain on each line to be executed with prompt expect the separation string %_% followed by the expected prompt, or relevant part of the prompt
@@ -2230,26 +2242,35 @@ The path to the SshNet tool and the $SecVars are not specified, as it should whe
         throw "Execute-SSHScript: SSH port unreachable!"
     }
 
-    ######################
-    # handling the SVars now
-    if (!$SVars) {
-        # the builtin SVars variable is not available; check if it was made available using the function parameter SecVars
-        if (!$SecVars) {
-            # SecVars are not available either; cannot substitute secrets inside the SSH script
-            Write-SPOTLog "WARNING: SVars are not available in this execution. If the SSH script needs `$SV: replacements, they will fail." -DBG $true
-        }
-        else {
-            # SecVars are available; working with them
-            $SVars = $SecVars
-        }
-    }
-
     #################################
     # test/detect the local Renci.SSHNet.dll file
     $SshNetPath = Get-SPOTSshNetPath -SshNetPath $SshNetPath
     if (!$SshNetPath) {
         Write-SPOTLog "ERROR: The SshNetPath was not provided/determined/detected. Cannot continue."
         throw "Execute-SSHScript: SshNetPath not provided/determined/detected!"
+    }
+
+    ######################
+    # load the script content
+    $Script = Get-Content -Path $ScriptPath
+    
+    ######################
+    $NewScript = @()
+    # replacing any variables defined in the script content
+    foreach ($line in $Script) { 
+        # check for empty lines and skip them
+        if ($line.Trim() -eq "") {
+            continue
+        }
+        # replace any $PV or $SV or $OV variables here
+        try {
+            $line = Replace-SPOTLineVars -line $line -SVars $SVars -PVars $PVars -RPars $RPars
+        }
+        catch {
+            Write-SPOTLog "ERROR: while replacing variables for line: ""$line""."
+            throw "Execute-SSHScript: error during variable replacement!"
+        }
+        $NewScript += $line 
     }
 
     #################################
@@ -2272,35 +2293,6 @@ The path to the SshNet tool and the $SecVars are not specified, as it should whe
         throw "Execute-SSHScript: error creating the SSHStream!"
     }
 
-    ######################
-    # load the script content
-    $Script = Get-Content -Path $ScriptPath
-    
-    ######################
-    $NewScript = @()
-    # replacing any variables defined in the script content
-    foreach ($line in $Script) { 
-        # check for empty lines and skip them
-        if ($line.Trim() -eq "") {
-            continue
-        }
-        # replace any $PV or $SV or $OV variables here
-        $tmp = $null
-        $tmp = Replace-SPOTLineVars -line $line
-        if ($tmp -ne $false) {
-            $line = $tmp
-        }
-        else {
-            Write-SPOTLog "ERROR: while replacing variables for line: ""$line""."
-            $SSHStream.Dispose()
-            $SSHSession.Disconnect()
-            $SSHSession.Dispose()
-            throw "Execute-SSHScript: error during variable replacement!"
-        }
-        $NewScript += $line 
-    }
-    
-    # Write-SPOTLog "INFO: Changed ssh script: $NewScript." -DBG $true
     ######################
     # execution code
     $_spot_FullOutput = @()
@@ -2418,13 +2410,13 @@ Executes a Telnet script on a remote device.
 
 .DESCRIPTION
 Connects to a remote device over Telnet and executes a series of commands loaded from a local script file.
-Before executing the commands from the local script file, each line is checked for $Cred, $OV, $SV or $PV references and they get replaced, in string only mode.
+Before executing the commands from the local script file, each line is checked for $Cred, $RP, $OV, $SV or $PV references and they get replaced, in string only mode.
+For replacing the references, the respective variable collections must be specified with the RPars, SVars or PVars parameters.
+For example, if no $RP references or no #SV references are made in the telnet script, no RPars or no SVars parameters are needed or they can be specified with no value.
 For Telnet the authentication is performed during script execution so the username and password must be referenced inside the script with $Cred:Username and $Cred:Password.
 These will be replaced with the credential elements from the $Credential function parameter.
 Any secrets replaced in the commands may be visible in the log files.
-When executed inside SPOT locally, the $SecVars parameter is not needed as the $SVars built-in variable is available.
-When executed inside SPOT remotely, the $SecVars parameter is needed as the $SVars built-in variable is not normally available.
-To reference the entire set of $SVars for the $SecVars parameter in remote executions, the syntax "$SV:." can be used in the command parameter part in the SPOT runbook file.
+To reference the entire set of $SVars, the syntax "$SV:." can be used in the command parameter part in the SPOT runbook file. The same applies to $RP and $PV.
 Each line may contain a prompt matching string at the beginning, split with "%_%" from the actual command. This is for the prompt after the command has been executed.
 The Timeout parameter is for lines without prompt matching string, to move on to reading the output after a command has been sent.
 The ExpectTimeout parameter is for lines with prompt matching string, to move on to reading the output after a command has been sent and no prompt match has been made.
@@ -2452,8 +2444,14 @@ Specifies the number of seconds to wait for the prompt expect to match.
 .PARAMETER Credential
 Specifies the Telnet credential to be used for remote authentication.
 
-.PARAMETER SecVars
+.PARAMETER SVars
 Specifies the collection of secrets from the Vault, for replacement inside script purposes.
+
+.PARAMETER PVars
+Specifies the collection of Published Variables, for replacement inside script purposes.
+
+.PARAMETER RPars
+Specifies the collection of Runbook Parameters, for replacement inside script purposes.
 
 .INPUTS
 None. You can't pipe objects to Execute-TelnetScript.
@@ -2512,7 +2510,15 @@ The path to the $SecVars is not specified, as it should when executing locally i
         [Parameter(Mandatory=$false)]
         [hashtable]
         # the collection of secrets from the Vault, for replacement inside script purposes
-        $SecVars 
+        $SVars, 
+        [Parameter(Mandatory=$false)]
+        [hashtable]
+        # the collection of Published Variables, for replacement inside script purposes
+        $PVars, 
+        [Parameter(Mandatory=$false)]
+        [hashtable]
+        # the collection of Runbook Parameters, for replacement inside script purposes
+        $RPars 
         )
 
 
@@ -2535,49 +2541,33 @@ The path to the $SecVars is not specified, as it should when executing locally i
     }
     
     ######################
-    # handling the SVars now
-    if (!$SVars) {
-        # the builtin SVars variable is not available; check if it was made available using the function parameter SecVars
-        if (!$SecVars) {
-            # SecVars are not available either; cannot substitute secrets inside the Telnet script
-            Write-SPOTLog "WARNING: SVars are not available in this execution. If the Telnet script needs `$SV: replacements, they will fail."
-        }
-        else {
-            # SecVars are available; working with them
-            $SVars = $SecVars
-        }
-    }
-
-    ######################
     # loading the script content
     $Script = Get-Content -Path $ScriptPath
     $NewScript = @()
     # replacing any variables defined in the script content
     foreach ($line in $Script) { 
-        
+        ###################################
         # check for empty lines and skip them
         if ($line.Trim() -eq "") {
             continue
         }
 
+        ###################################
         # replace line Creds here 
-        $tmp = $null
-        $tmp = Replace-SPOTLineCred -line $line -Credential $Credential
-        if ($tmp -ne $false) {
-            $line = $tmp
+        try {
+            $line = Replace-SPOTLineCred -line $line -Credential $Credential
         }
-        else {
+        catch {
             Write-SPOTLog "ERROR: while replacing credentials for line: ""$line"" ."
             throw "Execute-TelnetScript: error during variable replacement!"
         }
-
-        # replace any $PV or $SV or $OV variables here
-        $tmp = $null
-        $tmp = Replace-SPOTLineVars -line $line
-        if ($tmp -ne $false) {
-            $line = $tmp
+        
+        ###################################
+        # replace any $PV or $SV or $OV or $RP variables here
+        try {
+            $line = Replace-SPOTLineVars -line $line -SVars $SVars -PVars $PVars -RPars $RPars
         }
-        else {
+        catch {
             Write-SPOTLog "ERROR: while replacing variables for line: ""$line"" ."
             throw "Execute-TelnetScript: error during variable replacement!"
         }

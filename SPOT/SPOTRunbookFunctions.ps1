@@ -1,5 +1,8 @@
 # SPOT Runbook Functions file
 # v1.0 - 26.04.2026 - initial version
+# v1.1 - 17.05.2026 - added the RunbookParameters functionality in Execute-SPOTRunbook, Replace-SPOTLineVars
+#                   - introduced Replace-SPOTVarsInRunbookJIT and Replace-SPOTVarsInRunbookStepJIT (just in time replace functions)
+#                   - fixed single line step output in PowershellCommandRemote reported as failed
 # 
 #
 #
@@ -71,8 +74,8 @@ function PowershellCommandRemote {
         _spot_PublishedData = $null
     }
     ######
-    if ($VariablesToPublish) {
-        # add the PublishedData variable only if needed to publish something (otherwise it is a waste of resources)
+    if ($VariablesToPublish -or ($CommandName -in ("Execute-SSHScript","Execute-TelnetScript"))) {
+        # add the PublishedData variable only if needed to publish something or for commands that need it (otherwise it is a waste of resources)
         $ParamList._spot_PublishedData = $PublishedData
     }
 
@@ -290,20 +293,18 @@ $PCROutput = Invoke-Command -Session $session -ScriptBlock {
         $_spot_TWOE = $false
     }
 
+    ######################################
+    if ($_spot_TWOE) {
+        # signal the execution as successful unless there was a terminating error
+        $_spot_Output += $true
+    }
+    else {
+        # signal the execution as failed because there was a terminating error
+        $_spot_Output += $false
+    }
+
     # return the results
     $_spot_Output
-}
-
-######################################
-# get the TWOE value from remote
-$TWOE = [bool](Invoke-Command -Session $session -ScriptBlock {$_spot_TWOE})
-if ($TWOE) {
-    # signal the execution as successful unless there was a terminating error
-    $PCROutput += $true
-}
-else {
-    # signal the execution as failed because there was a terminating error
-    $PCROutput += $false
 }
 
 ######################################
@@ -855,8 +856,8 @@ function PowershellCommandRemoteSJ {
         _spot_PublishedData = $null
     }
     ######
-    if ($VariablesToPublish) {
-        # add the PublishedData variable only if needed to publish something (otherwise it is a waste of resources)
+    if ($VariablesToPublish -or ($CommandName -in ("Execute-SSHScript","Execute-TelnetScript"))) {
+        # add the PublishedData variable only if needed to publish something or for commands that need it (otherwise it is a waste of resources)
         $ParamList._spot_PublishedData = $PublishedData
     }
 
@@ -1316,8 +1317,8 @@ function PowershellCommandRemoteWMI {
         _spot_PublishedData = $null
     }
     ######
-    if ($VariablesToPublish) {
-        # add the PublishedData variable only if needed to publish something (otherwise it is a waste of resources)
+    if ($VariablesToPublish -or ($CommandName -in ("Execute-SSHScript","Execute-TelnetScript"))) {
+        # add the PublishedData variable only if needed to publish something or for commands that need it (otherwise it is a waste of resources)
         $ParamList._spot_PublishedData = $PublishedData
     }
 
@@ -1784,8 +1785,8 @@ function PowershellCommandRemotePsExec {
         _spot_PublishedData = $null
     }
     ######
-    if ($VariablesToPublish) {
-        # add the PublishedData variable only if needed to publish something (otherwise it is a waste of resources)
+    if ($VariablesToPublish -or ($CommandName -in ("Execute-SSHScript","Execute-TelnetScript"))) {
+        # add the PublishedData variable only if needed to publish something or for commands that need it (otherwise it is a waste of resources)
         $ParamList._spot_PublishedData = $PublishedData
     }
 
@@ -2273,8 +2274,8 @@ function PowershellCommandRemoteOWMI {
         _spot_PublishedData = $null
     }
     ######
-    if ($VariablesToPublish) {
-        # add the PublishedData variable only if needed to publish something (otherwise it is a waste of resources)
+    if ($VariablesToPublish -or ($CommandName -in ("Execute-SSHScript","Execute-TelnetScript"))) {
+        # add the PublishedData variable only if needed to publish something or for commands that need it (otherwise it is a waste of resources)
         $ParamList._spot_PublishedData = $PublishedData
     }
 
@@ -2660,6 +2661,7 @@ function Execute-SPOTRunbook {
 
         $CurrentSteps = $null
         $CurrentJbs = $null
+        $ReplaceResult = $null
 
         # get all steps with the current sequence number
         $CurrentSteps = $RunbookSteps.Where({$_.Seq -eq $Seq})
@@ -2675,15 +2677,15 @@ function Execute-SPOTRunbook {
                 continue
             }
             #####
-            # replace the PVs
+            # replace the remaining references (mainly PVs)
             if ($Step.GetType().Name -eq "Runbook") {
-                Write-SPOTLog "__##__Replacing PVs for Runbook ""$($Step.Name)"" with GUID ""$($Step.GUID)"".__##__" -DBG $true
-                Replace-SPOTRunbookPV -Runbook $Step | Out-Null
+                Write-SPOTLog "__##__Replacing remaining SPOT Vars for Runbook ""$($Step.Name)"" with GUID ""$($Step.GUID)"".__##__" -DBG $true
+                Replace-SPOTVarsInRunbookJIT -Runbook $Step
                 Write-SPOTLog "__##__Checking conditions for Runbook ""$($Step.Name)"" with GUID ""$($Step.GUID)"".__##__" -DBG $true
             }
             else {
-                Write-SPOTLog "__##__Replacing PVs for RunbookStep ""$($Step.Name)"" with GUID ""$($Step.GUID)"".__##__" -DBG $true
-                Replace-SPOTPV -RunbookStep $Step | Out-Null
+                Write-SPOTLog "__##__Replacing remaining SPOT Vars for RunbookStep ""$($Step.Name)"" with GUID ""$($Step.GUID)"".__##__" -DBG $true
+                Replace-SPOTVarsInRunbookStepJIT -RunbookStep $Step -RbParameters $Runbook.RunbookParameters
                 Write-SPOTLog "__##__Checking conditions for RunbookStep ""$($Step.Name)"" with GUID ""$($Step.GUID)"".__##__" -DBG $true
             }
             #####
@@ -3092,49 +3094,50 @@ function Start-SPOTRunbookStepJob {
     if ($RunbookStep.Function -like "*Remote*") {
         # for remotely executed functions, we might have RFO references; managing here the archive creation and propagation to all step jobs (single or multiple)
         foreach ($cpar in $($RunbookStep.FunctionParams.CommandParameters.Keys)) {
-            if ($RunbookStep.FunctionParams.CommandParameters.$cpar.GetType().Name -ne "String") {
-                continue
-            }
-            if ($RunbookStep.FunctionParams.CommandParameters.$cpar.StartsWith('$RFO:')) {
-                # get the local item path
-                if (($RunbookStep.FunctionParams.CommandParameters.$cpar -split ":")[1] -eq "SSHNET") {
-                    $LocalFilePath = $OrchVars._SshNetPath
+            if ($RunbookStep.FunctionParams.CommandParameters.$cpar) {
+                if ($RunbookStep.FunctionParams.CommandParameters.$cpar.GetType().Name -eq "String") {
+                    if ($RunbookStep.FunctionParams.CommandParameters.$cpar.StartsWith('$RFO:')) {
+                        # get the local item path
+                        if (($RunbookStep.FunctionParams.CommandParameters.$cpar -split ":")[1] -eq "SSHNET") {
+                            $LocalFilePath = $OrchVars._SshNetPath
+                        }
+                        elseif (($RunbookStep.FunctionParams.CommandParameters.$cpar -split ":")[1] -eq "PSEXEC") {
+                            $LocalFilePath = $OrchVars._PsExecPath
+                        }
+                        else {
+                            $LocalFilePath = "$($OrchVars._ProjectPath)\$(($RunbookStep.FunctionParams.CommandParameters.$cpar -split ":")[1])"
+                        }
+                        # get the local item
+                        $LocalItem = Get-Item -Path $LocalFilePath -ErrorAction SilentlyContinue
+                        if (!($LocalItem)) {
+                            Write-SPOTLog "ERROR: a local RFO referenced item, for the parameter ""$cpar"", was not found. Skipping RFO folder management for this step. The current step ""$($RunbookStep.Name)"" will fail." -Output $false
+                            continue
+                        }
+                        # manage the archive of the folder
+                        Write-SPOTLog "__#__The referenced item for parameter $cpar and value ""$($RunbookStep.FunctionParams.CommandParameters.$cpar)"" was detected as ""$($LocalItem.FullName)"". Managing the local folder archiving.__#__" -Output $false -DBG $true
+                        if ($LocalItem.Attributes -eq "Directory") {
+                            # there is no file referenced, just the folder, so use it as is
+                            $LocalFolder = $LocalItem
+                            $ReferencedFileName = "."
+                        }
+                        else {
+                            # there is a file referenced, so use the parent folder
+                            $LocalFolder = Get-Item -Path (Split-Path -Path $LocalItem.FullName -Parent) -ErrorAction SilentlyContinue
+                            $ReferencedFileName = $LocalItem.Name
+                        }
+                        $UniqueID = $([guid]::NewGuid().ToString())
+                        $TLFP = [System.IO.Path]::GetTempFileName()
+                        Remove-Item -Path $TLFP -Confirm:$false -Force -ErrorAction SilentlyContinue
+                        Create-SPOTArchive -TargetFolder $LocalFolder.FullName -ZipPath $TLFP
+                        # add the RFOMap entry now
+                        $OrchVars._RFOMap.$UniqueID = @{
+                            LocalArchivePath = $TLFP
+                            ReferencedFileName = $ReferencedFileName
+                        }
+                        # leave the same UniqueID inside the original command parameter
+                        $RunbookStep.FunctionParams.CommandParameters.$cpar = '$RFO:'+$UniqueID
+                    }
                 }
-                elseif (($RunbookStep.FunctionParams.CommandParameters.$cpar -split ":")[1] -eq "PSEXEC") {
-                    $LocalFilePath = $OrchVars._PsExecPath
-                }
-                else {
-                    $LocalFilePath = "$($OrchVars._ProjectPath)\$(($RunbookStep.FunctionParams.CommandParameters.$cpar -split ":")[1])"
-                }
-                # get the local item
-                $LocalItem = Get-Item -Path $LocalFilePath -ErrorAction SilentlyContinue
-                if (!($LocalItem)) {
-                    Write-SPOTLog "ERROR: a local RFO referenced item, for the parameter ""$cpar"", was not found. Skipping RFO folder management for this step. The current step ""$($RunbookStep.Name)"" will fail." -Output $false
-                    continue
-                }
-                # manage the archive of the folder
-                Write-SPOTLog "__#__The referenced item for parameter $cpar and value ""$($RunbookStep.FunctionParams.CommandParameters.$cpar)"" was detected as ""$($LocalItem.FullName)"". Managing the local folder archiving.__#__" -Output $false -DBG $true
-                if ($LocalItem.Attributes -eq "Directory") {
-                    # there is no file referenced, just the folder, so use it as is
-                    $LocalFolder = $LocalItem
-                    $ReferencedFileName = "."
-                }
-                else {
-                    # there is a file referenced, so use the parent folder
-                    $LocalFolder = Get-Item -Path (Split-Path -Path $LocalItem.FullName -Parent) -ErrorAction SilentlyContinue
-                    $ReferencedFileName = $LocalItem.Name
-                }
-                $UniqueID = $([guid]::NewGuid().ToString())
-                $TLFP = [System.IO.Path]::GetTempFileName()
-                Remove-Item -Path $TLFP -Confirm:$false -Force -ErrorAction SilentlyContinue
-                Create-SPOTArchive -TargetFolder $LocalFolder.FullName -ZipPath $TLFP
-                # add the RFOMap entry now
-                $OrchVars._RFOMap.$UniqueID = @{
-                    LocalArchivePath = $TLFP
-                    ReferencedFileName = $ReferencedFileName
-                }
-                # leave the same UniqueID inside the original command parameter
-                $RunbookStep.FunctionParams.CommandParameters.$cpar = '$RFO:'+$UniqueID
             }
         }
     }
@@ -3649,15 +3652,16 @@ function Get-SPOTRunbookStepJobResult {
                     if ($RunbookStep.Function -like "*Remote*") {
                         # for remotely executed functions, we might have RFO references; if yes, cleaning them up
                         foreach ($cpar in $($RunbookStep.FunctionParams.CommandParameters.Keys)) {
-                            if ($RunbookStep.FunctionParams.CommandParameters.$cpar.GetType().Name -ne "String") {
-                                continue
-                            }
-                            if ($RunbookStep.FunctionParams.CommandParameters.$cpar.StartsWith('$RFO:')) {
-                                Write-SPOTLog "__#__For RunbookStep ""$($RunbookStep.Name)"" the command parameter ""$cpar"" has a RFO reference. Cleaning up.__#__" -DBG $true
-                                $UniqueID = ($RunbookStep.FunctionParams.CommandParameters.$cpar -split ":")[1]
-                                $LocalArchivePath = $OrchVars._RFOMap.$UniqueID.LocalArchivePath
-                                if ($LocalArchivePath) {
-                                    Remove-Item -Path $LocalArchivePath -Confirm:$false -Force -ErrorAction SilentlyContinue
+                            if ($RunbookStep.FunctionParams.CommandParameters.$cpar) {
+                                if ($RunbookStep.FunctionParams.CommandParameters.$cpar.GetType().Name -eq "String") {
+                                    if ($RunbookStep.FunctionParams.CommandParameters.$cpar.StartsWith('$RFO:')) {
+                                        Write-SPOTLog "__#__For RunbookStep ""$($RunbookStep.Name)"" the command parameter ""$cpar"" has a RFO reference. Cleaning up.__#__" -DBG $true
+                                        $UniqueID = ($RunbookStep.FunctionParams.CommandParameters.$cpar -split ":")[1]
+                                        $LocalArchivePath = $OrchVars._RFOMap.$UniqueID.LocalArchivePath
+                                        if ($LocalArchivePath) {
+                                            Remove-Item -Path $LocalArchivePath -Confirm:$false -Force -ErrorAction SilentlyContinue
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -3807,149 +3811,317 @@ function Finalize-SPOTRemoteExecution {
 } # enf of Finalize-SPOTRemoteExecution function
 
 ######################################################################################################################
-function Replace-SPOTPV {
+function Replace-SPOTVarsInRunbookStepJIT {
 Param (
     [Parameter(Mandatory=$true)]
     [ValidateNotNullOrEmpty()]
     [Object]
-    # the runbookstep to parse and replace primarily with PVs (Published Variables) but also with other Vs (if they are intertwined)
-    $RunbookStep 
+    # the runbookstep to process
+    $RunbookStep,
+    [Parameter(Mandatory=$true)]
+    [AllowNull()]
+    [hashtable]
+    # the runbook parameters hashtable to be used for RP references
+    $RbParameters
     )
 
-    # if the detected parameters refer only a single PV, it is replaced normally
-    # if the detected paremeters refer any Vs it must be a line string and no variables have been replaced until now; trying to replace all of them, if any
-
+    # targeting PV references, mixed string references involving all reference types, all "." references
     #####
-    Write-SPOTLog "Starting function Replace-SPOTPV for Runbook/Step ""$($RunbookStep.Name)""." -Output $false -DBG $true
+    Write-SPOTLog "Starting function Replace-SPOTVarsInRunbookStepJIT for RunbookStep ""$($RunbookStep.Name)""." -Output $false -DBG $true
 
+    # conditions
     if ($RunbookStep.Conditions) {
         $RunbookStep.Conditions = $RunbookStep.Conditions | foreach {
             if ($_.GetType().Name -eq "String") {
                 if ($_.StartsWith("`$PV:")) {
-                    Write-SPOTLog "Evaluating the RunbookStep ""$($RunbookStep.Name)"" Condition ""$_"" >>>" -Output $false -DBG $true
+                    Write-SPOTLog " > Evaluating the RunbookStep ""$($RunbookStep.Name)"" Condition ""$_"" >>>" -Output $false -DBG $true
                     $condition = $_
-                    $condition = $PublishedData[($condition -split ":")[1]]
+                    try {
+                        $condition = Invoke-Expression -Command "`$PublishedData.$(($condition -split ":")[1].Trim())"
+                    }
+                    catch {
+                        Write-SPOTLog " >> ERROR: while replacing PV in Condition: $_." -Output $false
+                        throw "Replace-SPOTVarsInRunbookStepJIT: error processing condition!"
+                    }
                     $_ = $condition
-                    Write-SPOTLog ">>> Condition value evaluated to ""$_""." -Output $false -DBG $true
+                    Write-SPOTLog " >> INFO: Condition value evaluated to ""$_""." -Output $false -DBG $true
                 }
                 $_
             }
             else {
-                Write-SPOTLog "WARNING: Current Condition ""$_"" for the RunbookStep ""$($RunbookStep.Name)"" is not of type string! Leaving it unchanged." -Output $false
+                Write-SPOTLog " >> WARNING: Current Condition ""$_"" for the RunbookStep ""$($RunbookStep.Name)"" is not of type string! Leaving it unchanged." -Output $false
                 $_
             }
         }
     }
 
+    # step parameters
     foreach ($i in $($RunbookStep.FunctionParams.Keys)) {
-        $VariableName = $null
+        $Splitted = $null
         if ($RunbookStep.FunctionParams.$i) { 
             if (($RunbookStep.FunctionParams.$i).GetType().Name -eq "String") {
-                if (($RunbookStep.FunctionParams.$i).StartsWith("`$PV:") -and ($RunbookStep.FunctionParams.$i -split ":").Count -eq 2) {
-                    # one single PV referenced for the entire parameter (using simple replacement)
-                    Write-SPOTLog "Current step parameter ""$i"" detected as single reference and starting with `$PV." -Output $false -DBG $true
-                    if (($RunbookStep.FunctionParams.$i -split ":")[1] -eq '.') {
-                        # entire $PV referenced 
-                        $RunbookStep.FunctionParams.$i = $PublishedData
-                    }
-                    else {
-                        $RunbookStep.FunctionParams.$i = $PublishedData[($RunbookStep.FunctionParams.$i -split ":")[1]]
+                $Splitted = ($RunbookStep.FunctionParams.$i).Trim() -split ":"
+                if ($Splitted.Count -eq 2) {
+                    # a single reference is present
+                    switch ($Splitted[0]) {
+                        #########################################
+                        "`$RP" {
+                            # single reference to RP (only the '.' reference expected)
+                            Write-SPOTLog " > Current step parameter ""$i"" detected as single `$RP reference." -Output $false -DBG $true
+                            if ($Splitted[1] -eq '.') {
+                                Write-SPOTLog " >> INFO: The current RP reference is for the full RP, as expected at this point. Replacing it now." -Output $false -DBG $true
+                                $RunbookStep.FunctionParams.$i = $RbParameters
+                            }
+                            else {
+                                Write-SPOTLog " >> ERROR: The current RP reference is not ""."", as expected at this point, but rather ""$($RunbookStep.FunctionParams.$i)"". Something went wrong. Cannot continue." -Output $false
+                                throw "Replace-SPOTVarsInRunbookStepJIT: error processing step parameter!"
+                            }
+                        }
+                        #########################################
+                        "`$SV" {
+                            # single reference to SV (only the '.' reference expected)
+                            Write-SPOTLog " > Current step parameter ""$i"" detected as single `$SV reference." -Output $false -DBG $true
+                            if ($Splitted[1] -eq '.') {
+                                Write-SPOTLog " >> INFO: The current SV reference is for the full SV, as expected at this point. Replacing it now." -Output $false -DBG $true
+                                $RunbookStep.FunctionParams.$i = $SVars
+                            }
+                            else {
+                                Write-SPOTLog " >> ERROR: The current SV reference is not ""."", as expected at this point, but rather ""$($RunbookStep.FunctionParams.$i)"". Something went wrong. Cannot continue." -Output $false
+                                throw "Replace-SPOTVarsInRunbookStepJIT: error processing step parameter!"
+                            }
+                        }
+                        #########################################
+                        "`$PV" {
+                            # single reference to PV
+                            Write-SPOTLog " > Current step parameter ""$i"" detected as single `$PV reference." -Output $false -DBG $true
+                            if ($Splitted[1] -eq '.') {
+                                Write-SPOTLog " >> INFO: The current PV reference is for the full PV. Replacing it now." -Output $false -DBG $true
+                                $RunbookStep.FunctionParams.$i = $PublishedData
+                            }
+                            else {
+                                try {
+                                    $RunbookStep.FunctionParams.$i = Invoke-Expression -Command "`$PublishedData.$($Splitted[1])"
+                                }
+                                catch {
+                                    Write-SPOTLog " >> ERROR: while replacing PV in step parameter: $_." -Output $false
+                                    throw "Replace-SPOTVarsInRunbookStepJIT: error processing step parameter!"
+                                }
+                                Write-SPOTLog " >> INFO: Changed the step parameter ""$i"" into ""$($RunbookStep.FunctionParams.$i)""." -Output $false -DBG $true
+                            }
+                        }
                     }
                 }
-                elseif (($RunbookStep.FunctionParams.$i).Contains("`$PV:") -or ($RunbookStep.FunctionParams.$i).Contains("`$OV:") -or ($RunbookStep.FunctionParams.$i).Contains("`$SV:")) {
-                    # potentially several Vs referenced in the parameter string (using replace-spotlinevars)
-                    Write-SPOTLog "Changing the RunbookStep ""$($RunbookStep.Name)"" step parameter ""$i"" as string line >>>" -Output $false -DBG $true
-                    $RunbookStep.FunctionParams.$i = Replace-SPOTLineVars -line $RunbookStep.FunctionParams.$i
-                    Write-SPOTLog ">>> Into: ""$($RunbookStep.FunctionParams.$i)""." -Output $false -DBG $true
+                # if mixed string reference is present, process it
+                if ($RunbookStep.FunctionParams.$i) {
+                    if (($RunbookStep.FunctionParams.$i).GetType().Name -eq "String") {
+                        if (($RunbookStep.FunctionParams.$i).Contains("`$RP:") -or `
+                            ($RunbookStep.FunctionParams.$i).Contains("`$OV:") -or `
+                            ($RunbookStep.FunctionParams.$i).Contains("`$SV:") -or `
+                            ($RunbookStep.FunctionParams.$i).Contains("`$PV:")) {
+                            Write-SPOTLog " > Changing the RunbookStep ""$($RunbookStep.Name)"" step parameter ""$i"" as string line >>>" -Output $false -DBG $true
+                            $RunbookStep.FunctionParams.$i = Replace-SPOTLineVars -line $RunbookStep.FunctionParams.$i -SVars $SVars -PVars $PublishedData -RPars $RbParameters
+                            Write-SPOTLog " >> Into: ""$($RunbookStep.FunctionParams.$i)""." -Output $false -DBG $true
+                        }
+                    }
                 }
             }
         }
     }
 
+    # command parameters (for runbookSteps)
     foreach ($i in $($RunbookStep.FunctionParams.CommandParameters.Keys)) {
-        $VariableName = $null
+        $Splitted = $null
         if ($RunbookStep.FunctionParams.CommandParameters.$i) { 
             if (($RunbookStep.FunctionParams.CommandParameters.$i).GetType().Name -eq "String") {
-                if (($RunbookStep.FunctionParams.CommandParameters.$i).StartsWith("`$PV:") -and ($RunbookStep.FunctionParams.CommandParameters.$i -split ":").Count -eq 2) {
-                    # one single PV referenced for the entire parameter (using simple replacement)
-                    Write-SPOTLog "Current command parameter ""$i"" detected as single reference and starting with `$PV." -Output $false -DBG $true
-                    if (($RunbookStep.FunctionParams.CommandParameters.$i -split ":")[1] -eq '.') {
-                        # entire $PV referenced 
-                        $RunbookStep.FunctionParams.CommandParameters.$i = $PublishedData
-                    }
-                    else {
-                        $RunbookStep.FunctionParams.CommandParameters.$i = $PublishedData[($RunbookStep.FunctionParams.CommandParameters.$i -split ":")[1]]
+                $Splitted = ($RunbookStep.FunctionParams.CommandParameters.$i).Trim() -split ":"
+                if ($Splitted.Count -eq 2) {
+                    # a single reference is present
+                    switch ($Splitted[0]) {
+                        #########################################
+                        "`$RP" {
+                            # single reference to RP (only the '.' reference expected)
+                            Write-SPOTLog " > Current command parameter ""$i"" detected as single `$RP reference." -Output $false -DBG $true
+                            if ($Splitted[1] -eq '.') {
+                                Write-SPOTLog " >> INFO: The current RP reference is for the full RP, as expected at this point. Replacing it now." -Output $false -DBG $true
+                                $RunbookStep.FunctionParams.CommandParameters.$i = $RbParameters
+                            }
+                            else {
+                                Write-SPOTLog " >> ERROR: The current RP reference is not ""."", as expected at this point, but rather ""$($RunbookStep.FunctionParams.CommandParameters.$i)"". Something went wrong. Cannot continue." -Output $false
+                                throw "Replace-SPOTVarsInRunbookStepJIT: error processing command parameter!"
+                            }
+                        }
+                        #########################################
+                        "`$SV" {
+                            # single reference to SV (only the '.' reference expected)
+                            Write-SPOTLog " > Current command parameter ""$i"" detected as single `$SV reference." -Output $false -DBG $true
+                            if ($Splitted[1] -eq '.') {
+                                Write-SPOTLog " >> INFO: The current SV reference is for the full SV, as expected at this point. Replacing it now." -Output $false -DBG $true
+                                $RunbookStep.FunctionParams.CommandParameters.$i = $SVars
+                            }
+                            else {
+                                Write-SPOTLog " >> ERROR: The current SV reference is not ""."", as expected at this point, but rather ""$($RunbookStep.FunctionParams.CommandParameters.$i)"". Something went wrong. Cannot continue." -Output $false
+                                throw "Replace-SPOTVarsInRunbookStepJIT: error processing command parameter!"
+                            }
+                        }
+                        #########################################
+                        "`$PV" {
+                            # single reference to PV
+                            Write-SPOTLog " > Current command parameter ""$i"" detected as single `$PV reference." -Output $false -DBG $true
+                            if ($Splitted[1] -eq '.') {
+                                Write-SPOTLog " >> INFO: The current PV reference is for the full PV. Replacing it now." -Output $false -DBG $true
+                                $RunbookStep.FunctionParams.CommandParameters.$i = $PublishedData
+                            }
+                            else {
+                                try {
+                                    $RunbookStep.FunctionParams.CommandParameters.$i = Invoke-Expression -Command "`$PublishedData.$($Splitted[1])"
+                                }
+                                catch {
+                                    Write-SPOTLog " >> ERROR: while replacing PV in command parameter: $_." -Output $false
+                                    throw "Replace-SPOTVarsInRunbookStepJIT: error processing command parameter!"
+                                }
+                                Write-SPOTLog " >> INFO: Changed the command parameter ""$i"" into ""$($RunbookStep.FunctionParams.CommandParameters.$i)""." -Output $false -DBG $true
+                            }
+                        }
                     }
                 }
-                elseif (($RunbookStep.FunctionParams.CommandParameters.$i).Contains("`$PV:") -or ($RunbookStep.FunctionParams.CommandParameters.$i).Contains("`$OV:") -or ($RunbookStep.FunctionParams.CommandParameters.$i).Contains("`$SV:")) {
-                    # potentially several Vs referenced in the parameter string (using replace-spotlinevars)
-                    Write-SPOTLog "Changing the RunbookStep ""$($RunbookStep.Name)"" command parameter ""$i"" as string line >>>" -Output $false -DBG $true
-                    $RunbookStep.FunctionParams.CommandParameters.$i = Replace-SPOTLineVars -line $RunbookStep.FunctionParams.CommandParameters.$i
-                    Write-SPOTLog ">>> Into: ""$($RunbookStep.FunctionParams.CommandParameters.$i)""." -Output $false -DBG $true
+                # if mixed string reference is present, process it
+                if ($RunbookStep.FunctionParams.CommandParameters.$i) {
+                    if (($RunbookStep.FunctionParams.CommandParameters.$i).GetType().Name -eq "String") {
+                        if (($RunbookStep.FunctionParams.CommandParameters.$i).Contains("`$RP:") -or `
+                            ($RunbookStep.FunctionParams.CommandParameters.$i).Contains("`$OV:") -or `
+                            ($RunbookStep.FunctionParams.CommandParameters.$i).Contains("`$SV:") -or `
+                            ($RunbookStep.FunctionParams.CommandParameters.$i).Contains("`$PV:")) {
+                            Write-SPOTLog " > Changing the RunbookStep ""$($RunbookStep.Name)"" command parameter ""$i"" as string line >>>" -Output $false -DBG $true
+                            $RunbookStep.FunctionParams.CommandParameters.$i = Replace-SPOTLineVars -line $RunbookStep.FunctionParams.CommandParameters.$i -SVars $SVars -PVars $PublishedData -RPars $RbParameters
+                            Write-SPOTLog " >> Into: ""$($RunbookStep.FunctionParams.CommandParameters.$i)""." -Output $false -DBG $true
+                        }
+                    }
                 }
             }
         }
     }
 
     #####
-    Write-SPOTLog "Finished function Replace-SPOTPV for Runbook/Step ""$($RunbookStep.Name)""." -Output $false -DBG $true
+    Write-SPOTLog "Finished function Replace-SPOTVarsInRunbookStepJIT for RunbookStep ""$($RunbookStep.Name)""." -Output $false -DBG $true
 
-} # end of Replace-SPOTPV function
+} # end of Replace-SPOTVarsInRunbookStepJIT function
 
 ######################################################################################################################
-function Replace-SPOTRunbookPV {
+function Replace-SPOTVarsInRunbookJIT {
 Param (
     [Parameter(Mandatory=$true)]
     [ValidateNotNullOrEmpty()]
     [Object]
-    # the runbook object to parse and replace with PVs (Published Variables) inside conditions or remote parameters
+    # the runbook object to process
     $Runbook 
     )
 
     #####
-    Write-SPOTLog "Starting function Replace-SPOTRunbookPV for Runbook ""$($Runbook.Name)""." -Output $false -DBG $true
+    Write-SPOTLog "Starting function Replace-SPOTVarsInRunbookJIT for Runbook ""$($Runbook.Name)""." -Output $false -DBG $true
 
-    # conditions
+    # conditions (no RP references should be here at this point so starting with conditions)
     if ($Runbook.Conditions) {
         $Runbook.Conditions = $Runbook.Conditions | foreach {
             if ($_.GetType().Name -eq "String") {
                 if ($_.StartsWith("`$PV:")) {
-                    Write-SPOTLog "Evaluating the runbook ""$($Runbook.Name)"" Condition ""$_"" >>>" -Output $false -DBG $true
+                    Write-SPOTLog " > Evaluating the Runbook ""$($Runbook.Name)"" Condition ""$_"" >>>" -Output $false -DBG $true
                     $condition = $_
-                    $condition = $PublishedData[($condition -split ":")[1]]
+                    try {
+                        $condition = Invoke-Expression -Command "`$PublishedData.$(($condition -split ":")[1].Trim())"
+                    }
+                    catch {
+                        Write-SPOTLog " >> ERROR: while replacing PV in Condition: $_." -Output $false
+                        throw "Replace-SPOTVarsInRunbookJIT: error processing condition!"
+                    }
                     $_ = $condition
-                    Write-SPOTLog ">>> Condition value evaluated to ""$_""." -Output $false -DBG $true
+                    Write-SPOTLog " >> INFO: Condition value evaluated to ""$_""." -Output $false -DBG $true
                 }
                 $_
             }
             else {
-                Write-SPOTLog "WARNING: Current Condition ""$_"" for the runbook ""$($Runbook.Name)"" is not of type string! Leaving it unchanged." -Output $false
+                Write-SPOTLog " >> WARNING: Current Condition ""$_"" for the Runbook ""$($Runbook.Name)"" is not of type string! Leaving it unchanged." -Output $false
                 $_
+            }
+        }
+    }
+
+    # runbook parameters
+    if ($Runbook.RunbookParameters) {
+        foreach ($i in $($Runbook.RunbookParameters.Keys)) {
+            $Splitted = $null
+            if ($Runbook.RunbookParameters.$i) { 
+                if (($Runbook.RunbookParameters.$i).GetType().Name -eq "String") {
+                    $Splitted = ($Runbook.RunbookParameters.$i).Trim() -split ":"
+                    if ($Splitted.Count -eq 2) {
+                        # a single reference is present
+                        switch ($Splitted[0]) {
+                            #########################################
+                            "`$SV" {
+                                # single reference to SV (only the '.' reference expected)
+                                Write-SPOTLog " > Current runbook parameter ""$i"" detected as single `$SV reference." -Output $false -DBG $true
+                                if ($Splitted[1] -eq '.') {
+                                    Write-SPOTLog " >> INFO: The current SV reference is for the full SV, as expected at this point. Replacing it now." -Output $false -DBG $true
+                                    $Runbook.RunbookParameters.$i = $SVars
+                                }
+                                else {
+                                    Write-SPOTLog " >> ERROR: The current SV reference is not ""."", as expected at this point, but rather ""$($Runbook.RunbookParameters.$i)"". Something went wrong. Cannot continue." -Output $false
+                                    throw "Replace-SPOTVarsInRunbookJIT: error processing runbook parameter!"
+                                }
+                            }
+                            #########################################
+                            "`$PV" {
+                                # single reference to PV
+                                Write-SPOTLog " > Current runbook parameter ""$i"" detected as single `$PV reference." -Output $false -DBG $true
+                                if ($Splitted[1] -eq '.') {
+                                    Write-SPOTLog " >> INFO: The current PV reference is for the full PV. Replacing it now." -Output $false -DBG $true
+                                    $Runbook.RunbookParameters.$i = $PublishedData
+                                }
+                                else {
+                                    try {
+                                        $Runbook.RunbookParameters.$i = Invoke-Expression -Command "`$PublishedData.$($Splitted[1])"
+                                    }
+                                    catch {
+                                        Write-SPOTLog " >> ERROR: while replacing PV in runbook parameter: $_." -Output $false
+                                        throw "Replace-SPOTVarsInRunbookJIT: error processing runbook parameter!"
+                                    }
+                                    Write-SPOTLog " >> INFO: Changed the runbook parameter ""$i"" into ""$($Runbook.RunbookParameters.$i)""." -Output $false -DBG $true
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
 
     # remote parameters
     if ($Runbook.RemoteParams) {
-        foreach ($i in $Runbook.RemoteParams.Keys) {
+        foreach ($i in $($Runbook.RemoteParams.Keys)) {
+            $Splitted = $null
             if ($Runbook.RemoteParams.$i) { 
                 if (($Runbook.RemoteParams.$i).GetType().Name -eq "String") {
-                    if (($Runbook.RemoteParams.$i).StartsWith("`$PV:") -and ($Runbook.RemoteParams.$i -split ":").Count -eq 2) {
-                        # one single PV referenced for the entire parameter (using simple replacement)
-                        Write-SPOTLog "Current remote parameter ""$i"" detected as single reference and starting with `$PV." -Output $false -DBG $true
-                        if (($Runbook.RemoteParams.$i -split ":")[1] -eq '.') {
-                            # entire $PV referenced 
-                            $Runbook.RemoteParams.$i = $PublishedData
+                    $Splitted = ($Runbook.RemoteParams.$i).Trim() -split ":"
+                    if ($Splitted.Count -eq 2) {
+                        # a single reference is present
+                        if ($Splitted[0] -eq "`$PV") {
+                            #########################################
+                            # single reference to PV
+                            Write-SPOTLog " > Current remote parameter ""$i"" detected as single `$PV reference." -Output $false -DBG $true
+                            if ($Splitted[1] -eq '.') {
+                                Write-SPOTLog " >> INFO: The current PV reference is for the full PV. Replacing it now." -Output $false -DBG $true
+                                $Runbook.RemoteParams.$i = $PublishedData
+                            }
+                            else {
+                                try {
+                                    $Runbook.RemoteParams.$i = Invoke-Expression -Command "`$PublishedData.$($Splitted[1])"
+                                }
+                                catch {
+                                    Write-SPOTLog " >> ERROR: while replacing PV in remote parameter: $_." -Output $false
+                                    throw "Replace-SPOTVarsInRunbookJIT: error processing remote parameter!"
+                                }
+                                Write-SPOTLog " >> INFO: Changed the remote parameter ""$i"" into ""$($Runbook.RemoteParams.$i)""." -Output $false -DBG $true
+                            }
                         }
-                        else {
-                            $Runbook.RemoteParams.$i = $PublishedData[($Runbook.RemoteParams.$i -split ":")[1]]
-                        }
-                    }
-                    elseif (($Runbook.RemoteParams.$i).Contains("`$PV:")) {
-                        # potentially several Vs referenced in the parameter string (using replace-spotlinevars)
-                        Write-SPOTLog "Changing the runbook ""$($Runbook.Name)"" Remote Parameter ""$i"" as string line >>>" -Output $false -DBG $true
-                        $Runbook.RemoteParams.$i = Replace-SPOTLineVars -line $Runbook.RemoteParams.$i
-                        Write-SPOTLog ">>> Into: ""$($Runbook.RemoteParams.$i)""." -Output $false -DBG $true
                     }
                 }
             }
@@ -3957,9 +4129,9 @@ Param (
     }
 
     #####
-    Write-SPOTLog "Finished function Replace-SPOTRunbookPV for Runbook ""$($Runbook.Name)""." -Output $false -DBG $true
+    Write-SPOTLog "Finished function Replace-SPOTVarsInRunbookJIT for Runbook ""$($Runbook.Name)""." -Output $false -DBG $true
 
-} # end of Replace-SPOTRunbookPV function
+} # end of Replace-SPOTVarsInRunbookJIT function
 
 ######################################################################################################################
 function Replace-SPOTLineVars {
@@ -3967,21 +4139,42 @@ function Replace-SPOTLineVars {
     [Parameter(Mandatory=$true)]
     [string]
     # the string to parse and replace with any variables (Published Variables, Secrets or Orch Variables; no credential objects to be referenced as this is a string replace)
-    $line 
+    $line,
+    [Parameter(Mandatory=$false)]
+    [AllowNull()]
+    [hashtable]
+    # the secret variables to be used for replacing the references
+    $SVars,
+    [Parameter(Mandatory=$false)]
+    [AllowNull()]
+    [hashtable]
+    # the published variables to be used for replacing the references
+    $PVars,
+    [Parameter(Mandatory=$false)]
+    [AllowNull()]
+    [hashtable]
+    # the runbook parameters to be used for replacing RP references
+    $RPars
     )
 
     #####
     Write-SPOTLog "Starting function Replace-SPOTLineVars for line ""$line""." -Output $false -DBG $true
 
-    if ($line.Contains('$PV:') -or $line.Contains('$SV:') -or $line.Contains('$OV:')) {
-        Write-SPOTLog "Replace-SPOTLineVars: Current line ""$line"" detected with a Variable keyword." -Output $false -DBG $true
+    if ($line.Contains('$PV:') -or $line.Contains('$SV:') -or $line.Contains('$OV:') -or $line.Contains('$RP:')) {
+        Write-SPOTLog "INFO: Current line ""$line"" detected with a Variable keyword." -Output $false -DBG $true
         $NewLine = @()
         foreach ($word in ($line -split '\s+')) {
-            if ($word.Contains("`$PV:") -or $word.Contains('$SV:') -or $word.Contains('$OV:')) {
+            if ($word.Contains("`$PV:") -or $word.Contains('$SV:') -or $word.Contains('$OV:') -or $word.Contains('$RP:')) {
                 ###################################################
                 # set array of occurences
                 $occurences = @()
                 $SortedOccurences = @()
+                # start at position 0, for RP
+                $offset = 0
+                while (($pos = $word.IndexOf('$RP:',$offset)) -ne -1) {
+                    $occurences += New-Object -TypeName psobject -Property @{Pos=$pos; Type="RP"}
+                    $offset = $pos + 4
+                }
                 # start at position 0, for PV
                 $offset = 0
                 while (($pos = $word.IndexOf('$PV:',$offset)) -ne -1) {
@@ -4000,7 +4193,7 @@ function Replace-SPOTLineVars {
                     $occurences += New-Object -TypeName psobject -Property @{Pos=$pos; Type="OV"}
                     $offset = $pos + 4
                 }
-                # fort ascending based on positions order
+                # sort ascending based on positions order
                 $SortedOccurences = @($occurences | Sort-Object -Property Pos)
 
                 ###################################################
@@ -4018,6 +4211,7 @@ function Replace-SPOTLineVars {
                     }
                     # get the ending delimiter index, if it exists
                     switch ($SortedOccurences[$i].Type) {
+                        "RP" { $LastPos = $word.Substring($SortedOccurences[$i].Pos,$EndPos-$SortedOccurences[$i].Pos+1).IndexOf(':$RP') }
                         "PV" { $LastPos = $word.Substring($SortedOccurences[$i].Pos,$EndPos-$SortedOccurences[$i].Pos+1).IndexOf(':$PV') }
                         "SV" { $LastPos = $word.Substring($SortedOccurences[$i].Pos,$EndPos-$SortedOccurences[$i].Pos+1).IndexOf(':$SV') }
                         "OV" { $LastPos = $word.Substring($SortedOccurences[$i].Pos,$EndPos-$SortedOccurences[$i].Pos+1).IndexOf(':$OV') }
@@ -4047,55 +4241,83 @@ function Replace-SPOTLineVars {
                 foreach ($var in $SortedOccurences) {
                     $ReplaceString = $null
                     switch ($var.Type) {
-                        "PV" { 
-                            Write-SPOTLog "Replace-SPOTLineVars: Trying to replace PV: ""$($var.VarName)""." -Output $false -DBG $true
+                        "RP" { 
+                            if (!$RPars) {
+                                Write-SPOTLog "ERROR: a Runbook Parameter reference was detected, ""$($var.VarName)"", but no Runbook Parameters were made available. Cannot continue." -Output $false
+                                throw "Replace-SPOTLineVars: error replacing RP!"
+                            }
+                            Write-SPOTLog "INFO: Trying to replace RP: ""$($var.VarName)""." -Output $false -DBG $true
                             try {
-                                $ReplaceString = Invoke-Expression -Command "`$PublishedData.$($var.VarName)"
+                                $ReplaceString = Invoke-Expression -Command "`$RPars.$($var.VarName)"
                             }
                             catch {
-                                Write-SPOTLog "Replace-SPOTLineVars: ERROR: while trying to replace the Published Variable ""$($var.VarName)"": $_." -Output $false
-                                return $false
+                                Write-SPOTLog "ERROR: while trying to replace the Runbook Parameter ""$($var.VarName)"": $_." -Output $false
+                                throw "Replace-SPOTLineVars: error replacing RP!"
+                            }
+                            if ($ReplaceString.GetType().Name -ne "String") {
+                                Write-SPOTLog "ERROR: the referenced Runbook Parameter ""$($var.VarName)"" is not a String. Only String objects are supported in this function." -Output $false
+                                throw "Replace-SPOTLineVars: error replacing RP!"
+                            }
+                            $word = $word.Remove($var.Pos, ($var.LastPosition-$var.Pos+1)).Insert($var.Pos,$ReplaceString)
+                        }
+                        "PV" { 
+                            if (!$PVars) {
+                                Write-SPOTLog "ERROR: a Published Variable reference was detected, ""$($var.VarName)"", but no Published Variables were made available. Cannot continue." -Output $false
+                                throw "Replace-SPOTLineVars: error replacing PV!"
+                            }
+                            Write-SPOTLog "INFO: Trying to replace PV: ""$($var.VarName)""." -Output $false -DBG $true
+                            try {
+                                $ReplaceString = Invoke-Expression -Command "`$PVars.$($var.VarName)"
+                            }
+                            catch {
+                                Write-SPOTLog "ERROR: while trying to replace the Published Variable ""$($var.VarName)"": $_." -Output $false
+                                throw "Replace-SPOTLineVars: error replacing PV!"
+                            }
+                            if ($ReplaceString.GetType().Name -ne "String") {
+                                Write-SPOTLog "ERROR: the referenced Published Variable ""$($var.VarName)"" is not a String. Only String objects are supported in this function." -Output $false
+                                throw "Replace-SPOTLineVars: error replacing PV!"
                             }
                             $word = $word.Remove($var.Pos, ($var.LastPosition-$var.Pos+1)).Insert($var.Pos,$ReplaceString)
                         }
                         "SV" {
-                            Write-SPOTLog "Replace-SPOTLineVars: Trying to replace SV: ""$($var.VarName)""." -Output $false -DBG $true
-                            if ($SVars){
-                                # SVars are available; performing the replacement
-                                if ($SVars[$var.VarName]) {
-                                    if ($SVars[$var.VarName].GetType().Name -ne "SecureString") {
-                                        Write-SPOTLog "Replace-SPOTLineVars: ERROR: the referenced secret ""$($var.VarName)"" is not a SecureString. Only SecureString objects are supported in this function." -Output $false
-                                        return $false
-                                    }
-                                    else {
-                                        $ReplaceString = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($SVars[$var.VarName]))
-                                    }
+                            if (!$SVars) {
+                                Write-SPOTLog "ERROR: a Secret Variable reference was detected, ""$($var.VarName)"", but no Secret Variables were made available. Cannot continue." -Output $false
+                                throw "Replace-SPOTLineVars: error replacing SV!"
+                            }
+                            Write-SPOTLog "INFO: Trying to replace SV: ""$($var.VarName)""." -Output $false -DBG $true
+                            if ($SVars[$var.VarName]) {
+                                if ($SVars[$var.VarName].GetType().Name -ne "SecureString") {
+                                    Write-SPOTLog "ERROR: the referenced secret ""$($var.VarName)"" is not a SecureString. Only SecureString objects are supported in this function." -Output $false
+                                    throw "Replace-SPOTLineVars: error replacing SV!"
                                 }
                                 else {
-                                    Write-SPOTLog "Replace-SPOTLineVars: ERROR: the referenced secret ""$($var.VarName)"" does not exist in the SVars." -Output $false
-                                    return $false
-                                }
-                                if (!$ReplaceString) {
-                                    Write-SPOTLog "Replace-SPOTLineVars: ERROR: Replacing the script line with Secret Vault Variable ""$($var.VarName)"". The secret could not be found or had a null value." -Output $false
-                                    return $false
-                                }
-                                else {
-                                    $word = $word.Remove($var.Pos, ($var.LastPosition-$var.Pos+1)).Insert($var.Pos,$ReplaceString)
+                                    $ReplaceString = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($SVars[$var.VarName]))
                                 }
                             }
                             else {
-                                Write-SPOTLog "Replace-SPOTLineVars: ERROR: the script has `$SV: references but the SVars are not available in this context. Cannot continue." -Output $false
-                                return $false
+                                Write-SPOTLog "ERROR: the referenced secret ""$($var.VarName)"" does not exist in the SVars." -Output $false
+                                throw "Replace-SPOTLineVars: error replacing SV!"
+                            }
+                            if (!$ReplaceString) {
+                                Write-SPOTLog "ERROR: the secret has a null value." -Output $false
+                                throw "Replace-SPOTLineVars: error replacing SV!"
+                            }
+                            else {
+                                $word = $word.Remove($var.Pos, ($var.LastPosition-$var.Pos+1)).Insert($var.Pos,$ReplaceString)
                             }
                         }
                         "OV" { 
-                            Write-SPOTLog "Replace-SPOTLineVars: Trying to replace OV: ""$($var.VarName)""." -Output $false -DBG $true
+                            Write-SPOTLog "INFO: Trying to replace OV: ""$($var.VarName)""." -Output $false -DBG $true
                             try {
                                 $ReplaceString = Invoke-Expression -Command "`$OrchVars.$($var.VarName)"
                             }
                             catch {
-                                Write-SPOTLog "Replace-SPOTLineVars: ERROR: while trying to replace the Orch Variable ""$($var.VarName)"": $_." -Output $false
-                                return $false
+                                Write-SPOTLog "ERROR: while trying to replace the Orch Variable ""$($var.VarName)"": $_." -Output $false
+                                throw "Replace-SPOTLineVars: error replacing OV!"
+                            }
+                            if ($ReplaceString.GetType().Name -ne "String") {
+                                Write-SPOTLog "ERROR: the referenced OrchVar ""$($var.VarName)"" is not a String. Only String objects are supported in this function." -Output $false
+                                throw "Replace-SPOTLineVars: error replacing OV!"
                             }
                             $word = $word.Remove($var.Pos, ($var.LastPosition-$var.Pos+1)).Insert($var.Pos,$ReplaceString)
                         }
@@ -4105,7 +4327,7 @@ function Replace-SPOTLineVars {
             $NewLine += $word
         }
         $line = $NewLine -join " "
-        Write-SPOTLog "Replace-SPOTLineVars: >>> Current line changed to: ""$line""." -Output $false -DBG $true
+        Write-SPOTLog "INFO: Current line changed to: ""$line""." -Output $false -DBG $true
     }
     
     #####
@@ -4305,6 +4527,7 @@ function Decompose-SPOTRunbook {
     $CloneRunbook.Disabled          = $InputRunbook.Disabled
     $CloneRunbook.ContinueOnError   = $InputRunbook.ContinueOnError
     $CloneRunbook.ArtefactsPath     = $InputRunbook.ArtefactsPath
+    $CloneRunbook.RunbookParameters = Decompose-SPOTHashTableVariable -InputVariable $InputRunbook.RunbookParameters -Key $Key
 
     # force stop flag to false
     $CloneRunbook.StopFlag = $false
@@ -4385,6 +4608,7 @@ function Recompose-SPOTRunbook {
     $Runbook.Disabled          = $DRunbook.Disabled
     $Runbook.ContinueOnError   = $DRunbook.ContinueOnError
     $Runbook.ArtefactsPath     = $DRunbook.ArtefactsPath
+    $Runbook.RunbookParameters = Recompose-SPOTHashTableVariable -InputVariable $DRunbook.RunbookParameters -Key $Key
 
     # force stop flag to false
     $Runbook.StopFlag          = $false
@@ -5703,7 +5927,7 @@ function Create-SPOTRsPool {
     }
     $sessionState.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new("_spot_FunctionNames", $RSPoolFunctions.Name, "Injected Step Functions"))
     $sessionState.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new("OrchVars", $OrchVars, "SPOT Orchestration Variables"))
-    $sessionState.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new("SVars", $SVars, "SPOT Secret Variables"))
+    #$sessionState.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new("SVars", $SVars, "SPOT Secret Variables"))
 
     ######################################
     # create runspace pool and open
@@ -5780,7 +6004,7 @@ function Create-SPOTRunbookStepRunspace {
     }
     $sessionState.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new("_spot_FunctionNames", $RunspaceFunctions.Name, "Injected Step Functions"))
     $sessionState.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new("OrchVars", $OrchVars, "SPOT Orchestration Variables"))
-    $sessionState.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new("SVars", $SVars, "SPOT Secret Variables"))
+    #$sessionState.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new("SVars", $SVars, "SPOT Secret Variables"))
 
     ######################################
     # create runspace and open

@@ -1,4 +1,7 @@
-Description: 
+Description:
+RunbookParameters:
+    Par1: one
+    Par2: two 
 RunbookSteps:
     ##############################################
     ### with all possible fields
@@ -115,6 +118,9 @@ RunbookSteps:
         #     ExecFunction: 
         #     RemoteComputer: 
         #     Credential: 
+        # RunbookParameters:
+        #     Par1: one
+        #     Par2: two
         Disabled: false
 
     ##############################################

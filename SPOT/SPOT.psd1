@@ -1,5 +1,6 @@
 # Module manifest for module 'SPOT'
 # v1.0 - 26.04.2026 - initial version
+# v1.1 - 17.05.2026 - new released version
 #
 #
 #
@@ -11,10 +12,10 @@
     RootModule = 'SPOT.psm1'
 
     # Version number of this module.
-    ModuleVersion = '1.0.6'
+    ModuleVersion = '1.1.0'
 
     # ID used to uniquely identify this module
-    GUID = '89e24a1f-8002-47bf-b97f-e49ea97cce04'
+    GUID = '6665598f-1fdb-4f8f-88d1-b349e495c04c'
 
     # Author of this module
     Author = 'Narcis-Ionel Mircea'

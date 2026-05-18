@@ -1,5 +1,8 @@
 # SPOT Main Module File
 # v1.0 - 26.04.2026 - initial version
+# v1.1 - 17.05.2026 - fixed Load-SPOTRunbook to return only $false when encountering an error loading the yaml file
+#                   - added the RunbookParameters functionality in Load-SPOTRunbook and changed Replace Vars and Validate functions
+#                   - enhancements in the Start-SPOTGUI function
 #
 #
 #
@@ -20,6 +23,11 @@ function Load-SPOTRunbook {
         # The name of the yaml runbook file
         $Name, 
         [Parameter(Mandatory=$false)]
+        [AllowNull()]
+        [hashtable]
+        # The set of (parent) Runbook Parameters to be used in case child runbooks are loaded
+        $RunbookParameters, 
+        [Parameter(Mandatory=$false)]
         [ValidateNotNullOrEmpty()]
         [string]
         # the folder path where the output files and other relevant files will be saved right after execution
@@ -28,7 +36,12 @@ function Load-SPOTRunbook {
         [ValidateNotNullOrEmpty()]
         [int]
         # The sequence number to use, when called from another runbook
-        $Seq = 0 
+        $Seq = 0,
+        [Parameter(Mandatory=$false)]
+        [ValidateNotNullOrEmpty()]
+        [bool]
+        # The enable/disable configuration from or assigned from the parent runbook
+        $Disabled = $false
         )
     
     #######
@@ -37,20 +50,7 @@ function Load-SPOTRunbook {
     ###################################################
     # loads the runbooks from yaml text file and makes sure that all mandatory parameters for each step type are defined
     
-    # set the maximum file length in MB for referenced files/folders
-    $ReferencedFileSizeLimit = 10
-
-    # handle the artefacts path
-    if ($ArtefactsPath.EndsWith($Name)) {
-        $CurrentArtefactsPath = $ArtefactsPath
-    }
-    else {
-        $CurrentArtefactsPath = "$ArtefactsPath\$Name"
-    }
-
-    # define the runbook files path to the project path
-    $RunbooksPath = "$($OrchVars._ProjectPath)\__SPOT_Runbooks"
-
+    #########################
     # test the yaml module
     Import-Module -Name powershell-yaml -ErrorAction SilentlyContinue
     if (!(Get-Module -Name powershell-yaml)) {
@@ -65,23 +65,38 @@ function Load-SPOTRunbook {
         return $false
     }
 
+    #########################
+    # set the maximum file length in MB for referenced files/folders
+    $ReferencedFileSizeLimit = 10
+
+    # define the runbook files path to the project path
+    $RunbooksPath = "$($OrchVars._ProjectPath)\__SPOT_Runbooks"
+
+    # handle the artefacts path
+    if ($ArtefactsPath.EndsWith($Name)) {
+        $CurrentArtefactsPath = $ArtefactsPath
+    }
+    else {
+        $CurrentArtefactsPath = "$ArtefactsPath\$Name"
+    }
+
+    #########################
     # get the runbook ConfigFile
     $ConfigFile = Get-ChildItem -Path $RunbooksPath -Recurse | Where {$_.BaseName -eq $Name} | Select-Object -First 1
-
     # test the runbook ConfigFile existence
     if (!$ConfigFile) {
         Write-SPOTLog "ERROR: The configuration file ""$Name"" could not be detected in the default folder: ""$RunbooksPath"". Cannot continue." -Output $false
         return $false
     }
 
+    #########################
     # load runbook parameters from the runbook ConfigFile
     $yaml = Get-Content -Path $ConfigFile.FullName -raw
-
     try {
         $RunbookConfig = ConvertFrom-Yaml $yaml
     }
     catch {
-        Write-SPOTLog "ERROR: while loading the yaml file ""$($ConfigFile.FullName)"". Error details: $_."
+        Write-SPOTLog "ERROR: while loading the yaml file ""$($ConfigFile.FullName)"": $_." -Output $false
         return $false
     }
 
@@ -101,271 +116,191 @@ function Load-SPOTRunbook {
         Write-SPOTLog "For runbook ""$Name"", the TotalStepCount variable was found already defined ""$TotalStepCount"". The current runbook must be a child runbook." -Output $false -DBG $true
     }
 
-    
     ###################################################
-    # build runbook steps
+    # build the runbook first with minimal attributes and populate it with additional attributes from the current runbook yaml
+    $Runbook = [Runbook]::new($Name,$Seq)
+    $Runbook.Description       = $RunbookConfig.Description
+    $Runbook.Conditions        = $RunbookConfig.Conditions
+    $Runbook.RemoteParams      = $RunbookConfig.RemoteParameters
+    $Runbook.ContinueOnError   = $RunbookConfig.ContinueOnError
+    $Runbook.RunbookParameters = $RunbookConfig.RunbookParameters
+    $Runbook.ArtefactsPath     = $CurrentArtefactsPath
+    if ($Disabled -or $RunbookConfig.Disabled) { $Runbook.Disabled = $true}
+    
+    
+    if ($Runbook.RunbookParameters) {
+        # runbook parameters were defined inside the current Runbook yaml and imported in the current runbook object
+        if ($RunbookParameters) {
+            # runbook parameters for this runbook are assigned also from the parent Runbook via RunbookStep attributes
+            foreach ($RPar in $($Runbook.RunbookParameters.Keys)) {
+                if ($RunbookParameters.$RPar) {
+                    # the same parameter name is also assigned from the parent runbook; use that instead
+                    $Runbook.RunbookParameters.$RPar = $RunbookParameters.$RPar
+                    Write-SPOTLog "INFO: For runbook ""$Name"", the Runbook Parameter ""$RPar"" was overwritten from the calling RunbookStep runbook parameters." -Output $false -DBG $true
+                }
+            }
+        }
+    }
+
+    # replace the the O&S&R Vars in the current runbook
+    if (!(Replace-SPOTVarsInRunbook -Runbook $Runbook)) {
+        Write-SPOTLog "ERROR: for the current runbook ""$($Runbook.Name)"" the O&S&R Vars could not be replaced properly. Cannot continue." -Output $false
+        return $false
+    }
+
+    # validate the remote parameters configured from the current runbook yaml
+    if (!(Validate-SPOTRunbookRemoteParameters -Runbook $Runbook)) {
+        Write-SPOTLog "ERROR: for the current Runbook ""$($Runbook.Name)"" the remote parameters are not validated. Cannot continue." -Output $false
+        return $false
+    }
+
+    ###################################################
+    # build the runbook steps
     $RunbookSteps = @()
     foreach ($RunbookStepConfig in $RunbookConfig.RunbookSteps.GetEnumerator()) {
-
         $RunbookStep = $null
         # generate the runbook or runbookstep object
         if ($RunbookStepConfig.Value.Type -eq "Runbook") {
-            $RunbookStepRunbookGUID = Load-SPOTRunbook -Name $RunbookStepConfig.Name -Seq $RunbookStepConfig.Value.Seq -ArtefactsPath "$CurrentArtefactsPath\$($RunbookStepConfig.Name)"
-            if ($RunbookStepRunbookGUID -eq $false) {
-                Write-SPOTLog "ERROR: The Runbook ""$($RunbookStepConfig.Name)"" could not be loaded. Cannot continue." -Output $false
-                return $false
+            
+            $RunbookGUID = $null
+            $RunbookDisable = $false
+
+            ######################
+            # handle referencing Runbook Parameters by using the current runbook parameters from parent runbook parameters defined above
+            foreach ($i in $($RunbookStepConfig.Value.RunbookParameters.Keys)) {
+                if ($RunbookStepConfig.Value.RunbookParameters.$i) { 
+                    if (($RunbookStepConfig.Value.RunbookParameters.$i).GetType().Name -eq "String") {
+                        if (($RunbookStepConfig.Value.RunbookParameters.$i).StartsWith("`$RP:") -and (($RunbookStepConfig.Value.RunbookParameters.$i -split ":").Count -eq 2)) {
+                            Write-SPOTLog "Current child runbook parameter ""$i"" detected as single reference and starting with `$RP." -Output $false -DBG $true
+                            try {
+                                $RunbookStepConfig.Value.RunbookParameters.$i = Invoke-Expression -Command "`$Runbook.RunbookParameters.$(($RunbookStepConfig.Value.RunbookParameters.$i -split ":")[1])"
+                            }
+                            catch {
+                                Write-SPOTLog ">>> ERROR while replacing RP in child Runbook Parameter: $_." -Output $false
+                                return $false
+                            }
+                            Write-SPOTLog "Changed the child runbook parameter ""$i"" into ""$($RunbookStepConfig.Value.RunbookParameters.$i)""." -Output $false -DBG $true
+                        }
+                        elseif (($RunbookStepConfig.Value.RunbookParameters.$i).StartsWith("`$RP:") -and (($RunbookStepConfig.Value.RunbookParameters.$i -split ":").Count -gt 2)) {
+                            Write-SPOTLog "ERROR: Non-single RP reference detected in child Runbook Parameter ""$($RunbookStepConfig.Value.RunbookParameters.$i)"". Mixed string references are not allowed in Runbook Parameters. Cannot continue." -Output $false
+                            return $false
+                        }
+                    }
+                }
             }
 
-            # get the current step, which is a runbook, from the synched all runbooks hashtable variable
-            $RunbookStep = $AllRunbooks.$($RunbookStepRunbookGUID)
-
-            # handle the extra attribute ContinueOnError, for it to be present on all child runbooks
-            if ($RunbookStepConfig.Value.ContinueOnError -in ($true,$false)) {
-                Write-SPOTLog "INFO: The ""ContinueOnError"" flag was set for Runbook ""$($RunbookStepConfig.Name)"" to ""$($RunbookStepConfig.Value.ContinueOnError)""." -Output $false -DBG $true
-                $RunbookStep.ContinueOnError = $RunbookStepConfig.Value.ContinueOnError
+            ######################
+            # load the child runbook from its own runbook yaml file; propagate the disable state down
+            if ($Runbook.Disabled -or $RunbookStepConfig.Value.Disabled) { $RunbookDisable = $true }
+            if ($RunbookStepConfig.Value.Seq -and ($null -ne ($RunbookStepConfig.Value.Seq -as [int]))) {
+                if ($RunbookStepConfig.Value.RunbookName) {
+                    $RunbookGUID = Load-SPOTRunbook -Name $RunbookStepConfig.Value.RunbookName -RunbookParameters $RunbookStepConfig.Value.RunbookParameters -Seq $RunbookStepConfig.Value.Seq -ArtefactsPath "$CurrentArtefactsPath\$($RunbookStepConfig.Name)_#_$($RunbookStepConfig.Value.RunbookName)" -Disabled $RunbookDisable
+                }
+                else {
+                    $RunbookGUID = Load-SPOTRunbook -Name $RunbookStepConfig.Name -RunbookParameters $RunbookStepConfig.Value.RunbookParameters -Seq $RunbookStepConfig.Value.Seq -ArtefactsPath "$CurrentArtefactsPath\$($RunbookStepConfig.Name)" -Disabled $RunbookDisable
+                }
             }
             else {
-                $RunbookStep.ContinueOnError = $OrchVars._ContinueOnError
+                Write-SPOTLog "ERROR: For Child Runbook ""$($RunbookStepConfig.Name)"" the Seq number has an unsupported value: ""$($RunbookStepConfig.Value.Seq)"". It must be an integer. Cannot continue." -Output $false
+                return $false
             }
-            # mark the step runbook object as disabled, if configured like this in the yaml config
-            if ($RunbookStepConfig.Value.Disabled -eq $true) {
-                Write-SPOTLog "INFO: The Runbook ""$($RunbookStepConfig.Name)"" was detected as disabled. Marking it and all its steps as disabled." -Output $false -DBG $true
-                $RunbookStep.Disabled = $true
-                $RunbookStep.Status = "Disabled"
-                # marking substeps as disabled to be able to calculate the overall execution percentage easily
-                foreach ($SubStep in $RunbookStep.RunbookSteps) {
-                    $SubStep.Disabled = $true
-                    $SubStep.Status = "Disabled"
-                }
+            if ($RunbookGUID -eq $false) {
+                Write-SPOTLog "ERROR: The Child Runbook ""$($RunbookStepConfig.Name)"" could not be loaded. Cannot continue." -Output $false
+                return $false
             }
-            # insert the remote parameters of this runbookStep of type runbook, if any
-            if ($RunbookStepConfig.Value.RemoteParameters) {
-                Write-SPOTLog "INFO: The RemoteParameters are defined for Runbook ""$($RunbookStepConfig.Name)""." -Output $false -DBG $true
-                $RunbookStep.RemoteParams = $RunbookStepConfig.Value.RemoteParameters
-                # make sure all remote parameters are present (they are mandatory only if this parent parameter is present)
-                if ($RunbookStep.RemoteParams.ExecFunction -notin ("PowershellCommandRemote","PowershellCommandRemoteSJ","PowershellCommandRemoteWMI","PowershellCommandRemotePsExec","PowershellCommandRemoteOWMI")) {
-                    Write-SPOTLog "ERROR: for the runbook step ""$($RunbookStep.Name)"" the ExecFunction remote parameter is not defined or wrong value!" -Output $false
-                    return $false
-                }
-                if (($RunbookStep.RemoteParams.ExecFunction -eq "PowershellCommandRemotePsExec") -and ($OrchVars._SPOTCapability -ne "Extended")) {
-                    Write-SPOTLog "ERROR: for the runbook step ""$($RunbookStep.Name)"" the ExecFunction remote parameter references the PsExec tool but the current SPOT Capability is not ""Extended""!" -Output $false
-                    return $false
-                }
-                if (!$RunbookStep.RemoteParams.RemoteComputer) {
-                    Write-SPOTLog "ERROR: for the runbook step ""$($RunbookStep.Name)"" the RemoteComputer remote parameter is not defined!" -Output $false
-                    return $false
-                }
-                if (!$RunbookStep.RemoteParams.Credential) {
-                    Write-SPOTLog "ERROR: for the runbook step ""$($RunbookStep.Name)"" the Credential remote parameter is not defined!" -Output $false
-                    return $false
-                }
-            }
+            # get the current step, which is a runbook, from the synched all runbooks hashtable variable
+            $RunbookStep = $AllRunbooks.$($RunbookGUID)
 
-            # replace the the O&S Vars
-            if (!(Replace-SPOTVars -RunbookStep $RunbookStep)) {
-                Write-SPOTLog "ERROR: for the runbook step ""$($RunbookStep.Name)"" the O&S Vars could not be replaced properly!" -Output $false
+            ######################
+            # handle the propagation of attributes from current runbook/runbookStep to the child runbook processed here
+            if ($RunbookStep.Disabled) { $RunbookStep.Status = "Disabled" }
+            if ($Runbook.ContinueOnError -or $RunbookStepConfig.Value.ContinueOnError -or $RunbookStep.ContinueOnError) { $RunbookStep.ContinueOnError = $true }
+            else { $RunbookStep.ContinueOnError = $OrchVars._ContinueOnError }
+            if ($RunbookStepConfig.Value.Conditions) { $RunbookStep.Conditions = $RunbookStepConfig.Value.Conditions }
+            if ($RunbookStepConfig.Value.Description) { $RunbookStep.Description = $RunbookStepConfig.Value.Description }
+            if ($RunbookStepConfig.Value.RemoteParameters) { $RunbookStep.RemoteParams = $RunbookStepConfig.Value.RemoteParameters }
+
+            ######################
+            # validate the potentially new remote parameters after replacing any references
+            if (!(Validate-SPOTRunbookRemoteParameters -Runbook $RunbookStep)) {
+                Write-SPOTLog "ERROR: for the current child Runbook ""$($RunbookStep.Name)"" the remote parameters are not validated. Cannot continue." -Output $false
                 return $false
             }
 
-            # check for multiple targets
-            if ($RunbookStep.RemoteParameters) {
-                if (($RunbookStep.RemoteParams.RemoteComputer.GetType().Name -in ('List`1','Object[]')) -or (($RunbookStep.RemoteParams.RemoteComputer -split ",").Count -gt 1)) {
-                    Write-SPOTLog "ERROR: for the runbook step ""$($RunbookStep.Name)"" the RemoteComputer remote parameter is configured for multiple targets with the value: $($RunbookStep.RemoteParams.RemoteComputer)!" -Output $false
-                    return $false
-                }
+            ######################
+            # replace the the O&S&R Vars in the current child runbook, specially for potential new RemoteParameters and Conditions
+            if (!(Replace-SPOTVarsInRunbook -Runbook $RunbookStep)) {
+                Write-SPOTLog "ERROR: for the current child Runbook ""$($RunbookStep.Name)"" the O&S&R Vars could not be replaced properly. Cannot continue." -Output $false
+                return $false
             }
         }
         else {
             # handle progress reporting
             $global:TotalStepCount--
 
-            if ($RunbookStepConfig.Value.Disabled -eq $true) {
-                Write-SPOTLog "INFO: The RunbookStep ""$($RunbookStepConfig.Name)"" is marked as disabled. Loading it without any verification." -Output $false -DBG $true
+            ######################
+            # load the runbook step from the runbook yaml file
+            if ($RunbookStepConfig.Value.Seq -and ($null -ne ($RunbookStepConfig.Value.Seq -as [int]))) {
+                $RunbookStep = [RunbookStep]::new($RunbookStepConfig.Name, $RunbookStepConfig.Value.Seq, $RunbookStepConfig.Value.Type, $RunbookStepConfig.Value.StepParameters)
             }
-            else {        
-                # check any parameter file paths referenced from the project folder, to make sure the referenced files exist and its size is less than the maximum allowed (no action taken now on the parameter value)
-                if ($RunbookStepConfig.Value.StepParameters.CommandParameters) {
-                    foreach ($cpar in $RunbookStepConfig.Value.StepParameters.CommandParameters.GetEnumerator()) {
-                        if ($cpar.Value.GetType().Name -ne "String") {
-                            continue
-                        }
-                        else {
-                            if ($cpar.Value.StartsWith('$RFI:') -or $cpar.Value.StartsWith('$RFO:')) {
-                                # reference to a local file/folder detected
-                                $LocalItem = $null
-                                # get the local item
-                                if ($cpar.Value.StartsWith('$RFO:') -and (($cpar.Value -split ":")[1] -eq "SSHNET")) {
-                                    if ($OrchVars._SPOTCapability -in ("SshNet","Extended")) {
-                                        $LocalItem = Get-Item -Path $OrchVars._SshNetPath -ErrorAction SilentlyContinue
-                                    }
-                                    else {
-                                        Write-SPOTLog ">>> ERROR: For RunbookStep ""$($RunbookStepConfig.Name)"" the parameter ""$($cpar.Name)"" references the SshNet tool but the current SPOT Capability is ""Core"". Cannot continue." -Output $false
-                                        return $false
-                                    }
-                                }
-                                elseif ($cpar.Value.StartsWith('$RFO:') -and (($cpar.Value -split ":")[1] -eq "PSEXEC")) {
-                                    if ($OrchVars._SPOTCapability -eq "Extended") {
-                                        $LocalItem = Get-Item -Path $OrchVars._PsExecPath -ErrorAction SilentlyContinue
-                                    }
-                                    else {
-                                        Write-SPOTLog ">>> ERROR: For RunbookStep ""$($RunbookStepConfig.Name)"" the parameter ""$($cpar.Name)"" references the PsExec tool but the current SPOT Capability is not ""Extended"". Cannot continue." -Output $false
-                                        return $false
-                                    }
-                                }
-                                else {
-                                    $LocalItem = Get-Item -Path "$($OrchVars._ProjectPath)\$(($cpar.Value -split ":")[1])" -ErrorAction SilentlyContinue
-                                }
-                                
-                                if ($LocalItem) {
-                                    # check that with RFI only files are referenced
-                                    if ($LocalItem.PSIsContainer -and $cpar.Value.StartsWith('$RFI:')) {
-                                        # problem; there should only be files referenced with RFI
-                                        Write-SPOTLog ">>> ERROR: For RunbookStep ""$($RunbookStepConfig.Name)"" the referenced item for parameter ""$($cpar.Name)"" and value ""$($cpar.Value)"" was detected as a folder, but only files are permitted with RFI. Cannot continue." -Output $false
-                                        return $false
-                                    }
-                                    # check the size of the local item (if a folder item is referenced, it has a default Length of 1, so no actual check for size but it will pass)
-                                    if ([math]::ceiling($LocalItem.Length / 1MB) -le $ReferencedFileSizeLimit) {
-                                        Write-SPOTLog ">>> For RunbookStep ""$($RunbookStepConfig.Name)"" the referenced item for parameter ""$($cpar.Name)"" and value ""$($cpar.Value)"" was detected and is less than $($ReferencedFileSizeLimit)MB. OK to continue." -Output $false -DBG $true
-                                    }
-                                    else {
-                                        Write-SPOTLog ">>> ERROR: For RunbookStep ""$($RunbookStepConfig.Name)"" the referenced item for parameter ""$($cpar.Name)"" and value ""$($cpar.Value)"" was detected but it is bigger than $($ReferencedFileSizeLimit)MB. Cannot continue." -Output $false
-                                        return $false
-                                    }
-                                }
-                                else {
-                                    Write-SPOTLog ">>> ERROR: For RunbookStep ""$($RunbookStepConfig.Name)"" the referenced item for parameter ""$($cpar.Name)"" and value ""$($cpar.Value)"" was not detected. Cannot continue." -Output $false
-                                    return $false
-                                }
-                            }
-                        }
-                    }
-                }
+            else {
+                Write-SPOTLog "ERROR: For RunbookStep ""$($RunbookStepConfig.Name)"" the Seq number has an unsupported value: ""$($RunbookStepConfig.Value.Seq)"". It must be an integer. Cannot continue." -Output $false
+                return $false
+            }
+            $RunbookStep.ArtefactsPath = "$CurrentArtefactsPath\$($RunbookStep.Name).log"
+            $RunbookStep.ArtefactsPath = "$(Split-Path -Path $RunbookStep.ArtefactsPath -Parent)\$($Runbook.GUID)_$(Split-Path -Path $RunbookStep.ArtefactsPath -Leaf)"
+            $RunbookStep.Description   = $RunbookStepConfig.Value.Description
+            $RunbookStep.Conditions    = $RunbookStepConfig.Value.Conditions
+
+            ######################
+            # handle the ContinueOnError with propagation from above
+            if ($Runbook.ContinueOnError -or $RunbookStepConfig.Value.ContinueOnError) { $RunbookStep.ContinueOnError = $true }
+            else { $RunbookStep.ContinueOnError = $OrchVars._ContinueOnError }
+
+            ######################
+            # handle the RetryCount
+            if ($RunbookStepConfig.Value.RetryCount -and ($null -ne ($RunbookStepConfig.Value.RetryCount -as [int]))) { $RunbookStep.RetryCount = $RunbookStepConfig.Value.RetryCount }
+            else { $RunbookStep.RetryCount = $OrchVars._RetryCount }
+
+            ######################
+            # handle the RetryDelay
+            if ($RunbookStepConfig.Value.RetryDelay -and ($null -ne ($RunbookStepConfig.Value.RetryDelay -as [int]))) { $RunbookStep.RetryDelay = $RunbookStepConfig.Value.RetryDelay }
+            else { $RunbookStep.RetryDelay = $OrchVars._RetryDelay }
             
-                # validate that the generic step parameters are properly defines
-                if ($RunbookStepConfig.Value.Seq -in ("",$null,"0")) {
-                    Write-SPOTLog "ERROR: For RunbookStep ""$($RunbookStepConfig.Name)"" the Seq number is not defined or is an unsupported value: ""$($RunbookStepConfig.Value.Seq)"". Cannot continue." -Output $false
-                    return $false
-                }
-                if ($RunbookStepConfig.Value.Type -notin $StepTypeDefinitions.Keys) {
-                    Write-SPOTLog "ERROR: For RunbookStep ""$($RunbookStepConfig.Name)"" the step type is not defined or is an unsupported value: ""$($RunbookStepConfig.Value.Type)"". Cannot continue." -Output $false
-                    return $false
-                }
-                # check that PsExec type can be used only if the SPOT Capability is "Extended"
-                if (($RunbookStepConfig.Value.Type -eq "PowerShellCommandRemotePsExec") -and ($OrchVars._SPOTCapability -ne "Extended")) {
-                    Write-SPOTLog "ERROR: For RunbookStep ""$($RunbookStepConfig.Name)"" the step type depends on PsExec but the SPOT Capability is not ""Extended"". Cannot continue." -Output $false
-                    return $false
-                }
-                # validate that the mandatory parameters are properly defined
-                $ManPars = Get-SPOTMandatoryStepParameters -StepType $RunbookStepConfig.Value.Type
-                foreach ($ManPar in $ManPars) {
-                    if ($ManPar.Type -eq "StepParameter") {
-                        if (!$RunbookStepConfig.Value.StepParameters.$($ManPar.Name)) {
-                            Write-SPOTLog "ERROR: For RunbookStep ""$($RunbookStepConfig.Name)"" the ""$($ManPar.Name)"" step parameter is not defined. Cannot continue." -Output $false
-                            return $false
-                        }
-                    }
-                }
-
-                # if additional parameters are defined, they will be ignored
-                foreach ($par in $($RunbookStepConfig.Value.keys)) {
-                    if ($par -notin $StepTypeDefinitions.($RunbookStepConfig.Value.Type).Keys) {
-                        Write-SPOTLog "WARNING: Current Parameter ""$par"" is not needed in Runbook ""$Name"" for the current step: ""$($RunbookStepConfig.Name)"" of type: ""$($RunbookStepConfig.Value.Type)"". It will be ignored." -Output $false -DBG $true
-                    }
-                }
-                # if additional step parameters are defined, they will break the loading
-                foreach ($par in $($RunbookStepConfig.Value.StepParameters.keys)) {
-                    if ($par -notin ($StepTypeDefinitions.($RunbookStepConfig.Value.Type).StepParameters.Keys).Where({!$_.StartsWith("_")})) {
-                        Write-SPOTLog "ERROR: Current StepParameter ""$par"" must not be configured in Runbook ""$Name"" for the current step: ""$($RunbookStepConfig.Name)"" of type: ""$($RunbookStepConfig.Value.Type)"". Cannot continue." -Output $false
-                        return $false
-                    }
-                }
-            }
-
-            # instantiate the new RunbookStep
-            $RunbookStep = [RunbookStep]::new($RunbookStepConfig.Name, $RunbookStepConfig.Value.Conditions, $RunbookStepConfig.Value.Description, $RunbookStepConfig.Value.Seq, $RunbookStepConfig.Value.Type, $RunbookStepConfig.Value.StepParameters)
-            $RunbookStep.ArtefactsPath = "$CurrentArtefactsPath\$($RunbookStepConfig.Name).log"
-
-            if ($RunbookStepConfig.Value.Disabled -eq $true) {
-                Write-SPOTLog "INFO: The RunbookStep ""$($RunbookStepConfig.Name)"" was detected as disabled. Marking it as disabled and skipping all the checks after loading." -Output $false -DBG $true
+            ######################
+            # perform validation if not disabled
+            if ($Disabled -or $Runbook.Disabled -or $RunbookStepConfig.Value.Disabled) { 
+                Write-SPOTLog "INFO: The RunbookStep ""$($RunbookStep.Name)"" is disabled. No validation." -Output $false -DBG $true
                 $RunbookStep.Disabled = $true
                 $RunbookStep.Status = "Disabled"
             }
             else {
-                ###
-                # handle the extra attributes ContinueOnError, RetryCount and RetryDelay, for them to be present on all steps
-                if ($RunbookStepConfig.Value.ContinueOnError -in ($true,$false)) {
-                    Write-SPOTLog "INFO: The ""ContinueOnError"" flag was set for RunbookStep ""$($RunbookStepConfig.Name)"" to ""$($RunbookStepConfig.Value.ContinueOnError)""." -Output $false -DBG $true
-                    $RunbookStep.ContinueOnError = $RunbookStepConfig.Value.ContinueOnError
-                }
-                else {
-                    $RunbookStep.ContinueOnError = $OrchVars._ContinueOnError
-                }
-                ###
-                if ($RunbookStepConfig.Value.RetryCount) {
-                    Write-SPOTLog "INFO: The ""RetryCount"" was set for RunbookStep ""$($RunbookStepConfig.Name)"" to ""$($RunbookStepConfig.Value.RetryCount)""." -Output $false -DBG $true
-                    $RunbookStep.RetryCount = $RunbookStepConfig.Value.RetryCount
-                }
-                else {
-                    $RunbookStep.RetryCount = $OrchVars._RetryCount
-                }
-                ###
-                if ($RunbookStepConfig.Value.RetryDelay) {
-                    Write-SPOTLog "INFO: The ""RetryDelay"" was set for RunbookStep ""$($RunbookStepConfig.Name)"" to ""$($RunbookStepConfig.Value.RetryDelay)""." -Output $false -DBG $true
-                    $RunbookStep.RetryDelay = $RunbookStepConfig.Value.RetryDelay
-                }
-                else {
-                    $RunbookStep.RetryDelay = $OrchVars._RetryDelay
-                }
+                Write-SPOTLog "INFO: The RunbookStep ""$($RunbookStep.Name)"" is not disabled. Performing validation." -Output $false -DBG $true
 
                 ########################
-                # payload function validations
-                ########################
-                # check that the step function is found in the SPOT step functions
-                Write-SPOTLog " >> Starting step function validation for the current runbook step ""$($RunbookStep.Name)""." -Output $false -DBG $true
-                if ($RunbookStep.FunctionParams.CommandName -notin $OrchVars._ProjectFunctions) {
-                    Write-SPOTLog "ERROR: The function from the current runbook step ""$($RunbookStep.Name)"", ""$($RunbookStep.FunctionParams.CommandName)"", is not a valid SPOT step function." -Output $false
-                    return $false
-                }
-                
-                ########################
-                # payload function parameter validation
-                Write-SPOTLog " >> Starting step function parameter validation for the current runbook step ""$($RunbookStep.Name)""." -Output $false -DBG $true
-                $result = $true
-                # validate parameters for the first layer function in the step
-                if (!(Validate-SPOTParameterSet -Command $RunbookStep.Function -CommandParams $RunbookStep.FunctionParams)) {
-                    $result = $false
-                }
-                # validate parameters for the second layer command (function or script converted to function) in the step
-                if ($RunbookStep.FunctionParams.CommandName) {
-                    if (!(Validate-SPOTParameterSet -Command $RunbookStep.FunctionParams.CommandName -CommandParams $RunbookStep.FunctionParams.CommandParameters)) {
-                        $result = $false
-                    }
-                }
-
-                Write-SPOTLog " >> Finished parameter validation for the runbook step ""$($RunbookStep.Name)"" with the result: $result." -Output $false -DBG $true
-                if ($result -eq $false) {
-                    Write-SPOTLog "ERROR: Some parameters from the current runbook step ""$($RunbookStep.Name)"" were not valid." -Output $false
+                # validate all parameters
+                if (!(Validate-SPOTRunbookStep -RunbookStep $RunbookStep)) {
+                    Write-SPOTLog "ERROR: for the current RunbookStep ""$($RunbookStep.Name)"" the parameters are not validated. Cannot continue." -Output $false
                     return $false
                 }
 
                 ########################
-                # replace the the O&S Vars
-                if (!(Replace-SPOTVars -RunbookStep $RunbookStep)) {
-                    Write-SPOTLog "ERROR: for the runbook step ""$($RunbookStep.Name)"" the O&S Vars could not be replaced properly!" -Output $false
+                # check the size of referenced Items
+                if (!(Validate-SPOTReferencedItems -RunbookStep $RunbookStep -MaxSizeMB $ReferencedFileSizeLimit)) {
+                    Write-SPOTLog "ERROR: for the RunbookStep ""$($RunbookStep.Name)"" the referenced file size validation failed. Cannot continue." -Output $false
                     return $false
                 }
 
-                # make sure that (correct if necessary) VariablesToPublish are valid (all spaces are removed; "=" sign is removed if there is nothing before or after it)
-                if ($RunbookStep.FunctionParams.VariablesToPublish) {
-                    $RunbookStep.FunctionParams.VariablesToPublish = foreach ($i in $RunbookStep.FunctionParams.VariablesToPublish) {
-                        if (($i.Trim() -like "*=") -or ($i.Trim() -like "=*")) {
-                            Write-SPOTLog "WARNING: The current item in VariablesToPublish ""$i"" has an equal sign without values on both sides of it. Removing the equal sign and continuing as is." -Output $false -DBG $true
-                            $i = $i -replace "=",""
-                        }
-                        $i -replace '\s',""
-                    }
+                #########################
+                # start with replacing SPOTVars
+                if (!(Replace-SPOTVarsInRunbookStep -RunbookStep $RunbookStep -RbParameters $Runbook.RunbookParameters)) {
+                    Write-SPOTLog "ERROR: for the RunbookStep ""$($RunbookStep.Name)"" the O&S&R Vars could not be properly replaced. Cannot continue." -Output $false
+                    return $false
                 }
+
             }
+
+            ######################
             # add the current step to the synced all runbook steps hashtable variable
             $AllRunbookSteps.$($RunbookStep.GUID) = $RunbookStep
 
@@ -382,22 +317,13 @@ function Load-SPOTRunbook {
         # add the current step to the runbook steps array
         $RunbookSteps += $RunbookStep
     }
-    $RunbookSteps = $RunbookSteps | Sort-Object -Property Seq 
-    if ($RunbookConfig.RemoteParameters) {
-        $Runbook = [Runbook]::new($Name,$RunbookConfig.Conditions,$RunbookConfig.Description,$Seq,$RunbookSteps,$RunbookConfig.RemoteParameters)
-    }
-    else {
-        $Runbook = [Runbook]::new($Name,$RunbookConfig.Conditions,$RunbookConfig.Description,$Seq,$RunbookSteps)
-    }
-    
-    # handling artefacts path for the current runbook and included runbook steps
-    $Runbook.ArtefactsPath = $CurrentArtefactsPath
-    foreach ($RunStp in $Runbook.RunbookSteps) {
-        if ($RunStp.GetType().Name -eq "RunbookStep") {
-            $RunStp.ArtefactsPath = "$(Split-Path -Path $RunStp.ArtefactsPath -Parent)\$($Runbook.GUID)_$(Split-Path -Path $RunStp.ArtefactsPath -Leaf)"
-        }
-    }
 
+    ########################
+    # add the RunbookSteps array to the main Runbook Object
+    $RunbookSteps = $RunbookSteps | Sort-Object -Property Seq 
+    $Runbook.RunbookSteps = $RunbookSteps
+
+    ########################
     # add the current runbook to the AllRunbooks synced variable
     $AllRunbooks.$($Runbook.GUID) = $Runbook
 
@@ -853,7 +779,12 @@ function Get-SPOTStepsCountFromRunbookName {
             $StepsNumberTotal++
         }
         else {
-            [int]$StepsNumberTotal += [int](Get-SPOTStepsCountFromRunbookName $item.Name $ProjectRunbooksPath)
+            if ($item.Value.RunbookName) {
+                [int]$StepsNumberTotal += [int](Get-SPOTStepsCountFromRunbookName $item.Value.RunbookName $ProjectRunbooksPath)
+            }
+            else {
+                [int]$StepsNumberTotal += [int](Get-SPOTStepsCountFromRunbookName $item.Name $ProjectRunbooksPath)
+            }
         }
     }
 
@@ -883,40 +814,329 @@ function Get-SPOTRunbookByName {
 } # end of Get-SPOTRunbookByName function
 
 ######################################################################################################################
-function Replace-SPOTVars {
-Param (
+function Replace-SPOTVarsInRunbook {
+    Param (
     [Parameter(Mandatory=$true)]
     [ValidateNotNullOrEmpty()]
     [Object]
-    # the runbookstep or runbook to parse and replace with OVs (Orchestration Variables)
-    $RunbookStep 
+    # the runbook to validate, parse and replace the RPs/OVs/SVs
+    $Runbook
     )
 
     #####
-    Write-SPOTLog "Starting function Replace-SPOTVars for Runbook/Step ""$($RunbookStep.Name)""." -Output $false -DBG $true
+    Write-SPOTLog "Starting function Replace-SPOTVarsInRunbook for Runbook ""$($Runbook.Name)""." -Output $false -DBG $true
+
+    # Runbook Parameters first because the RP references from other elements refer to these ones
+    foreach ($i in $($Runbook.RunbookParameters.Keys)) {
+        $Splitted = $null
+        if ($Runbook.RunbookParameters.$i) { 
+            if (($Runbook.RunbookParameters.$i).GetType().Name -eq "String") {
+                $Splitted = ($Runbook.RunbookParameters.$i).Trim() -split ":"
+                if ($Splitted.Count -eq 2) {
+                    # a reference is present
+                    switch ($Splitted[0]) {
+                        #########################################
+                        "`$RP" {
+                            # single reference to RP
+                            Write-SPOTLog " > Current runbook parameter ""$i"" detected as single `$RP reference." -Output $false -DBG $true
+                            Write-SPOTLog " >> ERROR: There should be no RP references in Runbook Parameters when the runbook is processed by this function!! Cannot continue." -Output $false
+                            return $false
+                        }
+                        #########################################
+                        "`$OV" {
+                            # single reference to OV
+                            Write-SPOTLog " > Current runbook parameter ""$i"" detected as single `$OV reference." -Output $false -DBG $true
+                            if ([string]::IsNullOrEmpty($Splitted[1])) {
+                                Write-SPOTLog " >> ERROR: the current OV reference is null or empty. Cannot continue." -Output $false
+                                return $false
+                            }
+                            elseif ($Splitted[1] -eq '.') {
+                                Write-SPOTLog " >> ERROR: The current OV reference is for the full OV. Not needed/supported. Cannot continue." -Output $false
+                                return $false
+                            }
+                            else {
+                                try {
+                                    $Runbook.RunbookParameters.$i = Invoke-Expression -Command "`$OrchVars.$($Splitted[1])"
+                                }
+                                catch {
+                                    Write-SPOTLog " >> ERROR: while replacing OV in runbook parameter: $_." -Output $false
+                                    return $false
+                                }
+                                Write-SPOTLog " >> INFO: Changed the runbook parameter ""$i"" into ""$($Runbook.RunbookParameters.$i)""." -Output $false -DBG $true
+                            }
+                        }
+                        #########################################
+                        "`$SV" {
+                            # single reference to SV
+                            Write-SPOTLog " > Current runbook parameter ""$i"" detected as single `$SV reference." -Output $false -DBG $true
+                            if ([string]::IsNullOrEmpty($Splitted[1])) {
+                                Write-SPOTLog " >> ERROR: the current SV reference is null or empty. Cannot continue." -Output $false
+                                return $false
+                            }
+                            elseif ($Splitted[1] -eq '.') {
+                                Write-SPOTLog " >> INFO: The current SV reference is for the full SV. It will be replaced later, just in time for execution." -Output $false -DBG $true
+                            }
+                            else {
+                                $Runbook.RunbookParameters.$i = $SVars[$Splitted[1]]
+                                Write-SPOTLog " >> INFO: Changed the runbook parameter ""$i"" into ""$($Runbook.RunbookParameters.$i)""." -Output $false -DBG $true
+                            }
+                        }
+                        #########################################
+                        "`$PV" {
+                            # single reference to PV
+                            Write-SPOTLog " > Current runbook parameter ""$i"" detected as single `$PV reference." -Output $false -DBG $true
+                            if ([string]::IsNullOrEmpty($Splitted[1])) {
+                                Write-SPOTLog " >> ERROR: the current PV reference is null or empty. Cannot continue." -Output $false
+                                return $false
+                            }
+                            else {
+                                Write-SPOTLog " >> INFO: The current PV reference will be replaced later, just in time for execution." -Output $false -DBG $true
+                            }
+                        }
+                    }
+                }
+                elseif ($Splitted.Count -gt 2) {
+                    # mixed string reference is present, which is not allowed here
+                    if (($Runbook.RunbookParameters.$i).Contains("`$RP:") -or `
+                        ($Runbook.RunbookParameters.$i).Contains("`$OV:") -or `
+                        ($Runbook.RunbookParameters.$i).Contains("`$SV:") -or `
+                        ($Runbook.RunbookParameters.$i).Contains("`$PV:")) {
+                        Write-SPOTLog " > ERROR: Non-single RP, OV, SV or PV reference detected in Runbook Parameter ""$($Runbook.RunbookParameters.$i)"". Mixed string references are not allowed in Runbook Parameters. Cannot continue." -Output $false
+                        return $false
+                    }
+                }
+            }
+        }
+    }
+
+    # conditions
+    if ($Runbook.Conditions) {
+        $Runbook.Conditions = $Runbook.Conditions | foreach {
+            if ($_.GetType().Name -eq "String") {
+                Write-SPOTLog " > Evaluating the Runbook ""$($Runbook.Name)"" Condition ""$_"" >>>" -Output $false -DBG $true
+                if (($_ -split ":").Count -eq 2) {
+                    if ($_.StartsWith("`$RP:")) {
+                        $condition = $_
+                        try {
+                            $condition = Invoke-Expression -Command "`$Runbook.RunbookParameters.$(($condition -split ":")[1].Trim())"
+                        }
+                        catch {
+                            Write-SPOTLog " >> ERROR: while replacing RP in Condition: $_." -Output $false
+                            return $false
+                        }
+                        $_ = $condition
+                        Write-SPOTLog " >> INFO: Condition value evaluated to ""$_""." -Output $false -DBG $true
+                    }
+                    if ($_.StartsWith("`$OV:")) {
+                        $condition = $_
+                        try {
+                            $condition = Invoke-Expression -Command "`$OrchVars.$(($condition -split ":")[1].Trim())"
+                        }
+                        catch {
+                            Write-SPOTLog " >> ERROR: while replacing OV in Condition: $_." -Output $false
+                            return $false
+                        }
+                        $_ = $condition
+                        Write-SPOTLog " >> INFO: Condition value evaluated to ""$_""." -Output $false -DBG $true
+                    }
+                    elseif ($_.StartsWith("`$PV:")) {
+                        Write-SPOTLog " >> INFO: Condition with single PV reference. It will be replaced later, just in time for execution." -Output $false -DBG $true
+                    }
+                    elseif ($_.StartsWith("`$SV:")) {
+                        Write-SPOTLog " >> ERROR: SV reference detected in condition ""$_"". SV references are not allowed in Conditions. Cannot continue." -Output $false
+                        return $false
+                    }
+                }
+                # now the validations that this is not a mixed string or multi-word string
+                if ($_.GetType().Name -eq "String") {
+                    if ((($_ -split ":").Count -gt 2) -or (($_.Trim() -split '\s+').Count -gt 1)) {
+                        Write-SPOTLog " >> ERROR: mixed string reference or multi-word string detected in condition ""$_"". These are not allowed in Conditions. Cannot continue." -Output $false
+                        return $false
+                    }
+                }
+                $_
+            }
+            else {
+                Write-SPOTLog " >> WARNING: Current Condition ""$_"" for the runbook ""$($Runbook.Name)"" is not of type string! Leaving it unchanged." -Output $false
+                $_
+            }
+        }
+    }
+
+    # remote params 
+    foreach ($i in $($Runbook.RemoteParams.Keys)) {
+        $Splitted = $null
+        if ($Runbook.RemoteParams.$i) { 
+            if (($Runbook.RemoteParams.$i).GetType().Name -eq "String") {
+                #########################################
+                if (($Runbook.RemoteParams.$i).StartsWith("`$RP") -and (($Runbook.RemoteParams.$i -split ":").Count -eq 2)) {
+                    # single reference to RP
+                    Write-SPOTLog " > Current remote parameter ""$i"" detected as single `$RP reference." -Output $false -DBG $true
+                    if ([string]::IsNullOrEmpty((($Runbook.RemoteParams.$i).Trim() -split ":")[1])) {
+                        Write-SPOTLog " >> ERROR: the current RP reference is null or empty. Cannot continue." -Output $false
+                        return $false
+                    }
+                    elseif ((($Runbook.RemoteParams.$i).Trim() -split ":")[1] -eq '.') {
+                        Write-SPOTLog " >> ERROR: The current RP reference is for the full RP. Not needed/supported in Runbook Remote Parameters. Cannot continue." -Output $false
+                        return $false
+                    }
+                    else {
+                        try {
+                            $Runbook.RemoteParams.$i = Invoke-Expression -Command "`$Runbook.RunbookParameters.$((($Runbook.RemoteParams.$i).Trim() -split ":")[1])"
+                        }
+                        catch {
+                            Write-SPOTLog " >> ERROR: while replacing RP in remote parameter: $_." -Output $false
+                            return $false
+                        }
+                        Write-SPOTLog " >> INFO: Changed the remote parameter ""$i"" into ""$($Runbook.RemoteParams.$i)""." -Output $false -DBG $true 
+                    }
+                }
+                # the RP reference may turn into other references, so start from scratch
+                $Splitted = ($Runbook.RemoteParams.$i).Trim() -split ":"
+                if ($Splitted.Count -eq 2) {
+                    # a single reference is present
+                    switch ($Splitted[0]) {
+                        #########################################
+                        "`$OV" {
+                            # single reference to OV
+                            Write-SPOTLog " > Current remote parameter ""$i"" detected as single `$OV reference." -Output $false -DBG $true
+                            if ([string]::IsNullOrEmpty($Splitted[1])) {
+                                Write-SPOTLog " >> ERROR: the current OV reference is null or empty. Cannot continue." -Output $false
+                                return $false
+                            }
+                            elseif ($Splitted[1] -eq '.') {
+                                Write-SPOTLog " >> ERROR: The current OV reference is for the full OV. Not needed/supported. Cannot continue." -Output $false
+                                return $false
+                            }
+                            else {
+                                try {
+                                    $Runbook.RemoteParams.$i = Invoke-Expression -Command "`$OrchVars.$($Splitted[1])"
+                                }
+                                catch {
+                                    Write-SPOTLog " >> ERROR: while replacing OV in runbook parameter: $_." -Output $false
+                                    return $false
+                                }
+                                Write-SPOTLog " >> INFO: Changed the runbook parameter ""$i"" into ""$($Runbook.RemoteParams.$i)""." -Output $false -DBG $true
+                            }
+                        }
+                        #########################################
+                        "`$SV" {
+                            # single reference to SV
+                            Write-SPOTLog " > Current remote parameter ""$i"" detected as single `$SV reference." -Output $false -DBG $true
+                            if ([string]::IsNullOrEmpty($Splitted[1])) {
+                                Write-SPOTLog " >> ERROR: the current SV reference is null or empty. Cannot continue." -Output $false
+                                return $false
+                            }
+                            elseif ($Splitted[1] -eq '.') {
+                                Write-SPOTLog " >> ERROR: The current SV reference is for the full SV. Not needed/supported in Runbook Remote Parameters. Cannot continue." -Output $false
+                                return $true
+                            }
+                            else {
+                                $Runbook.RemoteParams.$i = $SVars[$Splitted[1]]
+                                Write-SPOTLog " >> INFO: Changed the remote parameter ""$i"" into ""$($Runbook.RemoteParams.$i)""." -Output $false -DBG $true
+                            }
+                        }
+                        #########################################
+                        "`$PV" {
+                            # single reference to PV
+                            Write-SPOTLog " > Current remote parameter ""$i"" detected as single `$PV reference." -Output $false -DBG $true
+                            if ([string]::IsNullOrEmpty($Splitted[1])) {
+                                Write-SPOTLog " >> ERROR: the current PV reference is null or empty. Cannot continue." -Output $false
+                                return $false
+                            }
+                            else {
+                                Write-SPOTLog " >> INFO: The current PV reference will be replaced later, just in time for execution." -Output $false -DBG $true
+                            }
+                        }
+                    }
+                }
+                elseif ($Splitted.Count -gt 2) {
+                    # mixed string reference is present, which is not allowed here
+                    if (($Runbook.RemoteParams.$i).Contains("`$RP:") -or `
+                        ($Runbook.RemoteParams.$i).Contains("`$OV:") -or `
+                        ($Runbook.RemoteParams.$i).Contains("`$SV:") -or `
+                        ($Runbook.RemoteParams.$i).Contains("`$PV:")) {
+                        Write-SPOTLog " > ERROR: Non-single RP, OV, SV or PV reference detected in Runbook Parameter ""$($Runbook.RemoteParams.$i)"". Mixed string references are not allowed in Runbook Remote Parameters. Cannot continue." -Output $false
+                        return $false
+                    }
+                }
+            }
+        }
+    }
+
+    #####
+    Write-SPOTLog "Finished function Replace-SPOTVarsInRunbook for Runbook ""$($Runbook.Name)""." -Output $false -DBG $true
+
+    return $true
+} # end of Replace-SPOTVarsInRunbook function
+
+######################################################################################################################
+function Replace-SPOTVarsInRunbookStep {
+    Param (
+    [Parameter(Mandatory=$true)]
+    [ValidateNotNullOrEmpty()]
+    [Object]
+    # the runbookstep to parse and replace the RPs/OVs/SVs
+    $RunbookStep,
+    [Parameter(Mandatory=$true)]
+    [AllowNull()]
+    [hashtable]
+    # the runbook parameters hashtable to be used for RP references
+    $RbParameters
+    )
+
+    #####
+    Write-SPOTLog "Starting function Replace-SPOTVarsInRunbookStep for RunbookStep ""$($RunbookStep.Name)""." -Output $false -DBG $true
 
     # conditions
     if ($RunbookStep.Conditions) {
         $RunbookStep.Conditions = $RunbookStep.Conditions | foreach {
             if ($_.GetType().Name -eq "String") {
-                if ($_.StartsWith("`$OV:")) {
-                    Write-SPOTLog "Evaluating the RunbookStep ""$($RunbookStep.Name)"" Condition ""$_"" >>>" -Output $false -DBG $true
-                    $condition = $_
-                    $VarName = ($condition -split ":")[1]
-                    try {
-                        $condition = Invoke-Expression -Command "`$OrchVars.$VarName"
+                Write-SPOTLog " > Evaluating the RunbookStep ""$($RunbookStep.Name)"" Condition ""$_"" >>>" -Output $false -DBG $true
+                if (($_ -split ":").Count -eq 2) {
+                    if ($_.StartsWith("`$RP:")) {
+                        $condition = $_
+                        try {
+                            $condition = Invoke-Expression -Command "`$RbParameters.$(($condition -split ":")[1].Trim())"
+                        }
+                        catch {
+                            Write-SPOTLog " >> ERROR: while replacing RP in Condition: $_." -Output $false
+                            return $false
+                        }
+                        $_ = $condition
+                        Write-SPOTLog " >> INFO: Condition value evaluated to ""$_""." -Output $false -DBG $true
                     }
-                    catch {
-                        Write-SPOTLog ">>> ERROR while replacing OV in Condition: $_." -Output $false
+                    if ($_.StartsWith("`$OV:")) {
+                        $condition = $_
+                        try {
+                            $condition = Invoke-Expression -Command "`$OrchVars.$(($condition -split ":")[1].Trim())"
+                        }
+                        catch {
+                            Write-SPOTLog " >> ERROR: while replacing OV in Condition: $_." -Output $false
+                            return $false
+                        }
+                        $_ = $condition
+                        Write-SPOTLog " >> INFO: Condition value evaluated to ""$_""." -Output $false -DBG $true
+                    }
+                    elseif ($_.StartsWith("`$PV:")) {
+                        Write-SPOTLog " >> INFO: Condition with single PV reference. It will be replaced later, just in time for execution." -Output $false -DBG $true
+                    }
+                    elseif ($_.StartsWith("`$SV:")) {
+                        Write-SPOTLog " >> ERROR: SV reference detected in condition ""$_"". SV references are not allowed in Conditions. Cannot continue." -Output $false
                         return $false
                     }
-                    $_ = $condition
-                    Write-SPOTLog ">>> Condition value evaluated to ""$_""." -Output $false -DBG $true
+                }
+                # now the validations that this is not a mixed string or multi-word string
+                if ($_.GetType().Name -eq "String") {
+                    if ((($_ -split ":").Count -gt 2) -or (($_.Trim() -split '\s+').Count -gt 1)) {
+                        Write-SPOTLog " >> ERROR: mixed string reference or multi-word string detected in condition ""$_"". These are not allowed in Conditions. Cannot continue." -Output $false
+                        return $false
+                    }
                 }
                 $_
             }
             else {
-                Write-SPOTLog "WARNING: Current Condition ""$_"" for the runbook ""$($RunbookStep.Name)"" is not of type string! Leaving it unchanged." -Output $false
+                Write-SPOTLog " >> WARNING: Current Condition ""$_"" for the runbook ""$($RunbookStep.Name)"" is not of type string! Leaving it unchanged." -Output $false
                 $_
             }
         }
@@ -924,30 +1144,86 @@ Param (
 
     # step parameters
     foreach ($i in $($RunbookStep.FunctionParams.Keys)) {
-        $VarName = $null
+        $Splitted = $null
         if ($RunbookStep.FunctionParams.$i) { 
             if (($RunbookStep.FunctionParams.$i).GetType().Name -eq "String") {
-                if (($RunbookStep.FunctionParams.$i).StartsWith("`$OV:") -and (($RunbookStep.FunctionParams.$i -split ":").Count -eq 2)) {
-                    Write-SPOTLog "Current step parameter ""$i"" detected as single reference and starting with `$OV." -Output $false -DBG $true
-                    # make available the use of sub-hashtables from the Orchvars
-                    $VarName = ($RunbookStep.FunctionParams.$i -split ":")[1]
-                    try {
-                        $RunbookStep.FunctionParams.$i = Invoke-Expression -Command "`$OrchVars.$VarName"
-                    }
-                    catch {
-                        Write-SPOTLog ">>> ERROR while replacing OV in step parameter: $_." -Output $false
+                #########################################
+                if (($RunbookStep.FunctionParams.$i).StartsWith("`$RP:") -and (($RunbookStep.FunctionParams.$i -split ":").Count -eq 2)) {
+                    Write-SPOTLog " > Current step parameter ""$i"" detected as single `$RP reference." -Output $false -DBG $true
+                    if ([string]::IsNullOrEmpty((($RunbookStep.FunctionParams.$i).Trim() -split ":")[1])) {
+                        Write-SPOTLog " >> ERROR: the current RP reference is null or empty. Cannot continue." -Output $false
                         return $false
                     }
-                    Write-SPOTLog "Changed the step parameter ""$i"" into ""$($RunbookStep.FunctionParams.$i)""." -Output $false -DBG $true
-                }
-                if (($RunbookStep.FunctionParams.$i).StartsWith("`$SV:") -and (($RunbookStep.FunctionParams.$i -split ":").Count -eq 2)) {
-                    Write-SPOTLog "Current step parameter ""$i"" detected as single reference and starting with `$SV." -Output $false -DBG $true
-                    if (($RunbookStep.FunctionParams.$i -split ":")[1] -eq '.') {
-                        # entire $SV referenced 
-                        $RunbookStep.FunctionParams.$i = $SVars
+                    elseif ((($RunbookStep.FunctionParams.$i).Trim() -split ":")[1] -eq '.') {
+                        Write-SPOTLog " >> INFO: The current RP reference is for the full RP. It will be replaced later, just in time for execution." -Output $false -DBG $true
                     }
                     else {
-                        $RunbookStep.FunctionParams.$i = $SVars[($RunbookStep.FunctionParams.$i -split ":")[1]]
+                        try {
+                            $RunbookStep.FunctionParams.$i = Invoke-Expression -Command "`$RbParameters.$((($RunbookStep.FunctionParams.$i).Trim() -split ":")[1])"
+                        }
+                        catch {
+                            Write-SPOTLog " >> ERROR: while replacing RP in step parameter: $_." -Output $false
+                            return $false
+                        }
+                        Write-SPOTLog " >> INFO: Changed the step parameter ""$i"" into ""$($RunbookStep.FunctionParams.$i)""." -Output $false -DBG $true
+                    }
+                }
+                # the RP reference may turn into other references, so start from scratch
+                $Splitted = ($RunbookStep.FunctionParams.$i).Trim() -split ":"
+                if ($Splitted.Count -eq 2) {
+                    # a single reference is present
+                    switch ($Splitted[0]) {
+                        #########################################
+                        "`$OV" {
+                            # single reference to OV
+                            Write-SPOTLog " > Current step parameter ""$i"" detected as single `$OV reference." -Output $false -DBG $true
+                            if ([string]::IsNullOrEmpty($Splitted[1])) {
+                                Write-SPOTLog " >> ERROR: the current OV reference is null or empty. Cannot continue." -Output $false
+                                return $false
+                            }
+                            elseif ($Splitted[1] -eq '.') {
+                                Write-SPOTLog " >> ERROR: The current OV reference is for the full OV. Not needed/supported. Cannot continue." -Output $false
+                                return $false
+                            }
+                            else {
+                                try {
+                                    $RunbookStep.FunctionParams.$i = Invoke-Expression -Command "`$OrchVars.$($Splitted[1])"
+                                }
+                                catch {
+                                    Write-SPOTLog " >> ERROR: while replacing OV in step parameter: $_." -Output $false
+                                    return $false
+                                }
+                                Write-SPOTLog " >> INFO: Changed the step parameter ""$i"" into ""$($RunbookStep.FunctionParams.$i)""." -Output $false -DBG $true
+                            }
+                        }
+                        #########################################
+                        "`$SV" {
+                            # single reference to SV
+                            Write-SPOTLog " > Current step parameter ""$i"" detected as single `$SV reference." -Output $false -DBG $true
+                            if ([string]::IsNullOrEmpty($Splitted[1])) {
+                                Write-SPOTLog " >> ERROR: the current SV reference is null or empty. Cannot continue." -Output $false
+                                return $false
+                            }
+                            elseif ($Splitted[1] -eq '.') {
+                                Write-SPOTLog " >> INFO: The current SV reference is for the full SV. It will be replaced later, just in time for execution." -Output $false -DBG $true
+                            }
+                            else {
+                                $RunbookStep.FunctionParams.$i = $SVars[$Splitted[1]]
+                                Write-SPOTLog " >> INFO: Changed the step parameter ""$i"" into ""$($RunbookStep.FunctionParams.$i)""." -Output $false -DBG $true
+                            }
+                        }
+                        #########################################
+                        "`$PV" {
+                            # single reference to PV
+                            Write-SPOTLog " > Current step parameter ""$i"" detected as single `$PV reference." -Output $false -DBG $true
+                            if ([string]::IsNullOrEmpty($Splitted[1])) {
+                                Write-SPOTLog " >> ERROR: the current PV reference is null or empty. Cannot continue." -Output $false
+                                return $false
+                            }
+                            else {
+                                Write-SPOTLog " >> INFO: The current PV reference will be replaced later, just in time for execution." -Output $false -DBG $true
+                            }
+                        }
                     }
                 }
             }
@@ -956,61 +1232,85 @@ Param (
 
     # command parameters
     foreach ($i in $($RunbookStep.FunctionParams.CommandParameters.Keys)) {
-        $VarName = $null
         if ($RunbookStep.FunctionParams.CommandParameters.$i) {
             if (($RunbookStep.FunctionParams.CommandParameters.$i).GetType().Name -eq "String") {
-                if (($RunbookStep.FunctionParams.CommandParameters.$i).StartsWith("`$OV:") -and (($RunbookStep.FunctionParams.CommandParameters.$i -split ":").Count -eq 2)) {
-                    Write-SPOTLog "Current command parameter ""$i"" detected as single reference and starting with `$OV." -Output $false -DBG $true
-                    # make available the use of sub-hashtables from the Orchvars
-                    $VarName = ($RunbookStep.FunctionParams.CommandParameters.$i -split ":")[1]
-                    try {
-                        $RunbookStep.FunctionParams.CommandParameters.$i = Invoke-Expression -Command "`$OrchVars.$VarName"
-                    }
-                    catch {
-                        Write-SPOTLog ">>> ERROR while replacing OV in command parameter: $_." -Output $false
+                #########################################
+                if (($RunbookStep.FunctionParams.CommandParameters.$i).StartsWith("`$RP:") -and (($RunbookStep.FunctionParams.CommandParameters.$i -split ":").Count -eq 2)) {
+                    Write-SPOTLog " > Current command parameter ""$i"" detected as single `$RP reference." -Output $false -DBG $true
+                    if ([string]::IsNullOrEmpty((($RunbookStep.FunctionParams.CommandParameters.$i).Trim() -split ":")[1])) {
+                        Write-SPOTLog " >> ERROR: the current RP reference is null or empty. Cannot continue." -Output $false
                         return $false
                     }
-                    Write-SPOTLog "Changed the command parameter ""$i"" into ""$($RunbookStep.FunctionParams.CommandParameters.$i)""." -Output $false -DBG $true
-                }
-                if (($RunbookStep.FunctionParams.CommandParameters.$i).StartsWith("`$SV:") -and (($RunbookStep.FunctionParams.CommandParameters.$i -split ":").Count -eq 2)) {
-                    Write-SPOTLog "Current command parameter ""$i"" detected as single reference and starting with `$SV." -Output $false -DBG $true
-                    if (($RunbookStep.FunctionParams.CommandParameters.$i -split ":")[1] -eq '.') {
-                        # entire $SV referenced
-                        $RunbookStep.FunctionParams.CommandParameters.$i = $SVars
+                    elseif ((($RunbookStep.FunctionParams.CommandParameters.$i).Trim() -split ":")[1] -eq '.') {
+                        Write-SPOTLog " >> INFO: The current RP reference is for the full RP. It will be replaced later, just in time for execution." -Output $false -DBG $true
                     }
                     else {
-                        $RunbookStep.FunctionParams.CommandParameters.$i = $SVars[($RunbookStep.FunctionParams.CommandParameters.$i -split ":")[1]]
+                        try {
+                            $RunbookStep.FunctionParams.CommandParameters.$i = Invoke-Expression -Command "`$RbParameters.$((($RunbookStep.FunctionParams.CommandParameters.$i).Trim() -split ":")[1])"
+                        }
+                        catch {
+                            Write-SPOTLog " >> ERROR: while replacing RP in command parameter: $_." -Output $false
+                            return $false
+                        }
+                        Write-SPOTLog " >> INFO: Changed the command parameter ""$i"" into ""$($RunbookStep.FunctionParams.CommandParameters.$i)""." -Output $false -DBG $true
                     }
                 }
-            }
-        }
-    }
-
-    foreach ($i in $($RunbookStep.RemoteParams.Keys)) {
-        $VarName = $null
-        if ($RunbookStep.RemoteParams.$i) { 
-            if (($RunbookStep.RemoteParams.$i).GetType().Name -eq "String") {
-                if (($RunbookStep.RemoteParams.$i).StartsWith("`$OV:") -and (($RunbookStep.RemoteParams.$i -split ":").Count -eq 2)) {
-                    Write-SPOTLog "Current remote parameter ""$i"" detected as single reference and starting with `$OV." -Output $false -DBG $true
-                    # make available the use of sub-hashtables from the Orchvars
-                    $VarName = ($RunbookStep.RemoteParams.$i -split ":")[1]
-                    try {
-                        $RunbookStep.RemoteParams.$i = Invoke-Expression -Command "`$OrchVars.$VarName"
-                    }
-                    catch {
-                        Write-SPOTLog ">>> ERROR while replacing OV in remote parameter: $_." -Output $false
-                        return $false
-                    }
-                    Write-SPOTLog "Changed the remote parameter ""$i"" into ""$($RunbookStep.RemoteParams.$i)""." -Output $false -DBG $true
-                }
-                if (($RunbookStep.RemoteParams.$i).StartsWith("`$SV:") -and (($RunbookStep.RemoteParams.$i -split ":").Count -eq 2)) {
-                    Write-SPOTLog "Current remote parameter ""$i"" detected as single reference and starting with `$SV." -Output $false -DBG $true
-                    if (($RunbookStep.RemoteParams.$i -split ":")[1] -eq '.') {
-                        # entire $SV referenced
-                        $RunbookStep.RemoteParams.$i = $SVars
-                    }
-                    else {
-                        $RunbookStep.RemoteParams.$i = $SVars[($RunbookStep.RemoteParams.$i -split ":")[1]]
+                # the RP reference may turn into other references, so start from scratch
+                $Splitted = ($RunbookStep.FunctionParams.CommandParameters.$i).Trim() -split ":"
+                if ($Splitted.Count -eq 2) {
+                    # a single reference is present
+                    switch ($Splitted[0]) {
+                        #########################################
+                        "`$OV" {
+                            # single reference to OV
+                            Write-SPOTLog " > Current command parameter ""$i"" detected as single `$OV reference." -Output $false -DBG $true
+                            if ([string]::IsNullOrEmpty($Splitted[1])) {
+                                Write-SPOTLog " >> ERROR: the current OV reference is null or empty. Cannot continue." -Output $false
+                                return $false
+                            }
+                            elseif ($Splitted[1] -eq '.') {
+                                Write-SPOTLog " >> ERROR: The current OV reference is for the full OV. Not needed/supported. Cannot continue." -Output $false
+                                return $false
+                            }
+                            else {
+                                try {
+                                    $RunbookStep.FunctionParams.CommandParameters.$i = Invoke-Expression -Command "`$OrchVars.$($Splitted[1])"
+                                }
+                                catch {
+                                    Write-SPOTLog " >> ERROR: while replacing OV in command parameter: $_." -Output $false
+                                    return $false
+                                }
+                                Write-SPOTLog " >> INFO: Changed the command parameter ""$i"" into ""$($RunbookStep.FunctionParams.CommandParameters.$i)""." -Output $false -DBG $true
+                            }
+                        }
+                        #########################################
+                        "`$SV" {
+                            # single reference to SV
+                            Write-SPOTLog " > Current command parameter ""$i"" detected as single `$SV reference." -Output $false -DBG $true
+                            if ([string]::IsNullOrEmpty($Splitted[1])) {
+                                Write-SPOTLog " >> ERROR: the current SV reference is null or empty. Cannot continue." -Output $false
+                                return $false
+                            }
+                            elseif ($Splitted[1] -eq '.') {
+                                Write-SPOTLog " >> INFO: The current SV reference is for the full SV. It will be replaced later, just in time for execution." -Output $false -DBG $true
+                            }
+                            else {
+                                $RunbookStep.FunctionParams.CommandParameters.$i = $SVars[$Splitted[1]]
+                                Write-SPOTLog " >> INFO: Changed the command parameter ""$i"" into ""$($RunbookStep.FunctionParams.CommandParameters.$i)""." -Output $false -DBG $true
+                            }
+                        }
+                        #########################################
+                        "`$PV" {
+                            # single reference to PV
+                            Write-SPOTLog " > Current command parameter ""$i"" detected as single `$PV reference." -Output $false -DBG $true
+                            if ([string]::IsNullOrEmpty($Splitted[1])) {
+                                Write-SPOTLog " >> ERROR: the current PV reference is null or empty. Cannot continue." -Output $false
+                                return $false
+                            }
+                            else {
+                                Write-SPOTLog " >> INFO: The current PV reference will be replaced later, just in time for execution." -Output $false -DBG $true
+                            }
+                        }
                     }
                 }
             }
@@ -1018,10 +1318,10 @@ Param (
     }
 
     #####
-    Write-SPOTLog "Finished function Replace-SPOTVars for Runbook/Step ""$($RunbookStep.Name)""." -Output $false -DBG $true
+    Write-SPOTLog "Finished function Replace-SPOTVarsInRunbookStep for RunbookStep ""$($RunbookStep.Name)""." -Output $false -DBG $true
 
     return $true
-} # end of Replace-SPOTVars function
+} # end of Replace-SPOTVarsInRunbookStep function
 
 ######################################################################################################################
 function Validate-SPOTParameterSet {
@@ -1107,6 +1407,222 @@ function Validate-SPOTParameterSet {
     # return the result
     return $retVSPS
 } # end of Validate-SPOTParameterSet function
+
+######################################################################################################################
+function Validate-SPOTRunbookRemoteParameters {
+    Param (
+    [Parameter(Mandatory=$true)]
+    [ValidateNotNullOrEmpty()]
+    [Object]
+    # the runbook to check the Remote Parameters
+    $Runbook 
+    )
+
+    #####
+    Write-SPOTLog "Starting function Validate-SPOTRunbookRemoteParameters for Runbook ""$($Runbook.Name)""." -Output $false -DBG $true
+
+    if ($Runbook.RemoteParams) {
+        Write-SPOTLog "INFO: The RemoteParameters are defined for Runbook ""$($Runbook.Name)"". Checking them." -Output $false -DBG $true
+        # make sure all remote parameters are present (they are mandatory only if this parent parameter is present)
+        if ($Runbook.RemoteParams.ExecFunction -notin ("PowershellCommandRemote","PowershellCommandRemoteSJ","PowershellCommandRemoteWMI","PowershellCommandRemotePsExec","PowershellCommandRemoteOWMI")) {
+            Write-SPOTLog "ERROR: for the Runbook ""$($Runbook.Name)"" the ExecFunction remote parameter is not defined or wrong value!" -Output $false
+            return $false
+        }
+        if (($Runbook.RemoteParams.ExecFunction -eq "PowershellCommandRemotePsExec") -and ($OrchVars._SPOTCapability -ne "Extended")) {
+            Write-SPOTLog "ERROR: for the Runbook ""$($Runbook.Name)"" the ExecFunction remote parameter references the PsExec tool but the current SPOT Capability is not ""Extended""!" -Output $false
+            return $false
+        }
+        if (!$Runbook.RemoteParams.RemoteComputer) {
+            Write-SPOTLog "ERROR: for the Runbook ""$($Runbook.Name)"" the RemoteComputer remote parameter is not defined!" -Output $false
+            return $false
+        }
+        if (($Runbook.RemoteParams.RemoteComputer.GetType().Name -in ('List`1','Object[]')) -or (($Runbook.RemoteParams.RemoteComputer -split ",").Count -gt 1)) {
+            Write-SPOTLog "ERROR: for the Runbook ""$($Runbook.Name)"" the RemoteComputer remote parameter is configured for multiple targets with the value: $($Runbook.RemoteParams.RemoteComputer)!" -Output $false
+            return $false
+        }
+        if (!$Runbook.RemoteParams.Credential) {
+            Write-SPOTLog "ERROR: for the Runbook ""$($Runbook.Name)"" the Credential remote parameter is not defined!" -Output $false
+            return $false
+        }
+    }
+
+    #####
+    Write-SPOTLog "Finished function Validate-SPOTRunbookRemoteParameters for Runbook ""$($Runbook.Name)""." -Output $false -DBG $true
+
+    return $true
+
+} # end of Validate-SPOTParameterSet function
+
+######################################################################################################################
+function Validate-SPOTReferencedItems {
+    Param (
+    [Parameter(Mandatory=$true)]
+    [ValidateNotNullOrEmpty()]
+    [Object]
+    # the runbookstep to check for Referenced Items
+    $RunbookStep,
+    [Parameter(Mandatory=$true)]
+    [ValidateNotNullOrEmpty()]
+    [int]
+    # the maximum size permitted, in MB
+    $MaxSizeMB
+    )
+
+    #########################
+    # check any parameter file paths referenced from the project folder, to make sure the referenced files exist and its size is less than the maximum allowed
+    if ($RunbookStep.StepParameters.CommandParameters) {
+        foreach ($cpar in $RunbookStep.StepParameters.CommandParameters.GetEnumerator()) {
+            if ($cpar.Value.GetType().Name -ne "String") {
+                continue
+            }
+            else {
+                if ($cpar.Value.StartsWith('$RFI:') -or $cpar.Value.StartsWith('$RFO:')) {
+                    # reference to a local file/folder detected
+                    $LocalItem = $null
+                    # get the local item
+                    if ($cpar.Value.StartsWith('$RFO:') -and (($cpar.Value -split ":")[1] -eq "SSHNET")) {
+                        if ($OrchVars._SPOTCapability -in ("SshNet","Extended")) {
+                            $LocalItem = Get-Item -Path $OrchVars._SshNetPath -ErrorAction SilentlyContinue
+                        }
+                        else {
+                            Write-SPOTLog ">>> ERROR: For RunbookStep ""$($RunbookStep.Name)"" the parameter ""$($cpar.Name)"" references the SshNet tool but the current SPOT Capability is ""Core"". Cannot continue." -Output $false
+                            return $false
+                        }
+                    }
+                    elseif ($cpar.Value.StartsWith('$RFO:') -and (($cpar.Value -split ":")[1] -eq "PSEXEC")) {
+                        if ($OrchVars._SPOTCapability -eq "Extended") {
+                            $LocalItem = Get-Item -Path $OrchVars._PsExecPath -ErrorAction SilentlyContinue
+                        }
+                        else {
+                            Write-SPOTLog ">>> ERROR: For RunbookStep ""$($RunbookStep.Name)"" the parameter ""$($cpar.Name)"" references the PsExec tool but the current SPOT Capability is not ""Extended"". Cannot continue." -Output $false
+                            return $false
+                        }
+                    }
+                    else {
+                        $LocalItem = Get-Item -Path "$($OrchVars._ProjectPath)\$(($cpar.Value -split ":")[1])" -ErrorAction SilentlyContinue
+                    }
+                    
+                    if ($LocalItem) {
+                        # check that with RFI only files are referenced
+                        if ($LocalItem.PSIsContainer -and $cpar.Value.StartsWith('$RFI:')) {
+                            # problem; there should only be files referenced with RFI
+                            Write-SPOTLog ">>> ERROR: For RunbookStep ""$($RunbookStep.Name)"" the referenced item for parameter ""$($cpar.Name)"" and value ""$($cpar.Value)"" was detected as a folder, but only files are permitted with RFI. Cannot continue." -Output $false
+                            return $false
+                        }
+                        # check the size of the local item (if a folder item is referenced, it has a default Length of 1, so no actual check for size but it will pass)
+                        if ([math]::ceiling($LocalItem.Length / 1MB) -le $MaxSizeMB) {
+                            Write-SPOTLog ">>> For RunbookStep ""$($RunbookStep.Name)"" the referenced item for parameter ""$($cpar.Name)"" and value ""$($cpar.Value)"" was detected and is less than $($MaxSizeMB)MB. OK to continue." -Output $false -DBG $true
+                        }
+                        else {
+                            Write-SPOTLog ">>> ERROR: For RunbookStep ""$($RunbookStep.Name)"" the referenced item for parameter ""$($cpar.Name)"" and value ""$($cpar.Value)"" was detected but it is bigger than $($MaxSizeMB)MB. Cannot continue." -Output $false
+                            return $false
+                        }
+                    }
+                    else {
+                        Write-SPOTLog ">>> ERROR: For RunbookStep ""$($RunbookStep.Name)"" the referenced item for parameter ""$($cpar.Name)"" and value ""$($cpar.Value)"" was not detected. Cannot continue." -Output $false
+                        return $false
+                    }
+                }
+            }
+        }
+    }
+
+    return $true
+
+} # end of Validate-SPOTReferencedItems function
+
+######################################################################################################################
+function Validate-SPOTRunbookStep {
+    Param (
+    [Parameter(Mandatory=$true)]
+    [ValidateNotNullOrEmpty()]
+    [Object]
+    # the runbookstep to parse and validate
+    $RunbookStep
+    )
+
+    #####
+    Write-SPOTLog "Starting function Validate-SPOTRunbookStep for RunbookStep ""$($RunbookStep.Name)""." -Output $false -DBG $true
+
+    ######################
+    # SPOT internal step structure validation
+    if ($RunbookStep.Seq -in ("",$null,"0")) {
+        Write-SPOTLog "ERROR: For RunbookStep ""$($RunbookStep.Name)"" the Seq number is not defined or has an unsupported value: ""$($RunbookStep.Seq)"". Cannot continue." -Output $false
+        return $false
+    }
+    if ($RunbookStep.Function -notin $StepTypeDefinitions.Keys) {
+        Write-SPOTLog "ERROR: For RunbookStep ""$($RunbookStep.Name)"" the step type is not defined or has an unsupported value: ""$($RunbookStep.Function)"". Cannot continue." -Output $false
+        return $false
+    }
+    # check that PsExec type can be used only if the SPOT Capability is "Extended"
+    if (($RunbookStep.Function -eq "PowerShellCommandRemotePsExec") -and ($OrchVars._SPOTCapability -ne "Extended")) {
+        Write-SPOTLog "ERROR: For RunbookStep ""$($RunbookStep.Name)"" the step type depends on PsExec but the SPOT Capability is not ""Extended"". Cannot continue." -Output $false
+        return $false
+    }
+
+    #########################
+    # validate that the mandatory parameters are properly defined
+    $ManPars = Get-SPOTMandatoryStepParameters -StepType $RunbookStep.Function
+    foreach ($ManPar in $ManPars) {
+        if ($ManPar.Type -eq "StepParameter") {
+            if (!$RunbookStep.FunctionParams.$($ManPar.Name)) {
+                Write-SPOTLog "ERROR: For RunbookStep ""$($RunbookStep.Name)"" the ""$($ManPar.Name)"" step parameter is not defined. Cannot continue." -Output $false
+                return $false
+            }
+        }
+    }
+
+    #########################
+    # if additional step parameters are defined, they will break the loading
+    foreach ($par in $($RunbookStep.FunctionParams.keys)) {
+        if ($par -notin ($StepTypeDefinitions.($RunbookStep.Function).StepParameters.Keys).Where({!$_.StartsWith("_")})) {
+            Write-SPOTLog "ERROR: Current StepParameter ""$par"" must not be configured in Runbook ""$Name"" for the current step: ""$($RunbookStep.Name)"" of type: ""$($RunbookStep.Function)"". Cannot continue." -Output $false
+            return $false
+        }
+    }
+
+    #########################
+    # SPOT step function validation
+    if ($RunbookStep.FunctionParams.CommandName -notin $OrchVars._ProjectFunctions) {
+        Write-SPOTLog "ERROR: The function from the current RunbookStep ""$($RunbookStep.Name)"", ""$($RunbookStep.FunctionParams.CommandName)"", is not a valid SPOT step function." -Output $false
+        return $false
+    }
+    
+    ########################
+    # function parameter validation
+    $result = $true
+    # validate parameters for the first layer function in the step (the step type function)
+    if (!(Validate-SPOTParameterSet -Command $RunbookStep.Function -CommandParams $RunbookStep.FunctionParams)) {
+        $result = $false
+    }
+    # validate parameters for the second layer command in the step (the step function) 
+    if (!(Validate-SPOTParameterSet -Command $RunbookStep.FunctionParams.CommandName -CommandParams $RunbookStep.FunctionParams.CommandParameters)) {
+        $result = $false
+    }
+    # apply the validation result
+    if ($result -eq $false) {
+        Write-SPOTLog "ERROR: Some parameters from the current RunbookStep ""$($RunbookStep.Name)"" were not valid. Cannot continue." -Output $false
+        return $false
+    }
+
+    ########################
+    # make sure that (correct if necessary) VariablesToPublish are valid (all spaces are removed; "=" sign is removed if there is nothing before or after it)
+    if ($RunbookStep.FunctionParams.VariablesToPublish) {
+        $RunbookStep.FunctionParams.VariablesToPublish = foreach ($i in $RunbookStep.FunctionParams.VariablesToPublish) {
+            if (($i.Trim() -like "*=") -or ($i.Trim() -like "=*")) {
+                Write-SPOTLog "WARNING: The current item in VariablesToPublish ""$i"" has an equal sign without values on both sides of it. Removing the equal sign and continuing as is." -Output $false -DBG $true
+                $i = $i -replace "=",""
+            }
+            $i -replace '\s',""
+        }
+    }
+    
+    #####
+    Write-SPOTLog "Finished function Validate-SPOTRunbookStep for RunbookStep ""$($RunbookStep.Name)""." -Output $false -DBG $true
+
+    return $true
+         
+} # end of Validate-SPOTRunbookStep function
 
 ######################################################################################################################
 function Unlock-SPOTSecretStore {
@@ -2357,28 +2873,57 @@ function Set-SPOTMainPG {
     $syncHash.window.Control_ProgressBar.Dispatcher.invoke([action]{$syncHash.window.Control_ProgressBar.Value = $percent })
 }
 
-function ConvertTo-SPOTTreeNodes ($RunbookSteps) {
-    $collection = New-Object System.Collections.ObjectModel.ObservableCollection[object]
-    foreach ($RunbookStep in $RunbookSteps) {
-        $treeNode = New-Object PSObject -Property @{
-            DisplayName = "$($RunbookStep.Seq)_$($RunbookStep.Name)_$($RunbookStep.Description)"
-            IconPath = "$SPOTPath\res\$($RunbookStep.Status).png"
+function ConvertTo-SPOTTreeNodes () {
+    Param (
+        [Parameter(Mandatory=$true)]
+        [Runbook]
+        # the target runbook to process
+        $Runbook, 
+        [Parameter(Mandatory=$false)]
+        [AllowNull()]
+        [bool]
+        # the flag to set the current runbook as the main
+        $Main
+        )
+    
+    # main runbook case
+    if ($Main) {
+        $Mcollection = New-Object System.Collections.ObjectModel.ObservableCollection[object]
+        $MainNode = New-Object PSObject -Property @{
+            DisplayName = "$($Runbook.Seq)_$($Runbook.Name)_$($Runbook.Description)"
+            IconPath = "$SPOTPath\res\$($Runbook.Status).png"
             IsExpanded = $true
-            Tag = $RunbookStep.GUID
+            Tag = $Runbook.GUID
         }
-        if ($RunbookStep.GetType().Name -eq "Runbook") {
-            $treeNode | Add-Member NoteProperty -Name "Children" -Value @(ConvertTo-SPOTTreeNodes $RunbookStep.RunbookSteps) -Force 
-        }
-        if ($RunbookStep.Disabled -eq $true) {
-            $treeNode.IconPath = "$SPOTPath\res\disabled.png"
-        }
-        $collection.Add($treeNode)
+        $MainNode | Add-Member NoteProperty -Name "Children" -Value @(ConvertTo-SPOTTreeNodes -Runbook $Runbook) -Force
+        $Mcollection.Add($MainNode)
+        return $Mcollection
     }
-    return $collection
+    else {
+        $collection = New-Object System.Collections.ObjectModel.ObservableCollection[object]
+        foreach ($RunbookStep in $Runbook.RunbookSteps) {
+            $treeNode = New-Object PSObject -Property @{
+                DisplayName = "$($RunbookStep.Seq)_$($RunbookStep.Name)_$($RunbookStep.Description)"
+                IconPath = "$SPOTPath\res\$($RunbookStep.Status).png"
+                IsExpanded = $true
+                Tag = $RunbookStep.GUID
+            }
+            if ($RunbookStep.GetType().Name -eq "Runbook") {
+                $treeNode | Add-Member NoteProperty -Name "Children" -Value @(ConvertTo-SPOTTreeNodes -Runbook $RunbookStep) -Force 
+            }
+            if ($RunbookStep.Disabled -eq $true) {
+                $treeNode.IconPath = "$SPOTPath\res\disabled.png"
+            }
+            $collection.Add($treeNode)
+        }
+        return $collection
+    }
 }
 
 function Update-SPOTPublishedData {
-    $GuiData = @()
+    #############################################
+    # prepare the new published data objects
+    $NewGuiData = @()
     foreach ($pvar in $($PublishedData.Keys)) {
         $vValue = $null
         $sVal = $null
@@ -2390,10 +2935,23 @@ function Update-SPOTPublishedData {
         else {
             $sVal = $vValue.GetType().FullName
         }
-        $GuiData += [PSCustomObject]@{Name=$pvar; Value=$sVal}
+        # avoid display of internal remote runbook execution results
+        if (!($pvar.StartsWith("RunbookSummary_") -or $pvar.StartsWith("RunbookArtefacts_") -or $pvar.StartsWith("PublishedData_"))) {
+            $NewGuiData += [PSCustomObject]@{Name=$pvar; Value=$sVal}
+        }
     }
-    if ([management.automation.psserializer]::Serialize($GuiData) -ne [management.automation.psserializer]::Serialize($syncHash.window.Control_PublishedData.ItemsSource)) {
-        $syncHash.window.Control_PublishedData.Dispatcher.invoke([action]{$syncHash.window.Control_PublishedData.ItemsSource = $GuiData })
+
+    #############################################
+    # read the existing published data GUI objects
+    $GuiData = @()
+    if ($syncHash.window.Control_PublishedData.ItemsSource) {
+        $GuiData += $syncHash.window.Control_PublishedData.ItemsSource
+    }
+
+    #############################################
+    # update the GUI only if there are differences
+    if (Compare-Object -ReferenceObject $NewGuiData -DifferenceObject $GuiData -Property Name,Value) {
+        $syncHash.window.Control_PublishedData.Dispatcher.invoke([action]{$syncHash.window.Control_PublishedData.ItemsSource = $NewGuiData })
     }
 }
 
@@ -2427,12 +2985,13 @@ function Show-SPOTRunbookStepDetails ( $GUID ) {
         }
         if ($RunbookStep.FunctionParams.CommandParameters) {
             foreach ($fParam in $RunbookStep.FunctionParams.CommandParameters.GetEnumerator() ) {
-                if ($fParam.Value.GetType().Name -eq "PSCredential") {
-                    $StepDetailsData += [PSCustomObject]@{ Name = $fParam.Name ; Value = $fParam.Value.UserName ; Type = "Command Parameters" }
+                if ($fParam.Value) {
+                    if ($fParam.Value.GetType().Name -eq "PSCredential") {
+                        $StepDetailsData += [PSCustomObject]@{ Name = $fParam.Name ; Value = $fParam.Value.UserName ; Type = "Command Parameters" }
+                        continue
+                    }
                 }
-                else {
-                    $StepDetailsData += [PSCustomObject]@{ Name = $fParam.Name ; Value = $fParam.Value ; Type = "Command Parameters" }
-                }
+                $StepDetailsData += [PSCustomObject]@{ Name = $fParam.Name ; Value = $fParam.Value ; Type = "Command Parameters" }
             }
         }
     }
@@ -2456,10 +3015,36 @@ function Show-SPOTRunbookStepDetails ( $GUID ) {
         if ($RunbookStep.RemoteParams) {
             foreach ($rParam in $RunbookStep.RemoteParams.GetEnumerator() ) {
                 if ($rParam.Value.GetType().Name -eq "PSCredential") {
-                    $StepDetailsData += [PSCustomObject]@{ Name = $rParam.Name ; Value = $rParam.Value.UserName ; Type = "Remote Parameters" }
+                    $StepDetailsData += [PSCustomObject]@{ 
+                        Name  = $rParam.Name; 
+                        Value = $rParam.Value.UserName; 
+                        Type  = "Remote Parameters" 
+                    }
                 }
                 else {
-                    $StepDetailsData += [PSCustomObject]@{ Name = $rParam.Name ; Value = $rParam.Value ;          Type = "Remote Parameters" }
+                    $StepDetailsData += [PSCustomObject]@{ 
+                        Name = $rParam.Name; 
+                        Value = $rParam.Value;          
+                        Type = "Remote Parameters" 
+                    }
+                }
+            }
+        }
+        if ($RunbookStep.RunbookParameters) {
+            foreach ($rbParam in $RunbookStep.RunbookParameters.GetEnumerator() ) {
+                if ($rbParam.Value.GetType().Name -eq "string") {
+                    $StepDetailsData += [PSCustomObject]@{ 
+                        Name  = $rbParam.Name; 
+                        Value = $rbParam.Value;                
+                        Type  = "Runbook Parameters" 
+                    }
+                }
+                else {
+                    $StepDetailsData += [PSCustomObject]@{ 
+                        Name = $rbParam.Name; 
+                        Value = $rbParam.Value.GetType().Name; 
+                        Type = "Runbook Parameters" 
+                    }
                 }
             }
         }
@@ -2486,6 +3071,35 @@ function Show-SPOTRunbookStepDetails ( $GUID ) {
         $column.Width = 0
         $column.Width = [double]::NaN # NaN corresponds to 'Auto' in XAML
     }
+}
+
+function Update-SPOTRunbookNodeObjects ( $NodeObjects ) {
+    
+    $update = $false
+    foreach ($NodeObject in $NodeObjects) {
+        if ($NodeObject.Children) {
+            # this represents a Runbook object
+            $Runbook = $AllRunbooks[$NodeObject.Tag]
+            if ($NodeObject.IconPath -ne "$SPOTPath\res\$($Runbook.Status).png") {
+                $NodeObject.IconPath = "$SPOTPath\res\$($Runbook.Status).png"
+                $update = $true
+            }
+            if (Update-SPOTRunbookNodeObjects -NodeObjects $NodeObject.Children) {
+                $update = $true
+            }
+        }
+        else {
+            # this represents a RunbookStep object
+            $RunbookStep = $AllRunbookSteps[$NodeObject.Tag]
+            if ($NodeObject.IconPath -ne "$SPOTPath\res\$($RunbookStep.Status).png") {
+                $NodeObject.IconPath = "$SPOTPath\res\$($RunbookStep.Status).png"
+                $update = $true
+            }
+        }
+    }
+
+    # signal there was an update performed
+    return $update
 }
 
 #endregion GUI functions
@@ -2562,6 +3176,10 @@ $window.Control_LoadProject.Add_Click({
             if (!(Validate-SPOTProjectFolder -TargetPath $ProjectPath)) {
                 Write-SPOTConsole "ERROR: The target project folder does not seem to be a valid SPOT Project folder."
                 Write-SPOTLog "GUI: ERROR: The target project folder does not seem to be a valid SPOT Project folder."
+                $syncHash.window.Control_LoadProject.Dispatcher.invoke([action]{
+                    $syncHash.window.Control_LoadProject.IsEnabled = $true
+                    $syncHash.window.Control_LoadProject.Content = "Load Project"
+                })
                 return
             }
 
@@ -2673,6 +3291,10 @@ $window.Control_LoadProject.Add_Click({
             if (!$AreOrchVarsLoaded) {
                 Write-SPOTConsole "ERROR: The OrchVars could not be loaded."
                 Write-SPOTLog "GUI: ERROR: The OrchVars could not be loaded."
+                $syncHash.window.Control_LoadProject.Dispatcher.invoke([action]{
+                    $syncHash.window.Control_LoadProject.IsEnabled = $true
+                    $syncHash.window.Control_LoadProject.Content = "Load Project"
+                })
                 return
             }
 
@@ -2795,7 +3417,7 @@ $window.Control_LoadProject.Add_Click({
             # finished loading project
             Write-SPOTConsole "The SPOT project from the path ""$ProjectPath"" was loaded."
             Write-SPOTLog "GUI: The SPOT project from the path ""$ProjectPath"" was loaded."
-            $syncHash.window.Control_ComboRunbook.Dispatcher.invoke([action]{
+            $syncHash.window.Control_LoadProject.Dispatcher.invoke([action]{
                 $syncHash.window.Control_LoadProject.IsEnabled = $true
                 $syncHash.window.Control_LoadProject.Content = "Load Project"
             })
@@ -2885,11 +3507,16 @@ $window.Control_LoadRunbook.Add_Click({
             Write-SPOTConsole "ERROR: The runbook ""$SelectedRunbookName"" failed to load. Cannot continue."
             Write-SPOTLog "GUI: ERROR: The runbook ""$SelectedRunbookName"" failed to load. Cannot continue."
             Set-SPOTSmallPG -percent 0
+            $syncHash.window.Dispatcher.invoke([action]{
+                $syncHash.window.Control_LoadProject.IsEnabled = $true
+                $syncHash.window.Control_LoadRunbook.IsEnabled = $true
+                $syncHash.window.Control_LoadRunbook.Content = "Load Runbook"
+            })
             return $false
         }
 
         # extract relevant data from the runbooks to be loaded in the treeview
-        $observableTreeData = @(ConvertTo-SPOTTreeNodes ($AllRunbooks.$RunbookGUID).RunbookSteps)
+        $observableTreeData = @(ConvertTo-SPOTTreeNodes -Runbook $AllRunbooks.$RunbookGUID -Main $true)
 
         # load the relevant data to the treeview, via the dispatcher
         $syncHash.window.Dispatcher.invoke([action]{
@@ -2975,27 +3602,24 @@ $window.Control_StartStop.Add_Click({
                     Set-SPOTMainPG -percent $GUIStatus
                 }
 
-                # load the relevant data to the treeview, via the dispatcher, if it has changed
-                $observableTreeData = @(ConvertTo-SPOTTreeNodes $TargetRunbook.RunbookSteps)
-                if ([management.automation.psserializer]::Serialize($observableTreeData) -ne [management.automation.psserializer]::Serialize($syncHash.window.Control_MainRunbook.ItemsSource)) {
-                    $syncHash.window.Control_MainRunbook.Dispatcher.invoke([action]{$syncHash.window.Control_MainRunbook.ItemsSource = $observableTreeData })
+                # update the Runbook Details from the GUI
+                if (Update-SPOTRunbookNodeObjects -NodeObjects $syncHash.window.Control_MainRunbook.Items) {
+                    $syncHash.window.Control_MainRunbook.Dispatcher.invoke([action]{$syncHash.window.Control_MainRunbook.Items.Refresh() })
                 }
                 Update-SPOTPublishedData
 
                 if ($MainJob.handle.IsCompleted) {break}
             } 
 
-            # one last cycle, to make sure there is no status missed
-            $observableTreeData = @(ConvertTo-SPOTTreeNodes $TargetRunbook.RunbookSteps)
-            if ([management.automation.psserializer]::Serialize($observableTreeData) -ne [management.automation.psserializer]::Serialize($syncHash.window.Control_MainRunbook.ItemsSource)) {
-                $syncHash.window.Control_MainRunbook.Dispatcher.invoke([action]{$syncHash.window.Control_MainRunbook.ItemsSource = $observableTreeData })
-            }
-
-            Update-SPOTPublishedData
-
             # manage the runbook job
             Get-SPOTRunbookJobResult -RunbookJob $MainJob
             
+            # one last cycle, to make sure there is no status missed
+            if (Update-SPOTRunbookNodeObjects -NodeObjects $syncHash.window.Control_MainRunbook.Items) {
+                $syncHash.window.Control_MainRunbook.Dispatcher.invoke([action]{$syncHash.window.Control_MainRunbook.Items.Refresh() })
+            }
+            Update-SPOTPublishedData
+
             # close and dispose the main worker pool
             $_spot_MainWorkerPool.Dispose()
 
@@ -3113,25 +3737,23 @@ $window.Control_StartStop.Add_Click({
                 }
 
                 # load the relevant data to the treeview, via the dispatcher, if it has changed
-                $observableTreeData = @(ConvertTo-SPOTTreeNodes $TargetRunbook.RunbookSteps)
-                if ([management.automation.psserializer]::Serialize($observableTreeData) -ne [management.automation.psserializer]::Serialize($syncHash.window.Control_MainRunbook.ItemsSource)) {
-                    $syncHash.window.Control_MainRunbook.Dispatcher.invoke([action]{$syncHash.window.Control_MainRunbook.ItemsSource = $observableTreeData })
+                if (Update-SPOTRunbookNodeObjects -NodeObjects $syncHash.window.Control_MainRunbook.Items) {
+                    $syncHash.window.Control_MainRunbook.Dispatcher.invoke([action]{$syncHash.window.Control_MainRunbook.Items.Refresh() })
                 }
                 Update-SPOTPublishedData
 
                 if ($MainJob.handle.IsCompleted) {break}
             } 
 
-            # one last cycle, to make sure there is no status missed
-            $observableTreeData = @(ConvertTo-SPOTTreeNodes $TargetRunbook.RunbookSteps)
-            if ([management.automation.psserializer]::Serialize($observableTreeData) -ne [management.automation.psserializer]::Serialize($syncHash.window.Control_MainRunbook.ItemsSource)) {
-                $syncHash.window.Control_MainRunbook.Dispatcher.invoke([action]{$syncHash.window.Control_MainRunbook.ItemsSource = $observableTreeData })
-            }
-            Update-SPOTPublishedData
-
             # manage the runbook job
             Get-SPOTRunbookJobResult -RunbookJob $MainJob
             
+            # one last cycle, to make sure there is no status missed
+            if (Update-SPOTRunbookNodeObjects -NodeObjects $syncHash.window.Control_MainRunbook.Items) {
+                $syncHash.window.Control_MainRunbook.Dispatcher.invoke([action]{$syncHash.window.Control_MainRunbook.Items.Refresh() })
+            }
+            Update-SPOTPublishedData
+
             # close and dispose the main worker pool
             $_spot_MainWorkerPool.Dispose()
 

@@ -1,5 +1,6 @@
 # SPOT Classes
-# v1.0 - 12.04.2026 - initial version
+# v1.0 - 26.04.2026 - initial version
+# v1.1 - 17.05.2026 - simplified the object constructors to the 2 main use cases
 #
 #
 #
@@ -26,7 +27,7 @@ class RunbookStep {
     [string[]]  $Conditions             # a set of optional values which have to be all evaluated to True for the runbook/step to be executed. otherwise, the runbook/step will be skipped.
     [string]    $ArtefactsPath          # the file/folder path where the output files and other relevant files will be saved right after execution
     
-    RunbookStep([string]$Name,[string[]]$Conditions,[int]$Seq,[string]$Function,[hashtable]$FunctionParams) {
+    RunbookStep([string]$Name,[int]$Seq,[string]$Function,[hashtable]$FunctionParams) {
         $this.ExitValue = $null
         $this.Name = $Name
         $this.Seq = $Seq
@@ -41,9 +42,10 @@ class RunbookStep {
         $this.MultiLastExecutionTime = @{}
         $this.Disabled = $false
         $this.ContinueOnError = $false
-        $this.Conditions = $Conditions
+        $this.Conditions = @()
         $this.Description = $null
     }
+
     RunbookStep([string]$Name,[string[]]$Conditions,[string]$Description,[int]$Seq,[string]$Function,[hashtable]$FunctionParams) {
         $this.ExitValue = $null
         $this.Name = $Name
@@ -62,6 +64,7 @@ class RunbookStep {
         $this.Conditions = $Conditions
         $this.Description = $Description
     }
+
     RunbookStep(){}
 }
 
@@ -75,6 +78,7 @@ class Runbook {
     [string]   $Status            # used to see if the runbook is still running or if it is completed; it can be: Initial, Executing, Completed, Error, Disabled
     [hashtable]$MultiStatus       # the status of all parallel Jobs implied by this Step, in case there are multiple targets; applies only to remote runbooks
     [hashtable]$RemoteParams      # the parameters to be passed to the step function; exec function (e.g. PowershellCommandRemote) target computer, credentials to use.
+    [hashtable]$RunbookParameters # the parameters to be used inside the runbook as variables.
     [Object[]] $RunbookSteps      # the collection of runbook steps, to be executed in order of their sequence numbers
     [datetime] $StartTime         # the start time of the runbook execution
     [datetime] $LastExecutionTime # the time of the execution finish of the runbook job
@@ -85,33 +89,19 @@ class Runbook {
     [string[]] $Conditions        # a set of optional values which have to be all evaluated to True for the runbook/step to be executed. otherwise, the runbook/step will be skipped.
     [bool]     $StopFlag          # the attribute that signals if a stop has been requested for this runbook; it can be updated during execution but it is checked only between steps
     
-    Runbook([string]$Name,[string[]]$Conditions,[Int]$Seq,[Object[]]$RunbookSteps) {
+    Runbook([string]$Name,[Int]$Seq) {
         $this.Name = $Name
         $this.Seq = $Seq
         $this.GUID = $([guid]::NewGuid().ToString())
         $this.Status = "Initial"
         $this.MultiStatus = @{}
         $this.RemoteParams = @{}
-        $this.RunbookSteps = $RunbookSteps
+        $this.RunbookParameters = @{}
+        $this.RunbookSteps = @()
         $this.StopFlag = $false
         $this.Disabled = $false
         $this.ContinueOnError = $false
-        $this.Conditions = $Conditions
-    }
-
-    Runbook([string]$Name,[string[]]$Conditions,[string]$Description,[Int]$Seq,[Object[]]$RunbookSteps) {
-        $this.Name = $Name
-        $this.Description = $Description
-        $this.Seq = $Seq
-        $this.GUID = $([guid]::NewGuid().ToString())
-        $this.Status = "Initial"
-        $this.MultiStatus = @{}
-        $this.RemoteParams = @{}
-        $this.RunbookSteps = $RunbookSteps
-        $this.StopFlag = $false
-        $this.Disabled = $false
-        $this.ContinueOnError = $false
-        $this.Conditions = $Conditions
+        $this.Conditions = @()
     }
 
     Runbook([string]$Name,[string[]]$Conditions,[string]$Description,[Int]$Seq,[Object[]]$RunbookSteps,[hashtable]$RemoteParams) {
@@ -122,11 +112,13 @@ class Runbook {
         $this.Status = "Initial"
         $this.MultiStatus = @{}
         $this.RemoteParams = $RemoteParams
+        $this.RunbookParameters = @{}
         $this.RunbookSteps = $RunbookSteps
         $this.StopFlag = $false
         $this.Disabled = $false
         $this.ContinueOnError = $false
         $this.Conditions = $Conditions
     }
+
     Runbook(){}
 }

@@ -291,8 +291,11 @@ StepTypeDefinitions:
                 _Type: System.Management.Automation.PSCredential
 
     Runbook:
-        Type:   # reference to the parent property, which is the type of the runbook step (e.g. PowershellFunctionLocal)
+        Type:   # reference to the parent property, which is the type of the runbook step (in this case, a Runbook)
             _Mandatory: True
+            _Type: string
+        RunbookName:   # the name of the step runbook
+            _Mandatory: False
             _Type: string
         Disabled:   # marks the step runbook to be skipped during runbook execution
             _Mandatory: False
@@ -321,3 +324,6 @@ StepTypeDefinitions:
             Credential: # the credential to be used to connect to the remote computer
                 _Mandatory: False
                 _Type: System.Management.Automation.PSCredential
+        RunbookParameters: # the parameters that can be used internally by the runbook
+            _Mandatory: False
+            _Type: hashtable
