@@ -3,6 +3,13 @@
 # v1.1 - 17.05.2026 - fixed Load-SPOTRunbook to return only $false when encountering an error loading the yaml file
 #                   - added the RunbookParameters functionality in Load-SPOTRunbook and changed Replace Vars and Validate functions
 #                   - enhancements in the Start-SPOTGUI function
+# v1.2 - 03.07.2026 - changed the error behavior of some internal functions to use throw; extended attributes shown as strings in the GUI
+#                   - improved the GUI refresh during runbook execution; minor improvement to Load-SPOTRunbook to avoind self nesting
+#                   - added several public functions for SecretStore handling: Initialize-SPOTSecretStore, Get-SPOTSecretStoreStatus,
+#                     Remove-SPOTProjectSecrets and Show-SPOTProjectSecretsInfo
+#                   - Improved overall GUI and non-GUI SecretStore handling in various functions; improved Validate-SPOTRunbookRemoteParameters
+#                   - removed some unnecessary functions and improved Runbook loading and validations
+#                   - added support for references (including mixed strings) inside VariablesToPublish entries
 #
 #
 #
@@ -26,12 +33,12 @@ function Load-SPOTRunbook {
         [AllowNull()]
         [hashtable]
         # The set of (parent) Runbook Parameters to be used in case child runbooks are loaded
-        $RunbookParameters, 
+        $RunbookParameters,
         [Parameter(Mandatory=$false)]
         [ValidateNotNullOrEmpty()]
         [string]
         # the folder path where the output files and other relevant files will be saved right after execution
-        $ArtefactsPath = "C:\temp", 
+        $ArtefactsPath = "C:\Windows\temp", 
         [Parameter(Mandatory=$false)]
         [ValidateNotNullOrEmpty()]
         [int]
@@ -46,23 +53,24 @@ function Load-SPOTRunbook {
     
     #######
     Write-SPOTLog "#> Starting function Load-SPOTRunbook for runbook ""$Name""." -Output $false -DBG $true
-
-    ###################################################
-    # loads the runbooks from yaml text file and makes sure that all mandatory parameters for each step type are defined
     
     #########################
     # test the yaml module
-    Import-Module -Name powershell-yaml -ErrorAction SilentlyContinue
-    if (!(Get-Module -Name powershell-yaml)) {
-        Write-SPOTLog "ERROR: The powershell-yaml module could not be loaded. Cannot continue." -Output $false
-        return $false
+    if (!(Get-Module -Name powershell-yaml -ListAvailable)) {
+        Write-SPOTLog "ERROR: The powershell-yaml module is not available. Cannot continue." -Output $false
+        throw "Load-SPOTRunbook: powershell-yaml module not available!"
     }
 
+    #########################
     # load the step type definitions from yaml file
-    $StepTypeDefinitions = Get-SPOTStepTypeDefinitions
     if (!$StepTypeDefinitions) {
-        Write-SPOTLog "ERROR: The StepTypeDefinitions could not be loaded from file. Cannot continue." -Output $false
-        return $false
+        try {
+            $global:StepTypeDefinitions = Get-SPOTStepTypeDefinitions
+        }
+        catch {
+            Write-SPOTLog "ERROR: The StepTypeDefinitions could not be loaded from file. Cannot continue." -Output $false
+            throw "Load-SPOTRunbook: error loading StepTypeDefinitions!"
+        }
     }
 
     #########################
@@ -86,7 +94,7 @@ function Load-SPOTRunbook {
     # test the runbook ConfigFile existence
     if (!$ConfigFile) {
         Write-SPOTLog "ERROR: The configuration file ""$Name"" could not be detected in the default folder: ""$RunbooksPath"". Cannot continue." -Output $false
-        return $false
+        throw "Load-SPOTRunbook: error loading runbook file!"
     }
 
     #########################
@@ -97,17 +105,13 @@ function Load-SPOTRunbook {
     }
     catch {
         Write-SPOTLog "ERROR: while loading the yaml file ""$($ConfigFile.FullName)"": $_." -Output $false
-        return $false
+        throw "Load-SPOTRunbook: error loading runbook file!"
     }
 
     ###################################################
     # determine the total number of steps for this runbook and any subordinate ones
     if (!$global:TotalStepCount) {
         $global:TotalStepCount = [int](Get-SPOTStepsCountFromRunbookName -RunbookName $Name -ProjectRunbooksPath $RunbooksPath)
-        if (!$global:TotalStepCount) {
-            Write-SPOTLog "ERROR: The Total Runbook Step count could not be determined. Cannot continue." -Output $false
-            return $false
-        }
         $global:75 = [math]::Floor($global:TotalStepCount/4)
         $global:50 = [math]::Floor($global:TotalStepCount/2)
         $global:25 = [math]::Floor($global:TotalStepCount*3/4)
@@ -121,12 +125,11 @@ function Load-SPOTRunbook {
     $Runbook = [Runbook]::new($Name,$Seq)
     $Runbook.Description       = $RunbookConfig.Description
     $Runbook.Conditions        = $RunbookConfig.Conditions
-    $Runbook.RemoteParams      = $RunbookConfig.RemoteParameters
     $Runbook.ContinueOnError   = $RunbookConfig.ContinueOnError
+    $Runbook.RemoteParameters  = $RunbookConfig.RemoteParameters
     $Runbook.RunbookParameters = $RunbookConfig.RunbookParameters
     $Runbook.ArtefactsPath     = $CurrentArtefactsPath
     if ($Disabled -or $RunbookConfig.Disabled) { $Runbook.Disabled = $true}
-    
     
     if ($Runbook.RunbookParameters) {
         # runbook parameters were defined inside the current Runbook yaml and imported in the current runbook object
@@ -139,21 +142,26 @@ function Load-SPOTRunbook {
                     Write-SPOTLog "INFO: For runbook ""$Name"", the Runbook Parameter ""$RPar"" was overwritten from the calling RunbookStep runbook parameters." -Output $false -DBG $true
                 }
             }
+            # if there are extra RunbookParameters coming from the parent Runbook via RunbookStep attributes, they will be ignored
+            foreach ($PRPar in $($RunbookParameters.Keys)){
+                if ($PRPar -notin $($Runbook.RunbookParameters.Keys)) {
+                    Write-SPOTLog "WARNING: For runbook ""$Name"", the Runbook Parameter ""$PRPar"" was defined in the calling RunbookStep runbook parameters but does not exist in the actual runbook. It will be ignored." -Output $false -DBG $true
+                }
+            }
         }
     }
 
-    # replace the the O&S&R Vars in the current runbook
-    if (!(Replace-SPOTVarsInRunbook -Runbook $Runbook)) {
-        Write-SPOTLog "ERROR: for the current runbook ""$($Runbook.Name)"" the O&S&R Vars could not be replaced properly. Cannot continue." -Output $false
-        return $false
+    if ($Seq -eq 0) {
+        # replace the the O&S&R Vars in the current runbook, if it is the main one
+        Replace-SPOTVarsInRunbook -Runbook $Runbook
+        
+        # validate the remote parameters configured from the current runbook yaml
+        if (!(Validate-SPOTRunbookRemoteParameters -Runbook $Runbook)) {
+            Write-SPOTLog "ERROR: for the current Runbook ""$($Runbook.Name)"" the remote parameters are not validated. Cannot continue." -Output $false
+            throw "Load-SPOTRunbook: error validating remote runbook parameters!"
+        }
     }
-
-    # validate the remote parameters configured from the current runbook yaml
-    if (!(Validate-SPOTRunbookRemoteParameters -Runbook $Runbook)) {
-        Write-SPOTLog "ERROR: for the current Runbook ""$($Runbook.Name)"" the remote parameters are not validated. Cannot continue." -Output $false
-        return $false
-    }
-
+    
     ###################################################
     # build the runbook steps
     $RunbookSteps = @()
@@ -167,48 +175,59 @@ function Load-SPOTRunbook {
 
             ######################
             # handle referencing Runbook Parameters by using the current runbook parameters from parent runbook parameters defined above
+            # the Runbook Parameters defined in the called runbook yaml file do not contain references as they are for standalone runbook use
+            # the only place to contain references to parent runbook parameters is the RunbookStep config
             foreach ($i in $($RunbookStepConfig.Value.RunbookParameters.Keys)) {
                 if ($RunbookStepConfig.Value.RunbookParameters.$i) { 
                     if (($RunbookStepConfig.Value.RunbookParameters.$i).GetType().Name -eq "String") {
                         if (($RunbookStepConfig.Value.RunbookParameters.$i).StartsWith("`$RP:") -and (($RunbookStepConfig.Value.RunbookParameters.$i -split ":").Count -eq 2)) {
-                            Write-SPOTLog "Current child runbook parameter ""$i"" detected as single reference and starting with `$RP." -Output $false -DBG $true
+                            Write-SPOTLog "Value of current parameter ""$i"" from nested runbook ""$($RunbookStepConfig.Name)"" detected as single reference and starting with `$RP." -Output $false -DBG $true
                             try {
                                 $RunbookStepConfig.Value.RunbookParameters.$i = Invoke-Expression -Command "`$Runbook.RunbookParameters.$(($RunbookStepConfig.Value.RunbookParameters.$i -split ":")[1])"
                             }
                             catch {
-                                Write-SPOTLog ">>> ERROR while replacing RP in child Runbook Parameter: $_." -Output $false
-                                return $false
+                                Write-SPOTLog ">>> ERROR while replacing RP reference in nested Runbook Parameter: $_." -Output $false
+                                throw "Load-SPOTRunbook: error replacing SPOT vars!"
                             }
-                            Write-SPOTLog "Changed the child runbook parameter ""$i"" into ""$($RunbookStepConfig.Value.RunbookParameters.$i)""." -Output $false -DBG $true
+                            Write-SPOTLog "Changed parameter ""$i"" from nested runbook ""$($RunbookStepConfig.Name)"" into ""$($RunbookStepConfig.Value.RunbookParameters.$i)""." -Output $false -DBG $true
                         }
                         elseif (($RunbookStepConfig.Value.RunbookParameters.$i).StartsWith("`$RP:") -and (($RunbookStepConfig.Value.RunbookParameters.$i -split ":").Count -gt 2)) {
-                            Write-SPOTLog "ERROR: Non-single RP reference detected in child Runbook Parameter ""$($RunbookStepConfig.Value.RunbookParameters.$i)"". Mixed string references are not allowed in Runbook Parameters. Cannot continue." -Output $false
-                            return $false
+                            Write-SPOTLog "ERROR: Non-single RP reference detected for parameter ""$i"" in nested Runbook ""$($RunbookStepConfig.Name)"" with value ""$($RunbookStepConfig.Value.RunbookParameters.$i)"". Mixed string references are not allowed in Runbook Parameters. Cannot continue." -Output $false
+                            throw "Load-SPOTRunbook: unexpected mixed string references!"
                         }
                     }
                 }
             }
 
             ######################
-            # load the child runbook from its own runbook yaml file; propagate the disable state down
+            # load the nested runbook from its own runbook yaml file; propagate the disable state down
             if ($Runbook.Disabled -or $RunbookStepConfig.Value.Disabled) { $RunbookDisable = $true }
-            if ($RunbookStepConfig.Value.Seq -and ($null -ne ($RunbookStepConfig.Value.Seq -as [int]))) {
+            if ($RunbookStepConfig.Value.Seq -and ($null -ne ($RunbookStepConfig.Value.Seq -as [int])) -and ($RunbookStepConfig.Value.Seq -ne 0)) {
                 if ($RunbookStepConfig.Value.RunbookName) {
-                    $RunbookGUID = Load-SPOTRunbook -Name $RunbookStepConfig.Value.RunbookName -RunbookParameters $RunbookStepConfig.Value.RunbookParameters -Seq $RunbookStepConfig.Value.Seq -ArtefactsPath "$CurrentArtefactsPath\$($RunbookStepConfig.Name)_#_$($RunbookStepConfig.Value.RunbookName)" -Disabled $RunbookDisable
+                    if ($RunbookStepConfig.Value.RunbookName -eq $Name) {
+                        # trying to load a runbook inside itself as a runbook step!! no go
+                        throw "Load-SPOTRunbook: a runbook cannot be present as a runbook step inside itself!"
+                    }
+                    else {
+                        $RunbookGUID = Load-SPOTRunbook -Name $RunbookStepConfig.Value.RunbookName -RunbookParameters $RunbookStepConfig.Value.RunbookParameters -Seq $RunbookStepConfig.Value.Seq -ArtefactsPath "$CurrentArtefactsPath\$($RunbookStepConfig.Name)_#_$($RunbookStepConfig.Value.RunbookName)" -Disabled $RunbookDisable
+                    }
                 }
                 else {
-                    $RunbookGUID = Load-SPOTRunbook -Name $RunbookStepConfig.Name -RunbookParameters $RunbookStepConfig.Value.RunbookParameters -Seq $RunbookStepConfig.Value.Seq -ArtefactsPath "$CurrentArtefactsPath\$($RunbookStepConfig.Name)" -Disabled $RunbookDisable
+                    if ($RunbookStepConfig.Name -eq $Name) {
+                        # trying to load a runbook inside itself as a runbook step!! no go
+                        throw "Load-SPOTRunbook: a runbook cannot be present as a runbook step inside itself!"
+                    }
+                    else {
+                        $RunbookGUID = Load-SPOTRunbook -Name $RunbookStepConfig.Name -RunbookParameters $RunbookStepConfig.Value.RunbookParameters -Seq $RunbookStepConfig.Value.Seq -ArtefactsPath "$CurrentArtefactsPath\$($RunbookStepConfig.Name)" -Disabled $RunbookDisable
+                    }
                 }
             }
             else {
-                Write-SPOTLog "ERROR: For Child Runbook ""$($RunbookStepConfig.Name)"" the Seq number has an unsupported value: ""$($RunbookStepConfig.Value.Seq)"". It must be an integer. Cannot continue." -Output $false
-                return $false
+                Write-SPOTLog "ERROR: For nested Runbook ""$($RunbookStepConfig.Name)"" the Seq number has an unsupported value: ""$($RunbookStepConfig.Value.Seq)"". It must be a non-zero integer. Cannot continue." -Output $false
+                throw "Load-SPOTRunbook: unexpected Seq value!"
             }
-            if ($RunbookGUID -eq $false) {
-                Write-SPOTLog "ERROR: The Child Runbook ""$($RunbookStepConfig.Name)"" could not be loaded. Cannot continue." -Output $false
-                return $false
-            }
-            # get the current step, which is a runbook, from the synched all runbooks hashtable variable
+
+            # get the object of the current step, which is a runbook, from the synched all runbooks hashtable variable
             $RunbookStep = $AllRunbooks.$($RunbookGUID)
 
             ######################
@@ -218,20 +237,17 @@ function Load-SPOTRunbook {
             else { $RunbookStep.ContinueOnError = $OrchVars._ContinueOnError }
             if ($RunbookStepConfig.Value.Conditions) { $RunbookStep.Conditions = $RunbookStepConfig.Value.Conditions }
             if ($RunbookStepConfig.Value.Description) { $RunbookStep.Description = $RunbookStepConfig.Value.Description }
-            if ($RunbookStepConfig.Value.RemoteParameters) { $RunbookStep.RemoteParams = $RunbookStepConfig.Value.RemoteParameters }
-
-            ######################
-            # validate the potentially new remote parameters after replacing any references
-            if (!(Validate-SPOTRunbookRemoteParameters -Runbook $RunbookStep)) {
-                Write-SPOTLog "ERROR: for the current child Runbook ""$($RunbookStep.Name)"" the remote parameters are not validated. Cannot continue." -Output $false
-                return $false
-            }
+            if ($RunbookStepConfig.Value.RemoteParameters) { $RunbookStep.RemoteParameters = $RunbookStepConfig.Value.RemoteParameters }
 
             ######################
             # replace the the O&S&R Vars in the current child runbook, specially for potential new RemoteParameters and Conditions
-            if (!(Replace-SPOTVarsInRunbook -Runbook $RunbookStep)) {
-                Write-SPOTLog "ERROR: for the current child Runbook ""$($RunbookStep.Name)"" the O&S&R Vars could not be replaced properly. Cannot continue." -Output $false
-                return $false
+            Replace-SPOTVarsInRunbook -Runbook $RunbookStep
+
+            ######################
+            # validate the remote parameters after replacing any references
+            if (!(Validate-SPOTRunbookRemoteParameters -Runbook $RunbookStep)) {
+                Write-SPOTLog "ERROR: for the current nested Runbook ""$($RunbookStep.Name)"" the remote parameters are not validated. Cannot continue." -Output $false
+                throw "Load-SPOTRunbook: error validating remote runbook parameters!"
             }
         }
         else {
@@ -245,10 +261,10 @@ function Load-SPOTRunbook {
             }
             else {
                 Write-SPOTLog "ERROR: For RunbookStep ""$($RunbookStepConfig.Name)"" the Seq number has an unsupported value: ""$($RunbookStepConfig.Value.Seq)"". It must be an integer. Cannot continue." -Output $false
-                return $false
+                throw "Load-SPOTRunbook: unexpected Seq value!"
             }
-            $RunbookStep.ArtefactsPath = "$CurrentArtefactsPath\$($RunbookStep.Name).log"
-            $RunbookStep.ArtefactsPath = "$(Split-Path -Path $RunbookStep.ArtefactsPath -Parent)\$($Runbook.GUID)_$(Split-Path -Path $RunbookStep.ArtefactsPath -Leaf)"
+            
+            $RunbookStep.ArtefactsPath = "$CurrentArtefactsPath\$($Runbook.GUID)_$($RunbookStep.Name).log"
             $RunbookStep.Description   = $RunbookStepConfig.Value.Description
             $RunbookStep.Conditions    = $RunbookStepConfig.Value.Conditions
 
@@ -277,27 +293,23 @@ function Load-SPOTRunbook {
             else {
                 Write-SPOTLog "INFO: The RunbookStep ""$($RunbookStep.Name)"" is not disabled. Performing validation." -Output $false -DBG $true
 
+                #########################
+                # start with replacing SPOTVars
+                Replace-SPOTVarsInRunbookStep -RunbookStep $RunbookStep -RbParameters $Runbook.RunbookParameters
+
                 ########################
-                # validate all parameters
+                # validate parameters
                 if (!(Validate-SPOTRunbookStep -RunbookStep $RunbookStep)) {
                     Write-SPOTLog "ERROR: for the current RunbookStep ""$($RunbookStep.Name)"" the parameters are not validated. Cannot continue." -Output $false
-                    return $false
+                    throw "Load-SPOTRunbook: error validating runbook step parameters!"
                 }
 
                 ########################
                 # check the size of referenced Items
                 if (!(Validate-SPOTReferencedItems -RunbookStep $RunbookStep -MaxSizeMB $ReferencedFileSizeLimit)) {
                     Write-SPOTLog "ERROR: for the RunbookStep ""$($RunbookStep.Name)"" the referenced file size validation failed. Cannot continue." -Output $false
-                    return $false
+                    throw "Load-SPOTRunbook: error validating referenced items!"
                 }
-
-                #########################
-                # start with replacing SPOTVars
-                if (!(Replace-SPOTVarsInRunbookStep -RunbookStep $RunbookStep -RbParameters $Runbook.RunbookParameters)) {
-                    Write-SPOTLog "ERROR: for the RunbookStep ""$($RunbookStep.Name)"" the O&S&R Vars could not be properly replaced. Cannot continue." -Output $false
-                    return $false
-                }
-
             }
 
             ######################
@@ -364,59 +376,52 @@ function Load-SPOTProject {
     }
     else {
         Write-SPOTLog "ERROR: The provided path was not detected as a folder. Cannot continue." -Output $false
-        return $false
+        throw "Load-SPOTProject: project path not found!"
     }
 
     ###########################################
     # validate project folder
-    $SPValidated = Validate-SPOTProjectFolder -TargetPath $ProjectPath
-    if (!$SPValidated) {
+    if (!(Validate-SPOTProjectFolder -TargetPath $ProjectPath)) {
         Write-SPOTLog "ERROR: The provided path was not validated as a SPOT project path. Cannot continue." -Output $false
-        return $false
+        throw "Load-SPOTProject: project folder not validated!"
     }
 
     ###########################################
     # test for Initialized status
-    $SPOTStatus = Get-SPOTStatus
+    if ($MasterPassword) {
+        $SPOTStatus = Get-SPOTStatus -MasterPassword $MasterPassword
+    }
+    else {
+        $SPOTStatus = Get-SPOTStatus
+    }
     if ($SPOTStatus -ne "Initialized") {
         Write-SPOTLog "ERROR: The SPOT tool is not initialized. Current status: $SPOTStatus. Cannot continue." -Output $false
-        return $false
+        throw "Load-SPOTProject: SPOT not initialized!"
     }
 
     ###########################################
     # unlock the secrets store
     if ($MasterPassword) {
-        $IsSecretStoreUnlocked = Unlock-SPOTSecretStore -MasterPassword $MasterPassword
+        Unlock-SPOTSecretStore -MasterPassword $MasterPassword
     }
     else {
-        $IsSecretStoreUnlocked = Unlock-SPOTSecretStore
+        Unlock-SPOTSecretStore
     }
-    # check if the unlock worked
-    if (!$IsSecretStoreUnlocked) {
-        Write-SPOTLog "ERROR: The SPOT secret store could not be unlocked. Cannot continue." -Output $false
-        return $false
-    }
-    else {
-        Write-SPOTLog "The SPOT secret store was unlocked." -Output $false -DBG $true
-    }
+    Write-SPOTLog "The SPOT secret store was unlocked." -Output $false -DBG $true
 
     ###########################################
     # check for secrets file and use it if present to refresh the Vault (if the file is present, it will be used all the time; if not, not)
     if ($MasterPassword) {
-        $PSImported = Import-SPOTProjectSecrets -ProjectPath $ProjectPath -MasterPassword $MasterPassword
+        Import-SPOTProjectSecrets -ProjectPath $ProjectPath -MasterPassword $MasterPassword
     }
     else {
-        $PSImported = Import-SPOTProjectSecrets -ProjectPath $ProjectPath
+        Import-SPOTProjectSecrets -ProjectPath $ProjectPath
     }
-    if (!$PSImported) {
-        Write-SPOTLog "ERROR: There was an error while trying to import/refresh the SPOT project secrets. Cannot continue." -Output $false
-        return $false
-    }
-
+    
     ###########################################
     # initialize the SPOT variables with internal and project values, as well as with the (potentially) updated secret vault available
     Initialize-SPOTVariables -ProjectPath $ProjectPath
-
+    
     ###########################################
     # load all SPOT classes
     . "$($OrchVars._SPOTPath)\classes\Classes.ps1"
@@ -441,7 +446,7 @@ function Load-SPOTProject {
     # populate the list of Runbook functions (to be used to create inidividual runspaces for Runbook execution) 
     # and the list of Payload/Step functions (to be used for the Main Runspace Pool initial session state)
     $OrchVars._ProjectFunctions += (Get-SPOTProjectFunctions).Name
-    $OrchVars._StepFunctions = $OrchVars._ProjectFunctions + ("Write-SPOTLog",
+    $OrchVars._StepFunctions = @($OrchVars._ProjectFunctions) + ("Write-SPOTLog",
                                 "Get-SPOTSshNetPath",
                                 "New-SPOTSSHSession",
                                 "New-SPOTSFTPSession",
@@ -456,6 +461,7 @@ function Load-SPOTProject {
                                 "Replace-SPOTLineVars",
                                 "Replace-SPOTLineCred",
                                 "Process-SPOTCommandParamsRF",
+                                "Process-SPOTCommandParamsLocalRF",
                                 "Transfer-SPOTDataOverPipe",
                                 "Replace-SPOTExitInCode")
     $OrchVars._StepFunctions = $OrchVars._StepFunctions | Select-Object -Unique
@@ -465,8 +471,6 @@ function Load-SPOTProject {
 
     #######
     Write-SPOTLog "##> Finished function Load-SPOTProject for project path ""$ProjectPath""." -Output $false -DBG $true
-
-    return $true
 
 } # end of Load-SPOTProject function
 
@@ -487,7 +491,7 @@ function Initialize-SPOTVariables {
     Import-Module -Name powershell-yaml -ErrorAction SilentlyContinue
     if (!(Get-Module -Name powershell-yaml)) {
         Write-SPOTLog "ERROR: The powershell-yaml module could not be loaded. Cannot continue." -Output $false
-        return $false
+        throw "Initialize-SPOTVariables: error loading powershell-yaml module!"
     }
 
     # detect SPOT Path if it was not already set (for GUI, SPOT cannot be detected from inside a runspace)
@@ -499,7 +503,7 @@ function Initialize-SPOTVariables {
     # testing project config file path
     if (!(Test-Path -Path $ProjectConfigPath -PathType Leaf)) {
         Write-SPOTLog "ERROR: No project config file detected at the expected location: $ProjectConfigPath. Cannot continue." -Output $false
-        return $false
+        throw "Initialize-SPOTVariables: project path not found!"
     }
 
     # define the main orchestration variable set, only if it is not already initialized in a different runspace and replicated here
@@ -547,7 +551,7 @@ function Initialize-SPOTVariables {
     }
     catch {
         Write-SPOTLog "ERROR: while loading the yaml file $ProjectConfigPath. Error details: $_."
-        return $false
+        throw "Initialize-SPOTVariables: error loading OrchVars file!"
     }
 
     foreach ($Var in $($ProjectConfigs.Keys)) { 
@@ -628,7 +632,7 @@ function Initialize-SPOTVariables {
             }
             catch {
                 Write-SPOTLog "ERROR: while loading secret $($s.Name) from the vault: $_." -Output $false -DBG $true
-                return $false
+                throw "Initialize-SPOTVariables: error loading secrets!"
             }
         }
     }
@@ -674,7 +678,6 @@ function Initialize-SPOTVariables {
     ####################################################################
     Write-SPOTLog "===== Finished function Initialize-SPOTVariables =====" -Output $false
     
-    return $true
 } # end of Initialize-SPOTVariables function
 
 ######################################################################################################################
@@ -691,29 +694,25 @@ function Start-SPOTOrchestration {
         # The number of seconds to wait between the checks for the runbook execution completion
         $CheckInterval = 10 
         )
-
+    
+    #############################
+    Write-SPOTLog "__## MAIN ##__Starting function Start-SPOTOrchestration for runbook ""$MainRunbookName"".__## MAIN ##__"
     # cleanup the total numer of steps
     if ($global:TotalStepCount) {
         $global:TotalStepCount = $null
     }
-
-    # load the main runbook
     $MainRunbookGUID = Load-SPOTRunbook -Name $MainRunbookName -ArtefactsPath "$($OrchVars._ProjectPath)\__SPOT_Artefacts"
-    if ($MainRunbookGUID -eq $false) {
-        Write-SPOTLog "__## MAIN ##__Runbook ""$MainRunbookName"" could not be loaded. Cannot launch execution.__## MAIN ##__"
-        return $false
-    }
     $Runbook = $AllRunbooks.$($MainRunbookGUID)
 
+    #############################
     # just before starting the main Runbook Job, start also the SPOT RunspacePool
     $global:_spot_MainWorkerPool = Create-SPOTRsPool -MaxNumber $OrchVars._SPOTRsPoolMax
-
     # launch runbook execution
     $MainJob = Start-SPOTRunbookJob -GUID $Runbook.GUID
-
     # wait a little for the dedicated runspace to start
     Start-Sleep -Seconds 4
 
+    #############################
     # check the status in a loop, until the orchestration is finished
     while (!$MainJob.handle.IsCompleted) {
         Start-Sleep -Seconds 5
@@ -724,11 +723,13 @@ function Start-SPOTOrchestration {
         Write-SPOTLog ">>> Progress: $CurrentStatus % >>> Current Runbooks: $CurrentRunbooks >>> Current RunbookSteps: $CurrentRunbookSteps <<<"
     } 
 
+    #############################
+    # get main runbook results
     Get-SPOTRunbookJobResult -RunbookJob $MainJob
-
     # close and dispose the main worker pool
     $_spot_MainWorkerPool.Dispose()
 
+    #############################
     # log the overall execution result
     if ($Runbook.ExitValue -eq $false) {
         Write-SPOTLog "__## MAIN ##__Runbook ""$($Runbook.Name)"" execution finished and returned failure.__## MAIN ##__"
@@ -762,15 +763,15 @@ function Get-SPOTStepsCountFromRunbookName {
     $Config = Get-ChildItem -Path $ProjectRunbooksPath -Recurse | Where {$_.BaseName -eq $RunbookName} | Select-Object -First 1
     if (!$Config) {
         Write-SPOTLog "ERROR: No runbook with the given name ""$RunbookName"" detected in the target runbookspath ""$ProjectRunbooksPath""." -Output $false
-        return $false
+        throw "Get-SPOTStepsCountFromRunbookName: runbook not found!"
     }
     $yamlConfig = Get-Content -Path $Config.FullName -raw
     try {
         $RunbookCfg = ConvertFrom-Yaml $yamlConfig
     }
     catch {
-        Write-SPOTLog "ERROR: while loading the yaml file ""$($Config.FullName)"". Error details: $_."
-        return $false
+        Write-SPOTLog "ERROR: while loading the yaml file ""$($Config.FullName)"". Error details: $_." -Output $false
+        throw "Get-SPOTStepsCountFromRunbookName: error loading runbook file!"
     }
 
     ############################
@@ -833,65 +834,61 @@ function Replace-SPOTVarsInRunbook {
             if (($Runbook.RunbookParameters.$i).GetType().Name -eq "String") {
                 $Splitted = ($Runbook.RunbookParameters.$i).Trim() -split ":"
                 if ($Splitted.Count -eq 2) {
-                    # a reference is present
+                    ###############################
+                    # check for unsupported cases
+                    if ([string]::IsNullOrEmpty($Splitted[1])) {
+                        Write-SPOTLog " >> ERROR: the current Var reference in current runbook parameter ""$i"" is null or empty. Cannot continue." -Output $false
+                        throw "Replace-SPOTVarsInRunbook: empty Var reference!"
+                    }
+                    elseif ($Splitted[1] -eq '.') {
+                        Write-SPOTLog " >> ERROR: The current Var reference in current runbook parameter ""$i"" is for the full Var set. Not needed/supported in Runbook Remote Parameters. Cannot continue." -Output $false
+                        throw "Replace-SPOTVarsInRunbook: unexpected dot reference!"
+                    }
+                    elseif ($Splitted[1] -like '*=*') {
+                        Write-SPOTLog " >> ERROR: The current Var reference in current runbook parameter ""$i"" contains ""="" character and this is not supported in a Var reference. Cannot continue." -Output $false
+                        throw "Replace-SPOTVarsInRunbook: unsupported Var reference!"
+                    }
+                    ###############################
+                    # process based on Var types
                     switch ($Splitted[0]) {
                         #########################################
                         "`$RP" {
                             # single reference to RP
                             Write-SPOTLog " > Current runbook parameter ""$i"" detected as single `$RP reference." -Output $false -DBG $true
                             Write-SPOTLog " >> ERROR: There should be no RP references in Runbook Parameters when the runbook is processed by this function!! Cannot continue." -Output $false
-                            return $false
+                            throw "Replace-SPOTVarsInRunbook: unexpected RP reference at this time!"
                         }
                         #########################################
                         "`$OV" {
                             # single reference to OV
                             Write-SPOTLog " > Current runbook parameter ""$i"" detected as single `$OV reference." -Output $false -DBG $true
-                            if ([string]::IsNullOrEmpty($Splitted[1])) {
-                                Write-SPOTLog " >> ERROR: the current OV reference is null or empty. Cannot continue." -Output $false
-                                return $false
+                            try {
+                                $Runbook.RunbookParameters.$i = Invoke-Expression -Command "`$OrchVars.$($Splitted[1])"
                             }
-                            elseif ($Splitted[1] -eq '.') {
-                                Write-SPOTLog " >> ERROR: The current OV reference is for the full OV. Not needed/supported. Cannot continue." -Output $false
-                                return $false
+                            catch {
+                                Write-SPOTLog " >> ERROR: while replacing OV in runbook parameter: $_." -Output $false
+                                throw "Replace-SPOTVarsInRunbook: error replacing OV reference!"
                             }
-                            else {
-                                try {
-                                    $Runbook.RunbookParameters.$i = Invoke-Expression -Command "`$OrchVars.$($Splitted[1])"
-                                }
-                                catch {
-                                    Write-SPOTLog " >> ERROR: while replacing OV in runbook parameter: $_." -Output $false
-                                    return $false
-                                }
-                                Write-SPOTLog " >> INFO: Changed the runbook parameter ""$i"" into ""$($Runbook.RunbookParameters.$i)""." -Output $false -DBG $true
-                            }
+                            Write-SPOTLog " >> INFO: Changed the runbook parameter ""$i"" into ""$($Runbook.RunbookParameters.$i)""." -Output $false -DBG $true
+                            
                         }
                         #########################################
                         "`$SV" {
                             # single reference to SV
                             Write-SPOTLog " > Current runbook parameter ""$i"" detected as single `$SV reference." -Output $false -DBG $true
-                            if ([string]::IsNullOrEmpty($Splitted[1])) {
-                                Write-SPOTLog " >> ERROR: the current SV reference is null or empty. Cannot continue." -Output $false
-                                return $false
-                            }
-                            elseif ($Splitted[1] -eq '.') {
-                                Write-SPOTLog " >> INFO: The current SV reference is for the full SV. It will be replaced later, just in time for execution." -Output $false -DBG $true
-                            }
-                            else {
-                                $Runbook.RunbookParameters.$i = $SVars[$Splitted[1]]
-                                Write-SPOTLog " >> INFO: Changed the runbook parameter ""$i"" into ""$($Runbook.RunbookParameters.$i)""." -Output $false -DBG $true
-                            }
+                            $Runbook.RunbookParameters.$i = $SVars[$Splitted[1]]
+                            Write-SPOTLog " >> INFO: Changed the runbook parameter ""$i"" into ""$($Runbook.RunbookParameters.$i)""." -Output $false -DBG $true
                         }
                         #########################################
                         "`$PV" {
                             # single reference to PV
                             Write-SPOTLog " > Current runbook parameter ""$i"" detected as single `$PV reference." -Output $false -DBG $true
-                            if ([string]::IsNullOrEmpty($Splitted[1])) {
-                                Write-SPOTLog " >> ERROR: the current PV reference is null or empty. Cannot continue." -Output $false
-                                return $false
-                            }
-                            else {
-                                Write-SPOTLog " >> INFO: The current PV reference will be replaced later, just in time for execution." -Output $false -DBG $true
-                            }
+                            Write-SPOTLog " >> INFO: The current PV reference will be replaced later, just in time for execution." -Output $false -DBG $true
+                        }
+                        #########################################
+                        default  {
+                            Write-SPOTLog " >> ERROR: the "":"" split character detected in runbook parameter ""$i"" without a known prefix or in a mixed string. Cannot continue." -Output $false
+                            throw "Replace-SPOTVarsInRunbook: unexpected "":"" usage in RunbookParameter!"
                         }
                     }
                 }
@@ -901,8 +898,12 @@ function Replace-SPOTVarsInRunbook {
                         ($Runbook.RunbookParameters.$i).Contains("`$OV:") -or `
                         ($Runbook.RunbookParameters.$i).Contains("`$SV:") -or `
                         ($Runbook.RunbookParameters.$i).Contains("`$PV:")) {
-                        Write-SPOTLog " > ERROR: Non-single RP, OV, SV or PV reference detected in Runbook Parameter ""$($Runbook.RunbookParameters.$i)"". Mixed string references are not allowed in Runbook Parameters. Cannot continue." -Output $false
-                        return $false
+                        Write-SPOTLog " >> ERROR: Non-single RP, OV, SV or PV reference detected in Runbook Parameter ""$($Runbook.RunbookParameters.$i)"". Mixed string references are not allowed in Runbook Parameters. Cannot continue." -Output $false
+                        throw "Replace-SPOTVarsInRunbook: unexpected mixed string reference!"
+                    }
+                    else {
+                        Write-SPOTLog " >> ERROR: Too many "":"" chars detected in Runbook Parameter ""$($Runbook.RunbookParameters.$i)"". Only single Var references are allowed in Runbook Parameters. Cannot continue." -Output $false
+                        throw "Replace-SPOTVarsInRunbook: unexpected mixed string reference!"
                     }
                 }
             }
@@ -912,152 +913,162 @@ function Replace-SPOTVarsInRunbook {
     # conditions
     if ($Runbook.Conditions) {
         $Runbook.Conditions = $Runbook.Conditions | foreach {
-            if ($_.GetType().Name -eq "String") {
-                Write-SPOTLog " > Evaluating the Runbook ""$($Runbook.Name)"" Condition ""$_"" >>>" -Output $false -DBG $true
-                if (($_ -split ":").Count -eq 2) {
-                    if ($_.StartsWith("`$RP:")) {
-                        $condition = $_
-                        try {
-                            $condition = Invoke-Expression -Command "`$Runbook.RunbookParameters.$(($condition -split ":")[1].Trim())"
-                        }
-                        catch {
-                            Write-SPOTLog " >> ERROR: while replacing RP in Condition: $_." -Output $false
-                            return $false
-                        }
-                        $_ = $condition
-                        Write-SPOTLog " >> INFO: Condition value evaluated to ""$_""." -Output $false -DBG $true
-                    }
-                    if ($_.StartsWith("`$OV:")) {
-                        $condition = $_
-                        try {
-                            $condition = Invoke-Expression -Command "`$OrchVars.$(($condition -split ":")[1].Trim())"
-                        }
-                        catch {
-                            Write-SPOTLog " >> ERROR: while replacing OV in Condition: $_." -Output $false
-                            return $false
-                        }
-                        $_ = $condition
-                        Write-SPOTLog " >> INFO: Condition value evaluated to ""$_""." -Output $false -DBG $true
-                    }
-                    elseif ($_.StartsWith("`$PV:")) {
-                        Write-SPOTLog " >> INFO: Condition with single PV reference. It will be replaced later, just in time for execution." -Output $false -DBG $true
-                    }
-                    elseif ($_.StartsWith("`$SV:")) {
-                        Write-SPOTLog " >> ERROR: SV reference detected in condition ""$_"". SV references are not allowed in Conditions. Cannot continue." -Output $false
-                        return $false
-                    }
-                }
-                # now the validations that this is not a mixed string or multi-word string
+            if ($_) {
                 if ($_.GetType().Name -eq "String") {
-                    if ((($_ -split ":").Count -gt 2) -or (($_.Trim() -split '\s+').Count -gt 1)) {
-                        Write-SPOTLog " >> ERROR: mixed string reference or multi-word string detected in condition ""$_"". These are not allowed in Conditions. Cannot continue." -Output $false
-                        return $false
+                    Write-SPOTLog " > Evaluating the Runbook ""$($Runbook.Name)"" Condition ""$_"" >>>" -Output $false -DBG $true
+                    if (($_ -split ":").Count -eq 2) {
+                        ###############################
+                        # check for unsupported cases
+                        if ([string]::IsNullOrEmpty(($_.Trim() -split ":")[1])) {
+                            Write-SPOTLog " >> ERROR: the current Var reference is null or empty. Cannot continue." -Output $false
+                            throw "Replace-SPOTVarsInRunbook: empty Var reference!"
+                        }
+                        elseif (($_.Trim() -split ":")[1] -eq '.') {
+                            Write-SPOTLog " >> ERROR: The current Var reference is for a full Var set and this is not supported inside Conditions. Cannot continue." -Output $false
+                            throw "Replace-SPOTVarsInRunbook: unsupported Var reference!"
+                        }
+                        elseif (($_.Trim() -split ":")[1] -like '*=*') {
+                            Write-SPOTLog " >> ERROR: The current Var reference contains ""="" character and this is not supported in a Var reference. Cannot continue." -Output $false
+                            throw "Replace-SPOTVarsInRunbook: unsupported Var reference!"
+                        }
+                        ###############################
+                        # process based on Var types
+                        if ($_.StartsWith("`$RP:")) {
+                            try {
+                                $_ = Invoke-Expression -Command "`$Runbook.RunbookParameters.$(($_ -split ":")[1].Trim())"
+                            }
+                            catch {
+                                Write-SPOTLog " >> ERROR: while replacing RP in Condition: $_." -Output $false
+                                throw "Replace-SPOTVarsInRunbook: error replacing RP reference!"
+                            }
+                            Write-SPOTLog " >> INFO: Condition value evaluated to ""$_""." -Output $false -DBG $true
+                        }
+                        elseif ($_.StartsWith("`$OV:")) {
+                            try {
+                                $_ = Invoke-Expression -Command "`$OrchVars.$(($_ -split ":")[1].Trim())"
+                            }
+                            catch {
+                                Write-SPOTLog " >> ERROR: while replacing OV in Condition: $_." -Output $false
+                                throw "Replace-SPOTVarsInRunbook: error replacing OV reference!"
+                            }
+                            Write-SPOTLog " >> INFO: Condition value evaluated to ""$_""." -Output $false -DBG $true
+                        }
+                        elseif ($_.StartsWith("`$PV:")) {
+                            Write-SPOTLog " >> INFO: Condition with single PV reference. It will be replaced later, just in time for execution." -Output $false -DBG $true
+                        }
+                        elseif ($_.StartsWith("`$SV:")) {
+                            Write-SPOTLog " >> ERROR: SV reference detected in condition ""$_"". SV references are not allowed in Conditions. Cannot continue." -Output $false
+                            throw "Replace-SPOTVarsInRunbook: unexpected SV reference in condition!"
+                        }
+                        else {
+                            Write-SPOTLog " >> ERROR: the "":"" split character detected in condition ""$_"" without a known prefix or in a mixed string. Cannot continue." -Output $false
+                            throw "Replace-SPOTVarsInRunbook: unexpected "":"" usage in condition!"
+                        }
+                    
                     }
+                    ###############################
+                    # now the validations that this is not a mixed string or multi-word string
+                    # multi-word is not allowed here, at the start, as it defeats the purpose of a condition - it will never become $false, $null or ""
+                    elseif ((($_ -split ":").Count -gt 2) -or (($_.Trim() -split '\s+').Count -gt 1)) {
+                        Write-SPOTLog " >> ERROR: mixed string reference or multi-word string detected in condition ""$_"". These are not allowed in Conditions. Cannot continue." -Output $false
+                        throw "Replace-SPOTVarsInRunbook: unexpected mixed string reference!"
+                    }
+                    $_
                 }
-                $_
+                else {
+                    Write-SPOTLog " >> INFO: Current Condition ""$_"" for the runbook ""$($Runbook.Name)"" is not of type string! Leaving it unchanged." -Output $false -DBG $true
+                    $_
+                }
             }
             else {
-                Write-SPOTLog " >> WARNING: Current Condition ""$_"" for the runbook ""$($Runbook.Name)"" is not of type string! Leaving it unchanged." -Output $false
+                # return the empty value as this is important for conditions
                 $_
             }
         }
     }
 
     # remote params 
-    foreach ($i in $($Runbook.RemoteParams.Keys)) {
+    foreach ($i in $($Runbook.RemoteParameters.Keys)) {
         $Splitted = $null
-        if ($Runbook.RemoteParams.$i) { 
-            if (($Runbook.RemoteParams.$i).GetType().Name -eq "String") {
-                #########################################
-                if (($Runbook.RemoteParams.$i).StartsWith("`$RP") -and (($Runbook.RemoteParams.$i -split ":").Count -eq 2)) {
-                    # single reference to RP
-                    Write-SPOTLog " > Current remote parameter ""$i"" detected as single `$RP reference." -Output $false -DBG $true
-                    if ([string]::IsNullOrEmpty((($Runbook.RemoteParams.$i).Trim() -split ":")[1])) {
-                        Write-SPOTLog " >> ERROR: the current RP reference is null or empty. Cannot continue." -Output $false
-                        return $false
-                    }
-                    elseif ((($Runbook.RemoteParams.$i).Trim() -split ":")[1] -eq '.') {
-                        Write-SPOTLog " >> ERROR: The current RP reference is for the full RP. Not needed/supported in Runbook Remote Parameters. Cannot continue." -Output $false
-                        return $false
-                    }
-                    else {
-                        try {
-                            $Runbook.RemoteParams.$i = Invoke-Expression -Command "`$Runbook.RunbookParameters.$((($Runbook.RemoteParams.$i).Trim() -split ":")[1])"
-                        }
-                        catch {
-                            Write-SPOTLog " >> ERROR: while replacing RP in remote parameter: $_." -Output $false
-                            return $false
-                        }
-                        Write-SPOTLog " >> INFO: Changed the remote parameter ""$i"" into ""$($Runbook.RemoteParams.$i)""." -Output $false -DBG $true 
-                    }
-                }
-                # the RP reference may turn into other references, so start from scratch
-                $Splitted = ($Runbook.RemoteParams.$i).Trim() -split ":"
+        if ($Runbook.RemoteParameters.$i) { 
+            if (($Runbook.RemoteParameters.$i).GetType().Name -eq "String") {
+                $Splitted = ($Runbook.RemoteParameters.$i).Trim() -split ":"
                 if ($Splitted.Count -eq 2) {
-                    # a single reference is present
+                    ###############################
+                    # check for unsupported cases
+                    if ([string]::IsNullOrEmpty($Splitted[1])) {
+                        Write-SPOTLog " >> ERROR: the current Var reference in current remote parameter ""$i"" is null or empty. Cannot continue." -Output $false
+                        throw "Replace-SPOTVarsInRunbook: empty Var reference!"
+                    }
+                    elseif ($Splitted[1] -eq '.') {
+                        Write-SPOTLog " >> ERROR: The current Var reference in current remote parameter ""$i"" is for the full Var set. Not needed/supported in Remote Parameters. Cannot continue." -Output $false
+                        throw "Replace-SPOTVarsInRunbook: unexpected dot reference!"
+                    }
+                    elseif ($Splitted[1] -like '*=*') {
+                        Write-SPOTLog " >> ERROR: The current Var reference in current remote parameter ""$i"" contains ""="" character and this is not supported in a Var reference. Cannot continue." -Output $false
+                        throw "Replace-SPOTVarsInRunbook: unsupported Var reference!"
+                    }
+                    ###############################
+                    # process based on Var types
                     switch ($Splitted[0]) {
+                        #########################################
+                        "`$RP" {
+                            # single reference to RP
+                            Write-SPOTLog " > Current remote parameter ""$i"" detected as single `$RP reference." -Output $false -DBG $true
+                            try {
+                                $Runbook.RemoteParameters.$i = Invoke-Expression -Command "`$Runbook.RunbookParameters.$($Splitted[1])"
+                            }
+                            catch {
+                                Write-SPOTLog " >> ERROR: while replacing RP in remote parameter: $_." -Output $false
+                                throw "Replace-SPOTVarsInRunbook: error replacing RP reference!"
+                            }
+                            Write-SPOTLog " >> INFO: Changed the remote parameter ""$i"" into ""$($Runbook.RemoteParameters.$i)""." -Output $false -DBG $true 
+                        }
                         #########################################
                         "`$OV" {
                             # single reference to OV
                             Write-SPOTLog " > Current remote parameter ""$i"" detected as single `$OV reference." -Output $false -DBG $true
-                            if ([string]::IsNullOrEmpty($Splitted[1])) {
-                                Write-SPOTLog " >> ERROR: the current OV reference is null or empty. Cannot continue." -Output $false
-                                return $false
+                            try {
+                                $Runbook.RemoteParameters.$i = Invoke-Expression -Command "`$OrchVars.$($Splitted[1])"
                             }
-                            elseif ($Splitted[1] -eq '.') {
-                                Write-SPOTLog " >> ERROR: The current OV reference is for the full OV. Not needed/supported. Cannot continue." -Output $false
-                                return $false
+                            catch {
+                                Write-SPOTLog " >> ERROR: while replacing OV in runbook parameter: $_." -Output $false
+                                throw "Replace-SPOTVarsInRunbook: error replacing OV reference!"
                             }
-                            else {
-                                try {
-                                    $Runbook.RemoteParams.$i = Invoke-Expression -Command "`$OrchVars.$($Splitted[1])"
-                                }
-                                catch {
-                                    Write-SPOTLog " >> ERROR: while replacing OV in runbook parameter: $_." -Output $false
-                                    return $false
-                                }
-                                Write-SPOTLog " >> INFO: Changed the runbook parameter ""$i"" into ""$($Runbook.RemoteParams.$i)""." -Output $false -DBG $true
-                            }
+                            Write-SPOTLog " >> INFO: Changed the runbook parameter ""$i"" into ""$($Runbook.RemoteParameters.$i)""." -Output $false -DBG $true
                         }
                         #########################################
                         "`$SV" {
                             # single reference to SV
                             Write-SPOTLog " > Current remote parameter ""$i"" detected as single `$SV reference." -Output $false -DBG $true
-                            if ([string]::IsNullOrEmpty($Splitted[1])) {
-                                Write-SPOTLog " >> ERROR: the current SV reference is null or empty. Cannot continue." -Output $false
-                                return $false
-                            }
-                            elseif ($Splitted[1] -eq '.') {
-                                Write-SPOTLog " >> ERROR: The current SV reference is for the full SV. Not needed/supported in Runbook Remote Parameters. Cannot continue." -Output $false
-                                return $true
-                            }
-                            else {
-                                $Runbook.RemoteParams.$i = $SVars[$Splitted[1]]
-                                Write-SPOTLog " >> INFO: Changed the remote parameter ""$i"" into ""$($Runbook.RemoteParams.$i)""." -Output $false -DBG $true
-                            }
+                            $Runbook.RemoteParameters.$i = $SVars[$Splitted[1]]
+                            Write-SPOTLog " >> INFO: Changed the remote parameter ""$i"" into ""$($Runbook.RemoteParameters.$i)""." -Output $false -DBG $true
                         }
                         #########################################
                         "`$PV" {
                             # single reference to PV
                             Write-SPOTLog " > Current remote parameter ""$i"" detected as single `$PV reference." -Output $false -DBG $true
-                            if ([string]::IsNullOrEmpty($Splitted[1])) {
-                                Write-SPOTLog " >> ERROR: the current PV reference is null or empty. Cannot continue." -Output $false
-                                return $false
-                            }
-                            else {
-                                Write-SPOTLog " >> INFO: The current PV reference will be replaced later, just in time for execution." -Output $false -DBG $true
-                            }
+                            Write-SPOTLog " >> INFO: The current PV reference will be replaced later, just in time for execution." -Output $false -DBG $true
+                        }
+                        #########################################
+                        default  {
+                            Write-SPOTLog " >> ERROR: the "":"" split character detected in remote parameter ""$i"" without a known prefix or in a mixed string. Cannot continue." -Output $false
+                            throw "Replace-SPOTVarsInRunbook: unexpected "":"" usage in RemoteParameter!"
                         }
                     }
                 }
                 elseif ($Splitted.Count -gt 2) {
                     # mixed string reference is present, which is not allowed here
-                    if (($Runbook.RemoteParams.$i).Contains("`$RP:") -or `
-                        ($Runbook.RemoteParams.$i).Contains("`$OV:") -or `
-                        ($Runbook.RemoteParams.$i).Contains("`$SV:") -or `
-                        ($Runbook.RemoteParams.$i).Contains("`$PV:")) {
-                        Write-SPOTLog " > ERROR: Non-single RP, OV, SV or PV reference detected in Runbook Parameter ""$($Runbook.RemoteParams.$i)"". Mixed string references are not allowed in Runbook Remote Parameters. Cannot continue." -Output $false
-                        return $false
+                    if (($Runbook.RemoteParameters.$i).Contains("`$RP:") -or `
+                        ($Runbook.RemoteParameters.$i).Contains("`$OV:") -or `
+                        ($Runbook.RemoteParameters.$i).Contains("`$SV:") -or `
+                        ($Runbook.RemoteParameters.$i).Contains("`$PV:")) {
+                        Write-SPOTLog " > ERROR: Non-single RP, OV, SV or PV reference detected in Remote Parameter ""$($Runbook.RemoteParameters.$i)"". Mixed string references are not allowed in Runbook Remote Parameters. Cannot continue." -Output $false
+                        throw "Replace-SPOTVarsInRunbook: unexpected mixed string reference!"
+                    }
+                    else {
+                        Write-SPOTLog " >> ERROR: Too many "":"" chars detected in Remote Parameter ""$($Runbook.RemoteParameters.$i)"". Only single Var references are allowed in Runbook Remote Parameters. Cannot continue." -Output $false
+                        throw "Replace-SPOTVarsInRunbook: unexpected mixed string reference!"
                     }
                 }
             }
@@ -1067,7 +1078,6 @@ function Replace-SPOTVarsInRunbook {
     #####
     Write-SPOTLog "Finished function Replace-SPOTVarsInRunbook for Runbook ""$($Runbook.Name)""." -Output $false -DBG $true
 
-    return $true
 } # end of Replace-SPOTVarsInRunbook function
 
 ######################################################################################################################
@@ -1091,138 +1101,142 @@ function Replace-SPOTVarsInRunbookStep {
     # conditions
     if ($RunbookStep.Conditions) {
         $RunbookStep.Conditions = $RunbookStep.Conditions | foreach {
-            if ($_.GetType().Name -eq "String") {
-                Write-SPOTLog " > Evaluating the RunbookStep ""$($RunbookStep.Name)"" Condition ""$_"" >>>" -Output $false -DBG $true
-                if (($_ -split ":").Count -eq 2) {
-                    if ($_.StartsWith("`$RP:")) {
-                        $condition = $_
-                        try {
-                            $condition = Invoke-Expression -Command "`$RbParameters.$(($condition -split ":")[1].Trim())"
-                        }
-                        catch {
-                            Write-SPOTLog " >> ERROR: while replacing RP in Condition: $_." -Output $false
-                            return $false
-                        }
-                        $_ = $condition
-                        Write-SPOTLog " >> INFO: Condition value evaluated to ""$_""." -Output $false -DBG $true
-                    }
-                    if ($_.StartsWith("`$OV:")) {
-                        $condition = $_
-                        try {
-                            $condition = Invoke-Expression -Command "`$OrchVars.$(($condition -split ":")[1].Trim())"
-                        }
-                        catch {
-                            Write-SPOTLog " >> ERROR: while replacing OV in Condition: $_." -Output $false
-                            return $false
-                        }
-                        $_ = $condition
-                        Write-SPOTLog " >> INFO: Condition value evaluated to ""$_""." -Output $false -DBG $true
-                    }
-                    elseif ($_.StartsWith("`$PV:")) {
-                        Write-SPOTLog " >> INFO: Condition with single PV reference. It will be replaced later, just in time for execution." -Output $false -DBG $true
-                    }
-                    elseif ($_.StartsWith("`$SV:")) {
-                        Write-SPOTLog " >> ERROR: SV reference detected in condition ""$_"". SV references are not allowed in Conditions. Cannot continue." -Output $false
-                        return $false
-                    }
-                }
-                # now the validations that this is not a mixed string or multi-word string
+            if ($_) {
                 if ($_.GetType().Name -eq "String") {
-                    if ((($_ -split ":").Count -gt 2) -or (($_.Trim() -split '\s+').Count -gt 1)) {
-                        Write-SPOTLog " >> ERROR: mixed string reference or multi-word string detected in condition ""$_"". These are not allowed in Conditions. Cannot continue." -Output $false
-                        return $false
+                    Write-SPOTLog " > Evaluating the RunbookStep ""$($RunbookStep.Name)"" Condition ""$_"" >>>" -Output $false -DBG $true
+                    if (($_ -split ":").Count -eq 2) {
+                        ###############################
+                        # check for unsupported cases
+                        if ([string]::IsNullOrEmpty(($_.Trim() -split ":")[1])) {
+                            Write-SPOTLog " >> ERROR: the current Var reference is null or empty. Cannot continue." -Output $false
+                            throw "Replace-SPOTVarsInRunbookStep: empty Var reference!"
+                        }
+                        elseif (($_.Trim() -split ":")[1] -eq '.') {
+                            Write-SPOTLog " >> ERROR: The current Var reference is for a full Var set and this is not supported inside Conditions. Cannot continue." -Output $false
+                            throw "Replace-SPOTVarsInRunbookStep: unsupported Var reference!"
+                        }
+                        elseif (($_.Trim() -split ":")[1] -like '*=*') {
+                            Write-SPOTLog " >> ERROR: The current Var reference contains ""="" character and this is not supported in a Var reference. Cannot continue." -Output $false
+                            throw "Replace-SPOTVarsInRunbookStep: unsupported Var reference!"
+                        }
+                        ###############################
+                        # process based on Var types
+                        if ($_.StartsWith("`$RP:")) {
+                            try {
+                                $_ = Invoke-Expression -Command "`$RbParameters.$(($_ -split ":")[1].Trim())"
+                            }
+                            catch {
+                                Write-SPOTLog " >> ERROR: while replacing RP in Condition: $_." -Output $false
+                                throw "Replace-SPOTVarsInRunbookStep: error replacing RP reference!"
+                            }
+                            Write-SPOTLog " >> INFO: Condition value evaluated to ""$_""." -Output $false -DBG $true
+                        }
+                        elseif ($_.StartsWith("`$OV:")) {
+                                try {
+                                    $_ = Invoke-Expression -Command "`$OrchVars.$(($_ -split ":")[1].Trim())"
+                                }
+                                catch {
+                                    Write-SPOTLog " >> ERROR: while replacing OV in Condition: $_." -Output $false
+                                    throw "Replace-SPOTVarsInRunbookStep: error replacing OV reference!"
+                                }
+                                Write-SPOTLog " >> INFO: Condition value evaluated to ""$_""." -Output $false -DBG $true
+                            }
+                        elseif ($_.StartsWith("`$PV:")) {
+                                Write-SPOTLog " >> INFO: Condition with single PV reference. It will be replaced later, just in time for execution." -Output $false -DBG $true
+                            }
+                        elseif ($_.StartsWith("`$SV:")) {
+                            Write-SPOTLog " >> ERROR: SV reference detected in condition ""$_"". SV references are not allowed in Conditions. Cannot continue." -Output $false
+                            throw "Replace-SPOTVarsInRunbookStep: unexpected reference!"
+                        }
+                        else {
+                            Write-SPOTLog " >> ERROR: the "":"" split character detected in condition ""$_"" without a known prefix or in a mixed string. Cannot continue." -Output $false
+                            throw "Replace-SPOTVarsInRunbookStep: unexpected "":"" usage in condition!"
+                        }
+                    
                     }
+                    ###############################
+                    # now the validations that this is not a mixed string or multi-word string
+                    # multi-word is not allowed here, at the start, as it defeats the purpose of a condition - it will never become $false, $null or ""
+                    elseif ((($_ -split ":").Count -gt 2) -or (($_.Trim() -split '\s+').Count -gt 1)) {
+                        Write-SPOTLog " >> ERROR: mixed string reference or multi-word string detected in condition ""$_"". These are not allowed in Conditions. Cannot continue." -Output $false
+                        throw "Replace-SPOTVarsInRunbookStep: unexpected mixed string reference!"
+                    }
+                    $_
                 }
-                $_
+                else {
+                    Write-SPOTLog " >> INFO: Current Condition ""$_"" for the RunbookStep ""$($RunbookStep.Name)"" is not of type string! Leaving it unchanged." -Output $false -DBG $true
+                    $_
+                }
             }
             else {
-                Write-SPOTLog " >> WARNING: Current Condition ""$_"" for the runbook ""$($RunbookStep.Name)"" is not of type string! Leaving it unchanged." -Output $false
+                # return the empty value as this is important for conditions
                 $_
             }
         }
     }
 
     # step parameters
-    foreach ($i in $($RunbookStep.FunctionParams.Keys)) {
+    foreach ($i in $($RunbookStep.StepParameters.Keys)) {
         $Splitted = $null
-        if ($RunbookStep.FunctionParams.$i) { 
-            if (($RunbookStep.FunctionParams.$i).GetType().Name -eq "String") {
-                #########################################
-                if (($RunbookStep.FunctionParams.$i).StartsWith("`$RP:") -and (($RunbookStep.FunctionParams.$i -split ":").Count -eq 2)) {
-                    Write-SPOTLog " > Current step parameter ""$i"" detected as single `$RP reference." -Output $false -DBG $true
-                    if ([string]::IsNullOrEmpty((($RunbookStep.FunctionParams.$i).Trim() -split ":")[1])) {
-                        Write-SPOTLog " >> ERROR: the current RP reference is null or empty. Cannot continue." -Output $false
-                        return $false
-                    }
-                    elseif ((($RunbookStep.FunctionParams.$i).Trim() -split ":")[1] -eq '.') {
-                        Write-SPOTLog " >> INFO: The current RP reference is for the full RP. It will be replaced later, just in time for execution." -Output $false -DBG $true
-                    }
-                    else {
-                        try {
-                            $RunbookStep.FunctionParams.$i = Invoke-Expression -Command "`$RbParameters.$((($RunbookStep.FunctionParams.$i).Trim() -split ":")[1])"
-                        }
-                        catch {
-                            Write-SPOTLog " >> ERROR: while replacing RP in step parameter: $_." -Output $false
-                            return $false
-                        }
-                        Write-SPOTLog " >> INFO: Changed the step parameter ""$i"" into ""$($RunbookStep.FunctionParams.$i)""." -Output $false -DBG $true
-                    }
-                }
-                # the RP reference may turn into other references, so start from scratch
-                $Splitted = ($RunbookStep.FunctionParams.$i).Trim() -split ":"
+        if ($RunbookStep.StepParameters.$i) { 
+            if (($RunbookStep.StepParameters.$i).GetType().Name -eq "String") {
+                $Splitted = ($RunbookStep.StepParameters.$i).Trim() -split ":"
                 if ($Splitted.Count -eq 2) {
-                    # a single reference is present
+                    ###############################
+                    # check for unsupported cases
+                    if ([string]::IsNullOrEmpty($Splitted[1])) {
+                        Write-SPOTLog " >> ERROR: the current Var reference in current step parameter ""$i"" is null or empty. Cannot continue." -Output $false
+                        throw "Replace-SPOTVarsInRunbookStep: empty Var reference!"
+                    }
+                    elseif ($Splitted[1] -eq '.') {
+                        Write-SPOTLog " >> ERROR: The current Var reference in current step parameter ""$i"" is for the full Var set. Not needed/supported in Step Parameters. Cannot continue." -Output $false
+                        throw "Replace-SPOTVarsInRunbookStep: unexpected dot reference!"
+                    }
+                    elseif ($Splitted[1] -like '*=*') {
+                        Write-SPOTLog " >> ERROR: The current Var reference in current step parameter ""$i"" contains ""="" character and this is not supported in a Var reference. Cannot continue." -Output $false
+                        throw "Replace-SPOTVarsInRunbookStep: unsupported Var reference!"
+                    }
+                    ###############################
+                    # process based on Var types
                     switch ($Splitted[0]) {
+                        #########################################
+                        "`$RP" {
+                            # single reference to RP
+                            Write-SPOTLog " > Current step parameter ""$i"" detected as single `$RP reference." -Output $false -DBG $true
+                            try {
+                                $RunbookStep.StepParameters.$i = Invoke-Expression -Command "`$RbParameters.$($Splitted[1])"
+                            }
+                            catch {
+                                Write-SPOTLog " >> ERROR: while replacing RP in step parameter: $_." -Output $false
+                                throw "Replace-SPOTVarsInRunbookStep: error replacing RP reference!"
+                            }
+                            Write-SPOTLog " >> INFO: Changed the step parameter ""$i"" into ""$($RunbookStep.StepParameters.$i)""." -Output $false -DBG $true
+                        }
                         #########################################
                         "`$OV" {
                             # single reference to OV
                             Write-SPOTLog " > Current step parameter ""$i"" detected as single `$OV reference." -Output $false -DBG $true
-                            if ([string]::IsNullOrEmpty($Splitted[1])) {
-                                Write-SPOTLog " >> ERROR: the current OV reference is null or empty. Cannot continue." -Output $false
-                                return $false
+                            try {
+                                $RunbookStep.StepParameters.$i = Invoke-Expression -Command "`$OrchVars.$($Splitted[1])"
                             }
-                            elseif ($Splitted[1] -eq '.') {
-                                Write-SPOTLog " >> ERROR: The current OV reference is for the full OV. Not needed/supported. Cannot continue." -Output $false
-                                return $false
+                            catch {
+                                Write-SPOTLog " >> ERROR: while replacing OV in step parameter: $_." -Output $false
+                                throw "Replace-SPOTVarsInRunbookStep: error replacing OV reference!"
                             }
-                            else {
-                                try {
-                                    $RunbookStep.FunctionParams.$i = Invoke-Expression -Command "`$OrchVars.$($Splitted[1])"
-                                }
-                                catch {
-                                    Write-SPOTLog " >> ERROR: while replacing OV in step parameter: $_." -Output $false
-                                    return $false
-                                }
-                                Write-SPOTLog " >> INFO: Changed the step parameter ""$i"" into ""$($RunbookStep.FunctionParams.$i)""." -Output $false -DBG $true
-                            }
+                            Write-SPOTLog " >> INFO: Changed the step parameter ""$i"" into ""$($RunbookStep.StepParameters.$i)""." -Output $false -DBG $true
                         }
                         #########################################
                         "`$SV" {
                             # single reference to SV
                             Write-SPOTLog " > Current step parameter ""$i"" detected as single `$SV reference." -Output $false -DBG $true
-                            if ([string]::IsNullOrEmpty($Splitted[1])) {
-                                Write-SPOTLog " >> ERROR: the current SV reference is null or empty. Cannot continue." -Output $false
-                                return $false
-                            }
-                            elseif ($Splitted[1] -eq '.') {
-                                Write-SPOTLog " >> INFO: The current SV reference is for the full SV. It will be replaced later, just in time for execution." -Output $false -DBG $true
-                            }
-                            else {
-                                $RunbookStep.FunctionParams.$i = $SVars[$Splitted[1]]
-                                Write-SPOTLog " >> INFO: Changed the step parameter ""$i"" into ""$($RunbookStep.FunctionParams.$i)""." -Output $false -DBG $true
-                            }
+                            $RunbookStep.StepParameters.$i = $SVars[$Splitted[1]]
+                            Write-SPOTLog " >> INFO: Changed the step parameter ""$i"" into ""$($RunbookStep.StepParameters.$i)""." -Output $false -DBG $true
                         }
                         #########################################
                         "`$PV" {
                             # single reference to PV
                             Write-SPOTLog " > Current step parameter ""$i"" detected as single `$PV reference." -Output $false -DBG $true
-                            if ([string]::IsNullOrEmpty($Splitted[1])) {
-                                Write-SPOTLog " >> ERROR: the current PV reference is null or empty. Cannot continue." -Output $false
-                                return $false
-                            }
-                            else {
-                                Write-SPOTLog " >> INFO: The current PV reference will be replaced later, just in time for execution." -Output $false -DBG $true
-                            }
+                            Write-SPOTLog " >> INFO: The current PV reference will be replaced later, just in time for execution." -Output $false -DBG $true
                         }
                     }
                 }
@@ -1230,86 +1244,138 @@ function Replace-SPOTVarsInRunbookStep {
         }
     }
 
-    # command parameters
-    foreach ($i in $($RunbookStep.FunctionParams.CommandParameters.Keys)) {
-        if ($RunbookStep.FunctionParams.CommandParameters.$i) {
-            if (($RunbookStep.FunctionParams.CommandParameters.$i).GetType().Name -eq "String") {
-                #########################################
-                if (($RunbookStep.FunctionParams.CommandParameters.$i).StartsWith("`$RP:") -and (($RunbookStep.FunctionParams.CommandParameters.$i -split ":").Count -eq 2)) {
-                    Write-SPOTLog " > Current command parameter ""$i"" detected as single `$RP reference." -Output $false -DBG $true
-                    if ([string]::IsNullOrEmpty((($RunbookStep.FunctionParams.CommandParameters.$i).Trim() -split ":")[1])) {
-                        Write-SPOTLog " >> ERROR: the current RP reference is null or empty. Cannot continue." -Output $false
-                        return $false
-                    }
-                    elseif ((($RunbookStep.FunctionParams.CommandParameters.$i).Trim() -split ":")[1] -eq '.') {
-                        Write-SPOTLog " >> INFO: The current RP reference is for the full RP. It will be replaced later, just in time for execution." -Output $false -DBG $true
-                    }
-                    else {
-                        try {
-                            $RunbookStep.FunctionParams.CommandParameters.$i = Invoke-Expression -Command "`$RbParameters.$((($RunbookStep.FunctionParams.CommandParameters.$i).Trim() -split ":")[1])"
+    # VariablesToPublish
+    if ($RunbookStep.StepParameters.VariablesToPublish) {
+        $RunbookStep.StepParameters.VariablesToPublish = $RunbookStep.StepParameters.VariablesToPublish | foreach {
+            if ($_) {
+                if ($_.GetType().Name -eq "String") {
+                    Write-SPOTLog " > Evaluating the RunbookStep ""$($RunbookStep.Name)"" VariablesToPublish entry ""$_"" >>>" -Output $false -DBG $true
+                    if (($_ -split ":").Count -eq 2) {
+                        ###############################
+                        # check for unsupported cases
+                        if ([string]::IsNullOrEmpty(($_.Trim() -split ":")[1])) {
+                            Write-SPOTLog " >> ERROR: the current Var reference is null or empty. Cannot continue." -Output $false
+                            throw "Replace-SPOTVarsInRunbookStep: empty Var reference!"
                         }
-                        catch {
-                            Write-SPOTLog " >> ERROR: while replacing RP in command parameter: $_." -Output $false
-                            return $false
+                        elseif (($_.Trim() -split ":")[1] -eq '.') {
+                            Write-SPOTLog " >> ERROR: The current Var reference is for a full Var set and this is not supported inside VariablesToPublish. Cannot continue." -Output $false
+                            throw "Replace-SPOTVarsInRunbookStep: unsupported Var reference!"
                         }
-                        Write-SPOTLog " >> INFO: Changed the command parameter ""$i"" into ""$($RunbookStep.FunctionParams.CommandParameters.$i)""." -Output $false -DBG $true
+                        elseif (($_.Trim() -split ":")[1] -like '*=*') {
+                            Write-SPOTLog " >> ERROR: The current Var reference contains ""="" character and this is not supported in a Var reference. Cannot continue." -Output $false
+                            throw "Replace-SPOTVarsInRunbookStep: unsupported Var reference!"
+                        }
+                        ###############################
+                        # process based on Var types
+                        if ($_.StartsWith("`$RP:")) {
+                            try {
+                                $_ = Invoke-Expression -Command "`$RbParameters.$(($_ -split ":")[1].Trim())"
+                            }
+                            catch {
+                                Write-SPOTLog " >> ERROR: while replacing RP in VariablesToPublish entry: $_." -Output $false
+                                throw "Replace-SPOTVarsInRunbookStep: error replacing RP reference!"
+                            }
+                            Write-SPOTLog " >> INFO: VariablesToPublish entry value evaluated to ""$_""." -Output $false -DBG $true
+                        }
+                        elseif ($_.StartsWith("`$OV:")) {
+                            try {
+                                $_ = Invoke-Expression -Command "`$OrchVars.$(($_ -split ":")[1].Trim())"
+                            }
+                            catch {
+                                Write-SPOTLog " >> ERROR: while replacing OV in VariablesToPublish entry: $_." -Output $false
+                                throw "Replace-SPOTVarsInRunbookStep: error replacing OV reference!"
+                            }
+                            Write-SPOTLog " >> INFO: VariablesToPublish entry value evaluated to ""$_""." -Output $false -DBG $true
+                        }
+                        elseif ($_.StartsWith("`$PV:")) {
+                            Write-SPOTLog " >> INFO: VariablesToPublish entry with single PV reference. It will be replaced later, just in time for execution." -Output $false -DBG $true
+                        }
+                        elseif ($_.StartsWith("`$SV:")) {
+                            Write-SPOTLog " >> ERROR: SV reference detected in VariablesToPublish entry ""$_"". SV references are not allowed in VariablesToPublish entries. Cannot continue." -Output $false
+                            throw "Replace-SPOTVarsInRunbookStep: unexpected reference!"
+                        }
                     }
+                    $_
                 }
-                # the RP reference may turn into other references, so start from scratch
-                $Splitted = ($RunbookStep.FunctionParams.CommandParameters.$i).Trim() -split ":"
+                else {
+                    Write-SPOTLog " >> WARNING: Current VariablesToPublish entry ""$_"" for the RunbookStep ""$($RunbookStep.Name)"" is not of type string! Leaving it out." -Output $false -DBG $true
+                }
+            }
+        }
+    }
+
+    # command parameters
+    foreach ($i in $($RunbookStep.StepParameters.CommandParameters.Keys)) {
+        if ($RunbookStep.StepParameters.CommandParameters.$i) {
+            if (($RunbookStep.StepParameters.CommandParameters.$i).GetType().Name -eq "String") {
+                $Splitted = ($RunbookStep.StepParameters.CommandParameters.$i).Trim() -split ":"
                 if ($Splitted.Count -eq 2) {
-                    # a single reference is present
+                    ###############################
+                    # check for unsupported cases
+                    if ([string]::IsNullOrEmpty($Splitted[1])) {
+                        Write-SPOTLog " >> ERROR: the current Var reference in current command parameter ""$i"" is null or empty. Cannot continue." -Output $false
+                        throw "Replace-SPOTVarsInRunbookStep: empty Var reference!"
+                    }
+                    elseif ($Splitted[1] -like '*=*') {
+                        Write-SPOTLog " >> ERROR: The current Var reference in current command parameter ""$i"" contains ""="" character and this is not supported in a Var reference. Cannot continue." -Output $false
+                        throw "Replace-SPOTVarsInRunbookStep: unsupported Var reference!"
+                    }
+                    ###############################
+                    # process based on Var types
                     switch ($Splitted[0]) {
+                        #########################################
+                        "`$RP" {
+                            Write-SPOTLog " > Current command parameter ""$i"" detected as single `$RP reference." -Output $false -DBG $true
+                            if ($Splitted[1] -eq '.') {
+                                Write-SPOTLog " >> INFO: The current RP reference is for the full RP. It will be replaced later, just in time for execution." -Output $false -DBG $true
+                            }
+                            else {
+                                try {
+                                    $RunbookStep.StepParameters.CommandParameters.$i = Invoke-Expression -Command "`$RbParameters.$($Splitted[1])"
+                                }
+                                catch {
+                                    Write-SPOTLog " >> ERROR: while replacing RP in command parameter: $_." -Output $false
+                                    throw "Replace-SPOTVarsInRunbookStep: error replacing RP reference!"
+                                }
+                                Write-SPOTLog " >> INFO: Changed the command parameter ""$i"" into ""$($RunbookStep.StepParameters.CommandParameters.$i)""." -Output $false -DBG $true
+                            }
+                        }
                         #########################################
                         "`$OV" {
                             # single reference to OV
                             Write-SPOTLog " > Current command parameter ""$i"" detected as single `$OV reference." -Output $false -DBG $true
-                            if ([string]::IsNullOrEmpty($Splitted[1])) {
-                                Write-SPOTLog " >> ERROR: the current OV reference is null or empty. Cannot continue." -Output $false
-                                return $false
-                            }
-                            elseif ($Splitted[1] -eq '.') {
+                            if ($Splitted[1] -eq '.') {
                                 Write-SPOTLog " >> ERROR: The current OV reference is for the full OV. Not needed/supported. Cannot continue." -Output $false
-                                return $false
+                                throw "Replace-SPOTVarsInRunbookStep: unexpected reference!"
                             }
                             else {
                                 try {
-                                    $RunbookStep.FunctionParams.CommandParameters.$i = Invoke-Expression -Command "`$OrchVars.$($Splitted[1])"
+                                    $RunbookStep.StepParameters.CommandParameters.$i = Invoke-Expression -Command "`$OrchVars.$($Splitted[1])"
                                 }
                                 catch {
                                     Write-SPOTLog " >> ERROR: while replacing OV in command parameter: $_." -Output $false
-                                    return $false
+                                    throw "Replace-SPOTVarsInRunbookStep: error replacing OV reference!"
                                 }
-                                Write-SPOTLog " >> INFO: Changed the command parameter ""$i"" into ""$($RunbookStep.FunctionParams.CommandParameters.$i)""." -Output $false -DBG $true
+                                Write-SPOTLog " >> INFO: Changed the command parameter ""$i"" into ""$($RunbookStep.StepParameters.CommandParameters.$i)""." -Output $false -DBG $true
                             }
                         }
                         #########################################
                         "`$SV" {
                             # single reference to SV
                             Write-SPOTLog " > Current command parameter ""$i"" detected as single `$SV reference." -Output $false -DBG $true
-                            if ([string]::IsNullOrEmpty($Splitted[1])) {
-                                Write-SPOTLog " >> ERROR: the current SV reference is null or empty. Cannot continue." -Output $false
-                                return $false
-                            }
-                            elseif ($Splitted[1] -eq '.') {
+                            if ($Splitted[1] -eq '.') {
                                 Write-SPOTLog " >> INFO: The current SV reference is for the full SV. It will be replaced later, just in time for execution." -Output $false -DBG $true
                             }
                             else {
-                                $RunbookStep.FunctionParams.CommandParameters.$i = $SVars[$Splitted[1]]
-                                Write-SPOTLog " >> INFO: Changed the command parameter ""$i"" into ""$($RunbookStep.FunctionParams.CommandParameters.$i)""." -Output $false -DBG $true
+                                $RunbookStep.StepParameters.CommandParameters.$i = $SVars[$Splitted[1]]
+                                Write-SPOTLog " >> INFO: Changed the command parameter ""$i"" into ""$($RunbookStep.StepParameters.CommandParameters.$i)""." -Output $false -DBG $true
                             }
                         }
                         #########################################
                         "`$PV" {
                             # single reference to PV
                             Write-SPOTLog " > Current command parameter ""$i"" detected as single `$PV reference." -Output $false -DBG $true
-                            if ([string]::IsNullOrEmpty($Splitted[1])) {
-                                Write-SPOTLog " >> ERROR: the current PV reference is null or empty. Cannot continue." -Output $false
-                                return $false
-                            }
-                            else {
-                                Write-SPOTLog " >> INFO: The current PV reference will be replaced later, just in time for execution." -Output $false -DBG $true
-                            }
+                            Write-SPOTLog " >> INFO: The current PV reference will be replaced later, just in time for execution." -Output $false -DBG $true
                         }
                     }
                 }
@@ -1320,7 +1386,6 @@ function Replace-SPOTVarsInRunbookStep {
     #####
     Write-SPOTLog "Finished function Replace-SPOTVarsInRunbookStep for RunbookStep ""$($RunbookStep.Name)""." -Output $false -DBG $true
 
-    return $true
 } # end of Replace-SPOTVarsInRunbookStep function
 
 ######################################################################################################################
@@ -1331,7 +1396,6 @@ function Validate-SPOTParameterSet {
         [string]
         # The name of the function to validate
         $Command, 
-
         [Parameter(Mandatory)]
         [AllowNull()]
         [hashtable]
@@ -1421,27 +1485,31 @@ function Validate-SPOTRunbookRemoteParameters {
     #####
     Write-SPOTLog "Starting function Validate-SPOTRunbookRemoteParameters for Runbook ""$($Runbook.Name)""." -Output $false -DBG $true
 
-    if ($Runbook.RemoteParams) {
+    if ($Runbook.RemoteParameters) {
         Write-SPOTLog "INFO: The RemoteParameters are defined for Runbook ""$($Runbook.Name)"". Checking them." -Output $false -DBG $true
         # make sure all remote parameters are present (they are mandatory only if this parent parameter is present)
-        if ($Runbook.RemoteParams.ExecFunction -notin ("PowershellCommandRemote","PowershellCommandRemoteSJ","PowershellCommandRemoteWMI","PowershellCommandRemotePsExec","PowershellCommandRemoteOWMI")) {
+        if ($Runbook.RemoteParameters.ExecFunction -notin ("PowershellCommandRemote","PowershellCommandRemoteSJ","PowershellCommandRemoteWMI","PowershellCommandRemotePsExec","PowershellCommandRemoteOWMI")) {
             Write-SPOTLog "ERROR: for the Runbook ""$($Runbook.Name)"" the ExecFunction remote parameter is not defined or wrong value!" -Output $false
             return $false
         }
-        if (($Runbook.RemoteParams.ExecFunction -eq "PowershellCommandRemotePsExec") -and ($OrchVars._SPOTCapability -ne "Extended")) {
+        if (($Runbook.RemoteParameters.ExecFunction -eq "PowershellCommandRemotePsExec") -and ($OrchVars._SPOTCapability -ne "Extended")) {
             Write-SPOTLog "ERROR: for the Runbook ""$($Runbook.Name)"" the ExecFunction remote parameter references the PsExec tool but the current SPOT Capability is not ""Extended""!" -Output $false
             return $false
         }
-        if (!$Runbook.RemoteParams.RemoteComputer) {
+        if (!$Runbook.RemoteParameters.RemoteComputer) {
             Write-SPOTLog "ERROR: for the Runbook ""$($Runbook.Name)"" the RemoteComputer remote parameter is not defined!" -Output $false
             return $false
         }
-        if (($Runbook.RemoteParams.RemoteComputer.GetType().Name -in ('List`1','Object[]')) -or (($Runbook.RemoteParams.RemoteComputer -split ",").Count -gt 1)) {
-            Write-SPOTLog "ERROR: for the Runbook ""$($Runbook.Name)"" the RemoteComputer remote parameter is configured for multiple targets with the value: $($Runbook.RemoteParams.RemoteComputer)!" -Output $false
+        if (($Runbook.RemoteParameters.RemoteComputer.GetType().Name -in ('List`1','Object[]')) -or (($Runbook.RemoteParameters.RemoteComputer -split ",").Count -gt 1)) {
+            Write-SPOTLog "ERROR: for the Runbook ""$($Runbook.Name)"" the RemoteComputer remote parameter is configured for multiple targets with the value: $($Runbook.RemoteParameters.RemoteComputer)!" -Output $false
             return $false
         }
-        if (!$Runbook.RemoteParams.Credential) {
+        if (!$Runbook.RemoteParameters.Credential) {
             Write-SPOTLog "ERROR: for the Runbook ""$($Runbook.Name)"" the Credential remote parameter is not defined!" -Output $false
+            return $false
+        }
+        if (($Runbook.RemoteParameters.AsSystem) -and ($Runbook.RemoteParameters.ExecFunction -notin ("PowershellCommandRemoteSJ","PowershellCommandRemotePsExec"))) {
+            Write-SPOTLog "ERROR: for the Runbook ""$($Runbook.Name)"" the AsSystem remote parameter is defined but not applicable to the ExecFunction!" -Output $false
             return $false
         }
     }
@@ -1451,7 +1519,7 @@ function Validate-SPOTRunbookRemoteParameters {
 
     return $true
 
-} # end of Validate-SPOTParameterSet function
+} # end of Validate-SPOTRunbookRemoteParameters function
 
 ######################################################################################################################
 function Validate-SPOTReferencedItems {
@@ -1544,71 +1612,66 @@ function Validate-SPOTRunbookStep {
     #####
     Write-SPOTLog "Starting function Validate-SPOTRunbookStep for RunbookStep ""$($RunbookStep.Name)""." -Output $false -DBG $true
 
-    ######################
-    # SPOT internal step structure validation
-    if ($RunbookStep.Seq -in ("",$null,"0")) {
-        Write-SPOTLog "ERROR: For RunbookStep ""$($RunbookStep.Name)"" the Seq number is not defined or has an unsupported value: ""$($RunbookStep.Seq)"". Cannot continue." -Output $false
-        return $false
+    #########################
+    # load the step type definitions from yaml file
+    if (!$StepTypeDefinitions) {
+        try {
+            $global:StepTypeDefinitions = Get-SPOTStepTypeDefinitions
+        }
+        catch {
+            Write-SPOTLog "ERROR: while loading StepTypeDefinitions from file: $_." -Output $false
+            return $false
+        }
     }
-    if ($RunbookStep.Function -notin $StepTypeDefinitions.Keys) {
-        Write-SPOTLog "ERROR: For RunbookStep ""$($RunbookStep.Name)"" the step type is not defined or has an unsupported value: ""$($RunbookStep.Function)"". Cannot continue." -Output $false
+
+    ######################
+    # SPOT internal step attribute validation
+    if ($RunbookStep.Type -notin $($StepTypeDefinitions.RunbookStepParameters.Keys)) {
+        Write-SPOTLog "ERROR: For RunbookStep ""$($RunbookStep.Name)"" the step type is not defined or has an unsupported value: ""$($RunbookStep.Type)"". Cannot continue." -Output $false
         return $false
     }
     # check that PsExec type can be used only if the SPOT Capability is "Extended"
-    if (($RunbookStep.Function -eq "PowerShellCommandRemotePsExec") -and ($OrchVars._SPOTCapability -ne "Extended")) {
+    if (($RunbookStep.Type -eq "PowerShellCommandRemotePsExec") -and ($OrchVars._SPOTCapability -ne "Extended")) {
         Write-SPOTLog "ERROR: For RunbookStep ""$($RunbookStep.Name)"" the step type depends on PsExec but the SPOT Capability is not ""Extended"". Cannot continue." -Output $false
         return $false
     }
 
     #########################
-    # validate that the mandatory parameters are properly defined
-    $ManPars = Get-SPOTMandatoryStepParameters -StepType $RunbookStep.Function
-    foreach ($ManPar in $ManPars) {
-        if ($ManPar.Type -eq "StepParameter") {
-            if (!$RunbookStep.FunctionParams.$($ManPar.Name)) {
-                Write-SPOTLog "ERROR: For RunbookStep ""$($RunbookStep.Name)"" the ""$($ManPar.Name)"" step parameter is not defined. Cannot continue." -Output $false
-                return $false
-            }
+    # validate that the mandatory step parameters are properly defined
+    foreach ($ManPar in ($StepTypeDefinitions.RunbookStepParameters.($RunbookStep.Type).GetEnumerator() | Where {$_.Value.Mandatory -eq $true}).Name) {
+        if (!$RunbookStep.StepParameters.$ManPar) {
+            Write-SPOTLog "ERROR: For RunbookStep ""$($RunbookStep.Name)"" the ""$ManPar"" mandatory step parameter is not defined. Cannot continue." -Output $false
+            return $false
         }
     }
-
+    
     #########################
     # if additional step parameters are defined, they will break the loading
-    foreach ($par in $($RunbookStep.FunctionParams.keys)) {
-        if ($par -notin ($StepTypeDefinitions.($RunbookStep.Function).StepParameters.Keys).Where({!$_.StartsWith("_")})) {
-            Write-SPOTLog "ERROR: Current StepParameter ""$par"" must not be configured in Runbook ""$Name"" for the current step: ""$($RunbookStep.Name)"" of type: ""$($RunbookStep.Function)"". Cannot continue." -Output $false
+    foreach ($par in $($RunbookStep.StepParameters.keys)) {
+        if ($par -notin $($StepTypeDefinitions.RunbookStepParameters.($RunbookStep.Type).Keys)) {
+            Write-SPOTLog "ERROR: Current StepParameter ""$par"" from step ""$($RunbookStep.Name)"" from Runbook ""$Name"" is not valid for the step type ""$($RunbookStep.Type)"". Cannot continue." -Output $false
             return $false
         }
     }
 
     #########################
     # SPOT step function validation
-    if ($RunbookStep.FunctionParams.CommandName -notin $OrchVars._ProjectFunctions) {
-        Write-SPOTLog "ERROR: The function from the current RunbookStep ""$($RunbookStep.Name)"", ""$($RunbookStep.FunctionParams.CommandName)"", is not a valid SPOT step function." -Output $false
+    if ($RunbookStep.StepParameters.CommandName -notin $OrchVars._ProjectFunctions) {
+        Write-SPOTLog "ERROR: The step function from the current RunbookStep ""$($RunbookStep.Name)"", ""$($RunbookStep.StepParameters.CommandName)"", is not a valid SPOT step function." -Output $false
         return $false
     }
     
     ########################
-    # function parameter validation
-    $result = $true
-    # validate parameters for the first layer function in the step (the step type function)
-    if (!(Validate-SPOTParameterSet -Command $RunbookStep.Function -CommandParams $RunbookStep.FunctionParams)) {
-        $result = $false
-    }
-    # validate parameters for the second layer command in the step (the step function) 
-    if (!(Validate-SPOTParameterSet -Command $RunbookStep.FunctionParams.CommandName -CommandParams $RunbookStep.FunctionParams.CommandParameters)) {
-        $result = $false
-    }
-    # apply the validation result
-    if ($result -eq $false) {
-        Write-SPOTLog "ERROR: Some parameters from the current RunbookStep ""$($RunbookStep.Name)"" were not valid. Cannot continue." -Output $false
+    # validate parameters for the step function
+    if (!(Validate-SPOTParameterSet -Command $RunbookStep.StepParameters.CommandName -CommandParams $RunbookStep.StepParameters.CommandParameters)) {
+        Write-SPOTLog "ERROR: The step function parameters from the current RunbookStep ""$($RunbookStep.Name)"" are not valid. Cannot continue." -Output $false
         return $false
     }
 
     ########################
     # make sure that (correct if necessary) VariablesToPublish are valid (all spaces are removed; "=" sign is removed if there is nothing before or after it)
-    if ($RunbookStep.FunctionParams.VariablesToPublish) {
-        $RunbookStep.FunctionParams.VariablesToPublish = foreach ($i in $RunbookStep.FunctionParams.VariablesToPublish) {
+    if ($RunbookStep.StepParameters.VariablesToPublish) {
+        $RunbookStep.StepParameters.VariablesToPublish = foreach ($i in $RunbookStep.StepParameters.VariablesToPublish) {
             if (($i.Trim() -like "*=") -or ($i.Trim() -like "=*")) {
                 Write-SPOTLog "WARNING: The current item in VariablesToPublish ""$i"" has an equal sign without values on both sides of it. Removing the equal sign and continuing as is." -Output $false -DBG $true
                 $i = $i -replace "=",""
@@ -1642,13 +1705,13 @@ function Unlock-SPOTSecretStore {
     Import-Module -Name microsoft.powershell.secretstore
     if (!(Get-Module -Name microsoft.powershell.secretstore)) {
         Write-SPOTLog "ERROR: The ""microsoft.powershell.secretstore"" powershell module was not detected locally. Cannot continue." -Output $false
-        return $false
+        throw "Unlock-SPOTSecretStore: error loading secretstore module!"
     }
 
     ####
     if (Get-SPOTSecretStoreState) {
         Write-SPOTLog "The secret store is already unlocked. Nothing to do." -Output $false
-        return $true
+        return
     }
 
     ###################
@@ -1662,7 +1725,7 @@ function Unlock-SPOTSecretStore {
         }
         else {
             Write-SPOTLog "ERROR: The MasterPassword parameter was not supplied and was also not found to be registered as user environment variable. Cannot continue." -Output $false
-            return $false
+            throw "Unlock-SPOTSecretStore: no master password provided!"
         } 
     }
     
@@ -1673,14 +1736,14 @@ function Unlock-SPOTSecretStore {
     }
     catch {
         Write-SPOTLog "ERROR: There was an error unlocking the secret store: $_." -Output $false
-        return $false
+        throw "Unlock-SPOTSecretStore: error unlocking the secret store!"
     }
 
     ###################
     # test if the secret store is unlocked
     if (!(Get-SPOTSecretStoreState)) {
         Write-SPOTLog "ERROR: The access to the secret store failed: $_." -Output $false
-        return $false
+        throw "Unlock-SPOTSecretStore: error accessing the secret store!"
     }
 
     ###################
@@ -1689,8 +1752,6 @@ function Unlock-SPOTSecretStore {
 
     ####################################################################
     Write-SPOTLog "===== Finished function Unlock-SPOTSecretStore ====="  -DBG $true -Output $false
-
-    return $true
 
 } # end of Unlock-SPOTSecretStore function
 
@@ -1713,72 +1774,44 @@ function Get-SPOTSecretStoreState {
             }
         }
         else {
-            return $true
+            return $false
         }
     }
 
 } # end of Get-SPOTSecretStoreState function
 
 ######################################################################################################################
-function Get-SPOTMandatoryStepParameters {
-    Param (
-        [Parameter(Mandatory=$true)]
-        [ValidateNotNullOrEmpty()]
-        [string]
-        # the type of step to be used
-        $StepType  
-        )
-
-    $StepTypeDefinitions = Get-SPOTStepTypeDefinitions
-
-    $ManPars = @()
-    foreach ($key in $StepTypeDefinitions.$StepType.Keys) {
-        if ($StepTypeDefinitions.$StepType.$key._Mandatory) {
-            $ManPars += @{
-                Type = "Parameter"
-                Name = $key
-            }
-        }
-    }
-    foreach ($key in $StepTypeDefinitions.$StepType.StepParameters.Keys) {
-        if ($StepTypeDefinitions.$StepType.StepParameters.$key._Mandatory) {
-            $ManPars += @{
-                Type = "StepParameter"
-                Name = $key
-            }
-        }
-    }
-    return $ManPars
-} # enf of Get-SPOTMandatoryStepParameters function
-
-######################################################################################################################
 function Get-SPOTStepTypeDefinitions {
     
+    #####################
     # get config path from $OrchVars
     $ConfigPath = "$($OrchVars._SPOTPath)\config\StepTypeDefinitions.yaml"
 
+    #####################
     # test the yaml module
-    Import-Module -Name powershell-yaml -ErrorAction SilentlyContinue
-    if (!(Get-Module -Name powershell-yaml)) {
-        Write-SPOTLog "ERROR: The powershell-yaml could not be loaded. Cannot continue." -Output $false
-        return $false
+    if (!(Get-Module -Name powershell-yaml -ListAvailable)) {
+        Write-SPOTLog "ERROR: The powershell-yaml module is not available. Cannot continue." -Output $false
+        throw "Get-SPOTStepTypeDefinitions: powershell-yaml module not available!"
     }
 
+    #####################
     # testing config file path
     if (!(Test-Path -Path $ConfigPath -PathType Leaf)) {
         Write-SPOTLog "ERROR: No StepTypeDefinitions file detected at the specified location $ConfigPath. Exiting." -Output $false
-        return $false
+        throw "Get-SPOTStepTypeDefinitions: error loading StepTypeDefinitions file!"
     }
 
+    #####################
     $yamlSTDConfigs = Get-Content -Path $ConfigPath -raw
     try {
         $StepTypeDefinitions = ConvertFrom-Yaml $yamlSTDConfigs
     }
     catch {
         Write-SPOTLog "ERROR: while loading the yaml file $ConfigPath. Error details: $_."
-        return $false
+        throw "Get-SPOTStepTypeDefinitions: error loading StepTypeDefinitions file!"
     }
 
+    #####################
     return $StepTypeDefinitions.StepTypeDefinitions
 
 } # enf of Get-SPOTStepTypeDefinitions function
@@ -1807,13 +1840,6 @@ function Get-SPOTInternalFunctions {
     else {
         # OrchVars cannot be loaded, the SPOT path must be detected and used
         $SPOTPath = Get-SPOTPath
-    }
-
-    ###################################
-    # handle any issue in getting the SPOT Path
-    if (!$SPOTPath) {
-        # error getting the SPOT functions
-        return $false
     }
 
     ###################################
@@ -1983,7 +2009,7 @@ System.String. Get-SPOTPath returns a folder path.
         return $SPOTPath
     }
     else {
-        return $false
+        throw "Get-SPOTPath: error detecting SPOT path!"
     }
 } # end of Get-SPOTPath function
 
@@ -2052,7 +2078,7 @@ The MasterPassword is not specified because, probably, it is registered locally 
     $ProjectPath = (Get-Item -Path $ProjectPath).FullName
     if (!($ProjectPath)) {
         Write-SPOTLog "ERROR: The provided SPOT Project Path not found. Cannot continue."
-        return $false
+        throw "Export-SPOTDevHelperFile: error while loading project."
     }
     else {
         Write-SPOTLog "The provided SPOT Project Path found. Full path: $ProjectPath."
@@ -2060,15 +2086,17 @@ The MasterPassword is not specified because, probably, it is registered locally 
 
     ###########################################
     # load the target project
-    if (!$MasterPassword) {
-        $SPLoaded = . Load-SPOTProject -ProjectPath $ProjectPath
+    try {
+        if (!$MasterPassword) {
+            . Load-SPOTProject -ProjectPath $ProjectPath
+        }
+        else {
+            . Load-SPOTProject -ProjectPath $ProjectPath -MasterPassword $MasterPassword
+        }
     }
-    else {
-        $SPLoaded = . Load-SPOTProject -ProjectPath $ProjectPath -MasterPassword $MasterPassword
-    }
-    if (!$SPLoaded) {
-        Write-SPOTLog "ERROR: There was an error while trying to load the SPOT project from ""$ProjectPath"". Cannot continue."
-        return $false
+    catch {
+        Write-SPOTLog "ERROR: There was an error while trying to load the SPOT project from ""$ProjectPath"": $_."
+        throw "Export-SPOTDevHelperFile: error while loading project."
     }
 
     #################################################
@@ -2097,6 +2125,7 @@ The MasterPassword is not specified because, probably, it is registered locally 
                                         "Replace-SPOTLineCred",
                                         "ConvertTo-SPOTHashtable",
                                         "Process-SPOTCommandParamsRF",
+                                        "Process-SPOTCommandParamsLocalRF",
                                         "Transfer-SPOTDataOverPipe",
                                         "Replace-SPOTExitInCode",
                                         "Add-SPOTSSHTrustedHostKey")
@@ -2196,71 +2225,86 @@ In this example the SPOT PowerShell module is initialized on the current compute
 
     ####################################################################
     # execute the function only if SPOT is not already initialized
-    $CurrentSPOTStatus = Get-SPOTStatus
+    if ($MasterPassword) {
+        $CurrentSPOTStatus = Get-SPOTStatus -MasterPassword $MasterPassword
+    }
+    else {
+        $CurrentSPOTStatus = Get-SPOTStatus
+    }
+    
     if ($CurrentSPOTStatus -ne "NotInitialized") {
-        Write-SPOTLog "WARNING: Current SPOT status: ""$CurrentSPOTStatus"". You can initialize SPOT only from the status ""NotInitialized"". Cannot continue."
-        return $false
-    }
-
-    ####################################################################
-    # enable the possibility to connect to any remote Windows computer (could be a vulnerability to trust all remote computers!! if this is a concern, 
-    #    any set of specifically trusted IP Addresses can be used instead of the star wildcard below)
-    # https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_remote_troubleshooting?view=powershell-5.1
-    # >>  How to connect remotely from a workgroup-based computer
-    Write-SPOTLog ">>> Enabling the PSRemoting locally with trust on all hosts."
-    Enable-PSRemoting -Force -SkipNetworkProfileCheck
-    Set-Item WSMan:\localhost\Client\TrustedHosts -Value '*' -Force
-
-    ####################################################################
-    # initialize SecretVault
-    if ($RegisterMasterPassword) {
-        Write-SPOTLog ">>> Register the Master Password, due to register flag."
-        Register-SPOTMasterPassword -Password $MasterPassword
-
-        Write-SPOTLog ">>> Initializing the SecretStore with the registered master password."
-        Initialize-SPOTSecretStore
+        Write-SPOTLog "Current SPOT status: ""$CurrentSPOTStatus"". You can initialize SPOT only from the status ""NotInitialized"". Nothing to do."
     }
     else {
-        Write-SPOTLog ">>> Initializing the SecretStore without a registered master password."
-        Initialize-SPOTSecretStore -MasterPassword $MasterPassword
-    }
+        ####################################################################
+        # enable the possibility to connect to any remote Windows computer (could be a vulnerability to trust all remote computers!! if this is a concern, 
+        #    any set of specifically trusted IP Addresses can be used instead of the star wildcard below)
+        # https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_remote_troubleshooting?view=powershell-5.1
+        # >>  How to connect remotely from a workgroup-based computer
+        Write-SPOTLog ">>> Enabling the PSRemoting locally with trust on all hosts."
+        Enable-PSRemoting -Force -SkipNetworkProfileCheck
+        Set-Item WSMan:\localhost\Client\TrustedHosts -Value '*' -Force
 
-    ####################################################################
-    # check and add allow all applicable outgoing ports
-    if (!(Get-NetFirewallRule | Where {$_.DisplayName -eq "Allow TCP 5985/445/22/23 Outbound"})) {
-        Write-SPOTLog ">>> The Firewall rule for TCP 5985/445/22/23 outbound access was not detected. Creating it now."
-        New-NetFirewallRule -DisplayName "Allow TCP 5985/445/22/23 Outbound" -Direction Outbound -Profile Any -Protocol TCP -RemotePort 5985,445,22,23 -Action Allow -Group SPOT | Out-Null
-    }
-    else {
-        Write-SPOTLog ">>> The Firewall rule for TCP 5985/445/22/23 outbound access was detected."
-    }
+        ####################################################################
+        # initialize SecretStore
+        if ((Get-SPOTSecretStoreStatus) -ne "Initialized") {
+            try {
+                if ($RegisterMasterPassword) {
+                    Write-SPOTLog ">>> Register the Master Password, due to register flag."
+                    Register-SPOTMasterPassword -Password $MasterPassword
 
-    ####################################################################
-    # check if PsExec is already present (offline installer) and manage the EULA
-    $SPOTPath = Get-SPOTPath
-    if (Test-Path -Path "$SPOTPath\tools\psexec\PsExec64.exe" -PathType Leaf) {
-        # PsExec detected; check EULA acceptance
-        Write-SPOTLog ">>> PsExec (Sysinternals, Microsoft) tool detected. Managing the EULA. To use PsExec from SPOT, its EULA must be accepted."
-        if (Test-Path -Path "HKCU:\Software\Sysinternals\PsExec" -PathType Container) {
-            $InitialSysinternalsEula = (Get-ItemProperty -Path "HKCU:\Software\Sysinternals\PsExec" -ErrorAction SilentlyContinue).EulaAccepted
+                    Write-SPOTLog ">>> Initializing the SecretStore with the registered master password."
+                    Initialize-SPOTSecretStore
+                }
+                else {
+                    Write-SPOTLog ">>> Initializing the SecretStore without a registered master password."
+                    Initialize-SPOTSecretStore -MasterPassword $MasterPassword
+                }
+            }
+            catch {
+                Write-SPOTLog "ERROR: while initializing the SPOT Secret Store: $_. Cannot continue."
+                return
+            }
         }
-        if ($InitialSysinternalsEula -eq "1") {
-            Write-SPOTLog ">>> PsExec EULA found already accepted. No need to trigger the pop-up window and accept it again."
+    
+        ####################################################################
+        # check and add allow all applicable outgoing ports
+        if (!(Get-NetFirewallRule | Where {$_.DisplayName -eq "Allow TCP 5985/445/22/23 Outbound"})) {
+            Write-SPOTLog ">>> The Firewall rule for TCP 5985/445/22/23 outbound access was not detected. Creating it now."
+            New-NetFirewallRule -DisplayName "Allow TCP 5985/445/22/23 Outbound" -Direction Outbound -Profile Any -Protocol TCP -RemotePort 5985,445,22,23 -Action Allow -Group SPOT | Out-Null
         }
         else {
-            # trigger PsExec EULA
-            & "$ToolsPath\psexec\PsExec64.exe" cmd /c exit
-            # check EULA acceptance and remove the tool if EULA not accepted
+            Write-SPOTLog ">>> The Firewall rule for TCP 5985/445/22/23 outbound access was detected."
+        }
+
+        ####################################################################
+        # check if PsExec is already present (offline installer) and manage the EULA
+        $SPOTPath = Get-SPOTPath
+        
+        if (Test-Path -Path "$SPOTPath\tools\psexec\PsExec64.exe" -PathType Leaf) {
+            # PsExec detected; check EULA acceptance
+            Write-SPOTLog ">>> PsExec (Sysinternals, Microsoft) tool detected. Managing the EULA. To use PsExec from SPOT, its EULA must be accepted."
             if (Test-Path -Path "HKCU:\Software\Sysinternals\PsExec" -PathType Container) {
-                $SysinternalsEula = (Get-ItemProperty -Path "HKCU:\Software\Sysinternals\PsExec" -ErrorAction SilentlyContinue).EulaAccepted
+                $InitialSysinternalsEula = (Get-ItemProperty -Path "HKCU:\Software\Sysinternals\PsExec" -ErrorAction SilentlyContinue).EulaAccepted
             }
-            if ($SysinternalsEula -eq "1") {
-                Write-SPOTLog ">>> PsExec EULA accepted after initialization."
+            if ($InitialSysinternalsEula -eq "1") {
+                Write-SPOTLog ">>> PsExec EULA found already accepted. No need to trigger the pop-up window and accept it again."
             }
             else {
-                # remove the PsExec tool
-                Write-SPOTLog ">>> PsExec EULA acceptance not found in the registry after initialization! Removing the PsExec tool from SPOT."
-                Remove-Item -Path "$SPOTPath\tools\psexec\PsExec64.exe" -Confirm:$false -Force
+                # trigger PsExec EULA
+                & "$ToolsPath\psexec\PsExec64.exe" cmd /c exit
+                # check EULA acceptance and remove the tool if EULA not accepted
+                if (Test-Path -Path "HKCU:\Software\Sysinternals\PsExec" -PathType Container) {
+                    $SysinternalsEula = (Get-ItemProperty -Path "HKCU:\Software\Sysinternals\PsExec" -ErrorAction SilentlyContinue).EulaAccepted
+                }
+                if ($SysinternalsEula -eq "1") {
+                    Write-SPOTLog ">>> PsExec EULA accepted after initialization."
+                }
+                else {
+                    # remove the PsExec tool
+                    Write-SPOTLog ">>> PsExec EULA acceptance not found in the registry after initialization! Removing the PsExec tool from SPOT."
+                    Remove-Item -Path "$SPOTPath\tools\psexec\PsExec64.exe" -Confirm:$false -Force
+                }
             }
         }
     }
@@ -2324,7 +2368,7 @@ In this example a new SPOT project is created/initialized on the current compute
         # the project folder exists, check if it is empty
         if (Get-ChildItem -Path $ProjectPath) {
             Write-SPOTLog "ERROR: the target folder ""$ProjectPath"" is not empty. Cannot continue."
-            return $false
+            throw "Initialize-SPOTProject: target folder not empty!"
         }
         else {
             Write-SPOTLog "The target folder ""$ProjectPath"" already exists and it is empty."
@@ -2332,98 +2376,44 @@ In this example a new SPOT project is created/initialized on the current compute
     }
     else {
         # the project folder does not exist; try to create it
-        try {
-            New-Item -ItemType Directory -Force -Path $ProjectPath -Confirm:$false | Out-Null
-        }
-        catch {
-            Write-SPOTLog "ERROR: while creating the target folder ""$ProjectPath"": $_. Cannot continue."
-            return $false
-        }
+        New-Item -ItemType Directory -Force -Path $ProjectPath -Confirm:$false -ErrorAction Stop | Out-Null
         Write-SPOTLog "The target folder ""$ProjectPath"" has been created."
     }
 
     ####################################################################
     # create the project file and folder structure 
     ########
-    try {
-        New-Item -ItemType Directory -Force -Path "$ProjectPath\_Scripts" -Confirm:$false | Out-Null
-    }
-    catch {
-        Write-SPOTLog "ERROR: while creating the target folder ""$ProjectPath\_Scripts"": $_. Cannot continue."
-        return $false
-    }
+    New-Item -ItemType Directory -Force -Path "$ProjectPath\_Scripts" -Confirm:$false -ErrorAction Stop | Out-Null
     Write-SPOTLog "The target folder ""$ProjectPath\_Scripts"" has been created."
 
     ########
-    try {
-        New-Item -ItemType Directory -Force -Path "$ProjectPath\_HelperFunctions" -Confirm:$false | Out-Null
-    }
-    catch {
-        Write-SPOTLog "ERROR: while creating the target folder ""$ProjectPath\_HelperFunctions"": $_. Cannot continue."
-        return $false
-    }
+    New-Item -ItemType Directory -Force -Path "$ProjectPath\_HelperFunctions" -Confirm:$false -ErrorAction Stop | Out-Null
     Write-SPOTLog "The target folder ""$ProjectPath\_HelperFunctions"" has been created."
 
     ########
-    try {
-        New-Item -ItemType Directory -Force -Path "$ProjectPath\__SPOT_Runbooks" -Confirm:$false | Out-Null
-    }
-    catch {
-        Write-SPOTLog "ERROR: while creating the target folder ""$ProjectPath\__SPOT_Runbooks"": $_. Cannot continue."
-        return $false
-    }
+    New-Item -ItemType Directory -Force -Path "$ProjectPath\__SPOT_Runbooks" -Confirm:$false -ErrorAction Stop | Out-Null
     Write-SPOTLog "The target folder ""$ProjectPath\__SPOT_Runbooks"" has been created."
 
     ########
-    try {
-        New-Item -ItemType Directory -Force -Path "$ProjectPath\__SPOT_Config" -Confirm:$false | Out-Null
-    }
-    catch {
-        Write-SPOTLog "ERROR: while creating the target folder ""$ProjectPath\__SPOT_Config"": $_. Cannot continue."
-        return $false
-    }
+    New-Item -ItemType Directory -Force -Path "$ProjectPath\__SPOT_Config" -Confirm:$false -ErrorAction Stop | Out-Null
     Write-SPOTLog "The target folder ""$ProjectPath\__SPOT_Config"" has been created."
 
     ########
-    try {
-        New-Item -ItemType Directory -Force -Path "$ProjectPath\__SPOT_Artefacts" -Confirm:$false | Out-Null
-    }
-    catch {
-        Write-SPOTLog "ERROR: while creating the target folder ""$ProjectPath\__SPOT_Artefacts"": $_. Cannot continue."
-        return $false
-    }
+    New-Item -ItemType Directory -Force -Path "$ProjectPath\__SPOT_Artefacts" -Confirm:$false -ErrorAction Stop | Out-Null
     Write-SPOTLog "The target folder ""$ProjectPath\__SPOT_Artefacts"" has been created."
 
     ########
-    try {
-        New-Item -ItemType File -Force -Path "$ProjectPath\__SPOT_Config\OrchVars.yaml" -Confirm:$false | Out-Null
-    }
-    catch {
-        Write-SPOTLog "ERROR: while creating the target file ""$ProjectPath\__SPOT_Config\OrchVars.yaml"": $_. Cannot continue."
-        return $false
-    }
+    New-Item -ItemType File -Force -Path "$ProjectPath\__SPOT_Config\OrchVars.yaml" -Confirm:$false -ErrorAction Stop | Out-Null
     Write-SPOTLog "The target file ""$ProjectPath\__SPOT_Config\OrchVars.yaml"" has been created."
 
     ########
-    try {
-        New-Item -ItemType File -Force -Path "$ProjectPath\__SPOT_Config\SInputs.yaml" -Confirm:$false | Out-Null
-    }
-    catch {
-        Write-SPOTLog "ERROR: while creating the target file ""$ProjectPath\__SPOT_Config\SInputs.yaml"": $_. Cannot continue."
-        return $false
-    }
+    New-Item -ItemType File -Force -Path "$ProjectPath\__SPOT_Config\SInputs.yaml" -Confirm:$false -ErrorAction Stop | Out-Null
     Write-SPOTLog "The target file ""$ProjectPath\__SPOT_Config\SInputs.yaml"" has been created."
 
     ####################################################################
     # copy the StepTemplates.yaml file
     $SPOTPath = Get-SPOTPath
-    try {
-        Copy-Item -Path "$SPOTPath\config\StepTemplates.yaml" -Destination "$ProjectPath" -Force -Confirm:$false
-    }
-    catch {
-        Write-SPOTLog "ERROR: while copying the file ""$SPOTPath\config\StepTemplates.yaml"": $_. Cannot continue."
-        return $false
-    }
+    Copy-Item -Path "$SPOTPath\config\StepTemplates.yaml" -Destination "$ProjectPath" -Force -Confirm:$false -ErrorAction Stop
     Write-SPOTLog "The target file ""$SPOTPath\config\StepTemplates.yaml"" has been copied."
 
     ####################################################################
@@ -2434,11 +2424,262 @@ In this example a new SPOT project is created/initialized on the current compute
     else {
         Import-SPOTProjectSecrets -ProjectPath $ProjectPath
     }
-
+    
     ####################################################################
-    Write-SPOTLog "===== Finished function Initialize-SPOTProject. ====="
+    Write-SPOTLog "===== Finished function Initialize-SPOTProject successfully. ====="
 
 } # end of Initialize-SPOTProject function
+
+######################################################################################################################
+function Remove-SPOTProjectSecrets {
+<#
+.SYNOPSIS
+Removes SPOT project secrets.
+
+.DESCRIPTION
+Removes all secrets defined for a target SPOT Project or in a Vault associated with a SPOT Project from the SecretStore vault.
+
+.PARAMETER MasterPassword
+Specifies the password to be used for unlocking the secret store, usually if it is not registered.
+
+.PARAMETER ProjectPath
+Specifies the path to the SPOT project for which the secrets to be removed.
+
+.PARAMETER VaultName
+Specifies the Vault Name of the SPOT project for which the secrets to be removed.
+The SPOT Project may be already removed and its secrets still populating the SecretStore.
+
+.INPUTS
+None. You can't pipe objects to Remove-SPOTProjectSecrets.
+
+.OUTPUTS
+System.String. Remove-SPOTProjectSecrets returns only logging output. 
+
+.EXAMPLE
+PS> Remove-SPOTProjectSecrets -ProjectPath "C:\temp\test" -MasterPassword "Passw0rd"
+In this example the secrets defined for the SPOT project from the folder "C:\temp\test" are removed. The master password "Passw0rd" is used,
+which is not registered locally in the environment variable.
+
+.EXAMPLE
+PS> Remove-SPOTProjectSecrets -VaultName "test" -MasterPassword "Passw0rd"
+In this example the secrets defined for the SPOT project Vault "test" are removed. The master password "Passw0rd" is used,
+which is not registered locally in the environment variable.
+
+.EXAMPLE
+PS> Remove-SPOTProjectSecrets -ProjectPath "C:\temp\test"
+In this example the secrets defined for the SPOT project from the folder "C:\temp\test" are removed. The master password is not specfied because
+it is already registered in the environment variable.
+#>
+    
+    [CmdletBinding(DefaultParameterSetName = 'ProjectPath')]
+    param(
+    # the path to the SPOT folder
+    [Parameter(Mandatory, ParameterSetName = 'ProjectPath')]
+    [ValidateNotNullOrEmpty()]
+    [string]$ProjectPath,
+
+    # the target Vault Name
+    [Parameter(Mandatory, ParameterSetName = 'VaultName')]
+    [ValidateNotNullOrEmpty()]
+    [string]$VaultName,
+
+    # Common parameter, the master password
+    [Parameter(ParameterSetName = 'ProjectPath')]
+    [Parameter(ParameterSetName = 'VaultName')]
+    [ValidateNotNullOrEmpty()]
+    [string]$MasterPassword
+    )
+
+    ###########################################
+    Write-SPOTLog "===== Starting function Remove-SPOTProjectSecrets ====="
+
+    switch ($PSCmdlet.ParameterSetName) {
+        'ProjectPath' {
+            ###########################################
+            # load the target project
+            if (!$MasterPassword) {
+                . Load-SPOTProject -ProjectPath $ProjectPath
+            }
+            else {
+                . Load-SPOTProject -ProjectPath $ProjectPath -MasterPassword $MasterPassword
+            }
+
+            ###########################################
+            # set the VaultName prefix
+            $VaultNamePrefix = "$($OrchVars._VaultName)%_%"
+        }
+        'VaultName' {
+            ###########################################
+            # set the VaultName prefix
+            $VaultNamePrefix = "$VaultName%_%"
+        }
+    }
+    Write-SPOTLog " > VaultName prefix: $VaultNamePrefix."
+
+    ###########################################
+    # unlock the secretstore
+    if (!$MasterPassword) {
+        Unlock-SPOTSecretStore
+    }
+    else {
+        Unlock-SPOTSecretStore -MasterPassword $MasterPassword
+    }
+
+    ###########################################
+    # remove the secrets defined for the current project
+    $ProjectSecrets = Get-SecretInfo | Where {$_.Name -like "$VaultNamePrefix*"} 
+    foreach ($i in $ProjectSecrets) {
+        Write-SPOTLog " > Removing SPOT secret: $(($i.Name -split '%_%')[1])."
+        Remove-Secret -Name $i.Name -Vault "SecretStore" -Confirm:$false
+    }
+
+    ###########################################
+    Write-SPOTLog "===== Finished function Remove-SPOTProjectSecrets ====="
+
+} # end of Remove-SPOTProjectSecrets function
+
+######################################################################################################################
+function Show-SPOTProjectSecretsInfo {
+<#
+.SYNOPSIS
+Shows SPOT project secrets info.
+
+.DESCRIPTION
+Shows general info (metadata) about the stored SPOT secrets associated with an existing SPOT Project or SPOT Project Vault.
+
+.PARAMETER MasterPassword
+Specifies the password to be used for unlocking the secret store, usually if it is not registered.
+
+.PARAMETER ProjectPath
+Specifies the path to the SPOT project for which the secrets info to be shown.
+
+.PARAMETER VaultName
+Specifies the Vault Name of the SPOT project for which the secrets to be shown.
+The SPOT Project may be already removed and its secrets still populating the SecretStore.
+
+.PARAMETER All
+Specifies that the info for all secrets from all projects must be listed.
+
+.INPUTS
+None. You can't pipe objects to Show-SPOTProjectSecretsInfo.
+
+.OUTPUTS
+System.String. Show-SPOTProjectSecretsInfo will return a list of existing secrets info (not the secrets themselves). 
+
+.EXAMPLE
+PS> Show-SPOTProjectSecretsInfo -ProjectPath "C:\temp\test" -MasterPassword "Passw0rd"
+In this example the secrets defined for the SPOT project from the folder "C:\temp\test" are shown. The master password "Passw0rd" is used,
+which is not registered locally in the environment variable.
+
+.EXAMPLE
+PS> Show-SPOTProjectSecretsInfo -VaultName "test" -MasterPassword "Passw0rd"
+In this example the secrets defined for the SPOT project Vault "test" are shown. The master password "Passw0rd" is used,
+which is not registered locally in the environment variable.
+
+.EXAMPLE
+PS> Show-SPOTProjectSecretsInfo -ProjectPath "C:\temp\test"
+In this example the secrets defined for the SPOT project from the folder "C:\temp\test" are shown. The master password is not specfied because
+it is already registered in the environment variable.
+#>
+    
+    [CmdletBinding(DefaultParameterSetName = 'ProjectPath')]
+    param(
+    # the path to the SPOT folder
+    [Parameter(Mandatory, ParameterSetName = 'ProjectPath')]
+    [ValidateNotNullOrEmpty()]
+    [string]$ProjectPath,
+
+    # the target Vault Name
+    [Parameter(Mandatory, ParameterSetName = 'VaultName')]
+    [ValidateNotNullOrEmpty()]
+    [string]$VaultName,
+
+    # the target Vault Name
+    [Parameter(Mandatory, ParameterSetName = 'All')]
+    [switch]$All,
+
+    # Common parameter, the master password
+    [Parameter(ParameterSetName = 'ProjectPath')]
+    [Parameter(ParameterSetName = 'VaultName')]
+    [Parameter(ParameterSetName = 'All')]
+    [ValidateNotNullOrEmpty()]
+    [string]$MasterPassword
+    )
+
+    ###########################################
+    Write-SPOTLog "===== Starting function Show-SPOTProjectSecretsInfo =====" -Output $false
+
+    switch ($PSCmdlet.ParameterSetName) {
+        'ProjectPath' {
+            #################################################
+            # get the Vault name prefix for the current project
+            $ProjectConfigPath = "$ProjectPath\__SPOT_Config\OrchVars.yaml"
+
+            # testing project config file path
+            if (!(Test-Path -Path $ProjectConfigPath -PathType Leaf)) {
+                Write-SPOTLog "ERROR: No project config file detected at the expected location: $ProjectConfigPath. Exiting." -Output $false
+                throw "Show-SPOTProjectSecretsInfo: OrchVars file not found!"
+            }
+
+            # load the project config file
+            $ProjectConfigsRaw = Get-Content -Path $ProjectConfigPath -raw
+            try {
+                $ProjectConfigs = ConvertFrom-Yaml $ProjectConfigsRaw
+            }
+            catch {
+                Write-SPOTLog "ERROR: while loading the yaml file $ProjectConfigPath. Error details: $_." -Output $false
+                throw "Show-SPOTProjectSecretsInfo: error loading OrchVars file!"
+            }
+
+            if (!$ProjectConfigs._VaultName) {
+                Write-SPOTLog "INFO: The VaultName was not set in the Project Config. Using the default value of project name." -Output $false -DBG $true
+                $VaultName = Split-Path -Path $ProjectPath -Leaf
+            }
+            else {
+                $VaultName = $ProjectConfigs._VaultName
+            }
+
+            ###########################################
+            # set the VaultName prefix
+            $VaultNamePrefix = "$VaultName%_%"
+        }
+        'VaultName' {
+            ###########################################
+            # set the VaultName prefix
+            $VaultNamePrefix = "$VaultName%_%"
+        }
+        'All' {
+            $VaultNamePrefix = "*"
+        }
+    }
+    Write-SPOTLog " > VaultName prefix: $VaultNamePrefix." -Output $false
+
+    ###########################################
+    # unlock the secretstore
+    if (!$MasterPassword) {
+        Unlock-SPOTSecretStore
+    }
+    else {
+        Unlock-SPOTSecretStore -MasterPassword $MasterPassword
+    }
+
+    ###########################################
+    # remove the secrets defined for the current project
+    $SecretsInfo = Get-SecretInfo | Where {$_.Name -like "$VaultNamePrefix*"}
+    foreach ($sInfo in $SecretsInfo) {
+        if ($sInfo.Name -like '*%_%*') {
+            [pscustomobject]@{
+                SPOTSecretName = ($sInfo.Name -split '%_%')[1]
+                SPOTVault      = ($sInfo.Name -split '%_%')[0]
+                Type           = $sInfo.Type
+            }
+        }
+    }
+    
+    ###########################################
+    Write-SPOTLog "===== Finished function Show-SPOTProjectSecretsInfo =====" -Output $false
+
+} # end of Show-SPOTProjectSecretsInfo function
 
 ######################################################################################################################
 function Start-SPOT {
@@ -2507,15 +2748,17 @@ The loaded runbook is then executed.
 
     ###########################################
     # load the target project
-    if (!$MasterPassword) {
-        $SPLoaded = . Load-SPOTProject -ProjectPath $ProjectPath
+    try {
+        if ($MasterPassword) {
+            . Load-SPOTProject -ProjectPath $ProjectPath -MasterPassword $MasterPassword
+        }
+        else {
+            . Load-SPOTProject -ProjectPath $ProjectPath
+        }
     }
-    else {
-        $SPLoaded = . Load-SPOTProject -ProjectPath $ProjectPath -MasterPassword $MasterPassword
-    }
-    if (!$SPLoaded) {
-        Write-SPOTLog "ERROR: There was an error while trying to load the SPOT project from ""$ProjectPath"". Cannot continue."
-        return $false
+    catch {
+        Write-SPOTLog "T.ERROR: while loading the SPOT project from ""$ProjectPath"": $_."
+        return
     }
     
     ###########################################
@@ -2524,7 +2767,13 @@ The loaded runbook is then executed.
 
     ###########################################
     # start the main orchestration/runbook, after the SPOT project is loaded
-    Start-SPOTOrchestration -MainRunbookName $MainRunbookName
+    try {
+        Start-SPOTOrchestration -MainRunbookName $MainRunbookName
+    }
+    catch {
+        Write-SPOTLog "T.ERROR: while executing the SPOT orchestration: $_."
+        return
+    }
 
     ###########################################
     Write-SPOTLog "===== Finished function Start-SPOT ====="
@@ -2558,6 +2807,91 @@ Add-Type -AssemblyName PresentationFramework
 Add-Type -AssemblyName PresentationCore
 Add-Type -AssemblyName WindowsBase
 Add-Type -AssemblyName System.Windows.Forms
+Add-Type @"
+using System;
+using System.Collections.ObjectModel;
+using System.ComponentModel;
+
+public class TreeNode : INotifyPropertyChanged
+{
+    private string _DisplayName;
+    private string _IconPath;
+    private bool _IsExpanded;
+    private string _Tag;
+
+    public TreeNode()
+    {
+        Children = new ObservableCollection<TreeNode>();
+    }
+
+    public string DisplayName
+    {
+        get { return _DisplayName; }
+        set
+        {
+            if (_DisplayName != value)
+            {
+                _DisplayName = value;
+                OnPropertyChanged("DisplayName");
+            }
+        }
+    }
+
+    public string IconPath
+    {
+        get { return _IconPath; }
+        set
+        {
+            if (_IconPath != value)
+            {
+                _IconPath = value;
+                OnPropertyChanged("IconPath");
+            }
+        }
+    }
+
+    public bool IsExpanded
+    {
+        get { return _IsExpanded; }
+        set
+        {
+            if (_IsExpanded != value)
+            {
+                _IsExpanded = value;
+                OnPropertyChanged("IsExpanded");
+            }
+        }
+    }
+
+    public string Tag
+    {
+        get { return _Tag; }
+        set
+        {
+            if (_Tag != value)
+            {
+                _Tag = value;
+                OnPropertyChanged("Tag");
+            }
+        }
+    }
+
+    public ObservableCollection<TreeNode> Children { get; set; }
+
+    public event PropertyChangedEventHandler PropertyChanged;
+
+    protected void OnPropertyChanged(string propertyName)
+    {
+        if (PropertyChanged != null)
+        {
+            PropertyChanged(
+                this,
+                new PropertyChangedEventArgs(propertyName)
+            );
+        }
+    }
+}
+"@
 
 # set execution policy for current session
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Confirm:$false -Force
@@ -2616,7 +2950,6 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Confirm:$false -Forc
 			            <ColumnDefinition Width="*" />
 		            </Grid.ColumnDefinitions>
                 
-                    
                     <ProgressBar Grid.Row="0" Grid.Column="0" Height="2" Grid.ColumnSpan="3" Margin="0,3,0,3" Name="SmallProgressBar" />
                     <TextBox Name="OutputBlock" Grid.Row="2" Grid.Column="0" Grid.ColumnSpan="2" Foreground="Black" IsReadOnly="True" TextWrapping="Wrap" Padding="2" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" Margin="3,3,3,3"/>
                     <ListView Grid.Row="2" Grid.Column="2" Name="PublishedData" Foreground="Black" ScrollViewer.VerticalScrollBarVisibility="Auto" ScrollViewer.HorizontalScrollBarVisibility="Auto" Margin="3,2,3,3">
@@ -2718,7 +3051,8 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Confirm:$false -Forc
     </Border>
 </Window>
 "@
-# 
+
+####################################
 $reader = (New-Object System.Xml.XmlNodeReader $xaml)
 $window = [Windows.Markup.XamlReader]::Load($reader)
 
@@ -2782,7 +3116,13 @@ function Offload-SPOTRunspace {
         ######################################
         # for GUI, load all SPOT internal functions
         $SessionFunctions = @()
-        $SessionFunctions += Get-SPOTInternalFunctions
+        try {
+            $SessionFunctions += Get-SPOTInternalFunctions
+        }
+        catch {
+            Write-Host "Offload-SPOTRunspace: error getting SPOT Internal Functions: $_."
+            return
+        }
         $SessionFunctions += ("Write-SPOTConsole",
                             "Set-SPOTSmallPG",
                             "Set-SPOTMainPG",
@@ -2873,7 +3213,7 @@ function Set-SPOTMainPG {
     $syncHash.window.Control_ProgressBar.Dispatcher.invoke([action]{$syncHash.window.Control_ProgressBar.Value = $percent })
 }
 
-function ConvertTo-SPOTTreeNodes () {
+function ConvertTo-SPOTTreeNodes {
     Param (
         [Parameter(Mandatory=$true)]
         [Runbook]
@@ -2888,28 +3228,28 @@ function ConvertTo-SPOTTreeNodes () {
     
     # main runbook case
     if ($Main) {
-        $Mcollection = New-Object System.Collections.ObjectModel.ObservableCollection[object]
-        $MainNode = New-Object PSObject -Property @{
+        $Mcollection = [System.Collections.ObjectModel.ObservableCollection[TreeNode]]::new()
+        $MainNode = New-Object TreeNode -Property @{
             DisplayName = "$($Runbook.Seq)_$($Runbook.Name)_$($Runbook.Description)"
             IconPath = "$SPOTPath\res\$($Runbook.Status).png"
             IsExpanded = $true
             Tag = $Runbook.GUID
         }
-        $MainNode | Add-Member NoteProperty -Name "Children" -Value @(ConvertTo-SPOTTreeNodes -Runbook $Runbook) -Force
+        $MainNode.Children = ConvertTo-SPOTTreeNodes -Runbook $Runbook
         $Mcollection.Add($MainNode)
         return $Mcollection
     }
     else {
-        $collection = New-Object System.Collections.ObjectModel.ObservableCollection[object]
+        $collection = [System.Collections.ObjectModel.ObservableCollection[TreeNode]]::new()
         foreach ($RunbookStep in $Runbook.RunbookSteps) {
-            $treeNode = New-Object PSObject -Property @{
+            $treeNode = New-Object TreeNode -Property @{
                 DisplayName = "$($RunbookStep.Seq)_$($RunbookStep.Name)_$($RunbookStep.Description)"
                 IconPath = "$SPOTPath\res\$($RunbookStep.Status).png"
                 IsExpanded = $true
                 Tag = $RunbookStep.GUID
             }
             if ($RunbookStep.GetType().Name -eq "Runbook") {
-                $treeNode | Add-Member NoteProperty -Name "Children" -Value @(ConvertTo-SPOTTreeNodes -Runbook $RunbookStep) -Force 
+                $treeNode.Children = ConvertTo-SPOTTreeNodes -Runbook $RunbookStep
             }
             if ($RunbookStep.Disabled -eq $true) {
                 $treeNode.IconPath = "$SPOTPath\res\disabled.png"
@@ -2929,8 +3269,8 @@ function Update-SPOTPublishedData {
         $sVal = $null
         # make sure the complex objects arrive deserialized, otherwise this may block the GUI
         $vValue = $PublishedData[$pvar]
-        if ($vValue.GetType().Name -in ("String","Boolean")) {
-            $sVal = $vValue
+        if ($vValue -as [string]) {
+            $sVal = $vValue -as [string]
         }
         else {
             $sVal = $vValue.GetType().FullName
@@ -2961,7 +3301,7 @@ function Show-SPOTRunbookStepDetails ( $GUID ) {
     if ($GUID -in $AllRunbookSteps.Keys) {
         # this is a runbookstep
         $RunbookStep = $AllRunbookSteps[$GUID]
-        $Type = $RunbookStep.Function
+        $Type = $RunbookStep.Type
         $StepDetailsData += @(
         [PSCustomObject]@{ Name = "Type";               Value = $Type;                                                    Type = "Step Parameters" },
         [PSCustomObject]@{ Name = "Name";               Value = $RunbookStep.Name;                                        Type = "Step Parameters" },
@@ -2975,16 +3315,16 @@ function Show-SPOTRunbookStepDetails ( $GUID ) {
         [PSCustomObject]@{ Name = "Disabled";           Value = $RunbookStep.Disabled;                                    Type = "Step Parameters" },
         [PSCustomObject]@{ Name = "Conditions";         Value = $RunbookStep.Conditions;                                  Type = "Step Parameters" },
         [PSCustomObject]@{ Name = "ArtefactsPath";      Value = $RunbookStep.ArtefactsPath;                               Type = "Step Parameters" },
-        [PSCustomObject]@{ Name = "VariablesToPublish"; Value = $RunbookStep.FunctionParams.VariablesToPublish -join ','; Type = "Step Parameters" },
-        [PSCustomObject]@{ Name = "Command";            Value = $RunbookStep.FunctionParams.CommandName;                  Type = "Step Parameters" }
+        [PSCustomObject]@{ Name = "VariablesToPublish"; Value = $RunbookStep.StepParameters.VariablesToPublish -join ','; Type = "Step Parameters" },
+        [PSCustomObject]@{ Name = "Command";            Value = $RunbookStep.StepParameters.CommandName;                  Type = "Step Parameters" }
         )
         # add extra potential details specific for RunbookSteps
         if ($Type -like "*Remote*") {
-            $StepDetailsData += [PSCustomObject]@{ Name = "RemoteComputer" ; Value = $RunbookStep.FunctionParams.RemoteComputer -join ','; Type = "Step Parameters" }
-            $StepDetailsData += [PSCustomObject]@{ Name = "Credential" ;     Value = $RunbookStep.FunctionParams.Credential.UserName ;     Type = "Step Parameters" }
+            $StepDetailsData += [PSCustomObject]@{ Name = "RemoteComputer" ; Value = $RunbookStep.StepParameters.RemoteComputer -join ','; Type = "Step Parameters" }
+            $StepDetailsData += [PSCustomObject]@{ Name = "Credential" ;     Value = $RunbookStep.StepParameters.Credential.UserName ;     Type = "Step Parameters" }
         }
-        if ($RunbookStep.FunctionParams.CommandParameters) {
-            foreach ($fParam in $RunbookStep.FunctionParams.CommandParameters.GetEnumerator() ) {
+        if ($RunbookStep.StepParameters.CommandParameters) {
+            foreach ($fParam in $RunbookStep.StepParameters.CommandParameters.GetEnumerator() ) {
                 if ($fParam.Value) {
                     if ($fParam.Value.GetType().Name -eq "PSCredential") {
                         $StepDetailsData += [PSCustomObject]@{ Name = $fParam.Name ; Value = $fParam.Value.UserName ; Type = "Command Parameters" }
@@ -3012,8 +3352,8 @@ function Show-SPOTRunbookStepDetails ( $GUID ) {
         [PSCustomObject]@{ Name = "ArtefactsPath";  Value = $RunbookStep.ArtefactsPath;   Type = "Step Parameters" }
         )
         # add extra potential details specific for Runbooks
-        if ($RunbookStep.RemoteParams) {
-            foreach ($rParam in $RunbookStep.RemoteParams.GetEnumerator() ) {
+        if ($RunbookStep.RemoteParameters) {
+            foreach ($rParam in $RunbookStep.RemoteParameters.GetEnumerator() ) {
                 if ($rParam.Value.GetType().Name -eq "PSCredential") {
                     $StepDetailsData += [PSCustomObject]@{ 
                         Name  = $rParam.Name; 
@@ -3032,10 +3372,10 @@ function Show-SPOTRunbookStepDetails ( $GUID ) {
         }
         if ($RunbookStep.RunbookParameters) {
             foreach ($rbParam in $RunbookStep.RunbookParameters.GetEnumerator() ) {
-                if ($rbParam.Value.GetType().Name -eq "string") {
+                if ($rbParam.Value -as [string]) {
                     $StepDetailsData += [PSCustomObject]@{ 
                         Name  = $rbParam.Name; 
-                        Value = $rbParam.Value;                
+                        Value = $rbParam.Value -as [string];                
                         Type  = "Runbook Parameters" 
                     }
                 }
@@ -3075,46 +3415,190 @@ function Show-SPOTRunbookStepDetails ( $GUID ) {
 
 function Update-SPOTRunbookNodeObjects ( $NodeObjects ) {
     
-    $update = $false
     foreach ($NodeObject in $NodeObjects) {
         if ($NodeObject.Children) {
             # this represents a Runbook object
             $Runbook = $AllRunbooks[$NodeObject.Tag]
             if ($NodeObject.IconPath -ne "$SPOTPath\res\$($Runbook.Status).png") {
                 $NodeObject.IconPath = "$SPOTPath\res\$($Runbook.Status).png"
-                $update = $true
             }
-            if (Update-SPOTRunbookNodeObjects -NodeObjects $NodeObject.Children) {
-                $update = $true
-            }
+            Update-SPOTRunbookNodeObjects -NodeObjects $NodeObject.Children
         }
         else {
             # this represents a RunbookStep object
             $RunbookStep = $AllRunbookSteps[$NodeObject.Tag]
             if ($NodeObject.IconPath -ne "$SPOTPath\res\$($RunbookStep.Status).png") {
                 $NodeObject.IconPath = "$SPOTPath\res\$($RunbookStep.Status).png"
-                $update = $true
             }
         }
     }
 
-    # signal there was an update performed
-    return $update
+}
+
+function Prompt-SPOTMasterPassword {
+    
+    if ($syncHash.pwindow) {
+        # the pWindow exists; make it appear
+        
+        ###################
+        $syncHash.pwindow.TopMost = $true
+        $syncHash.pwindow.ShowDialog()
+
+        ###################
+        # after closing the window, try to unlock the store with the given password, if not empty
+        try {
+            if (!$syncHash.pwindow.Control_InputBox.Password) {
+                Write-SPOTConsole "ERROR: The provided Master Password is null or empty."
+                Write-SPOTLog "GUI: ERROR: The provided Master Password is null or empty."
+                return
+            }
+            elseif ($syncHash.pwindow.Control_Prestage.IsChecked) {
+                Register-SPOTMasterPassword -Password $syncHash.pwindow.Control_InputBox.Password
+                Unlock-SPOTSecretStore
+            }
+            else {
+                Unlock-SPOTSecretStore -MasterPassword $syncHash.pwindow.Control_InputBox.Password
+            }
+        }
+        catch {
+            Write-SPOTConsole "ERROR: The SPOT secret store could not be unlocked with the provided Master Password."
+            Write-SPOTLog "GUI: ERROR: The SPOT secret store could not be unlocked with the provided Master Password."
+            return
+        }
+        ###################
+        Write-SPOTConsole "The SPOT secret store was unlocked with the provided password."
+        Write-SPOTLog "GUI: The SPOT secret store was unlocked with the provided password."
+
+    }
+    else {
+        # the pWindow does not exist; create it
+        [xml]$pxaml = @"
+        <Window
+            xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+            xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+            x:Name="PassWindow"
+            Title="PassWindow"  
+            AllowsTransparency="True" 
+            WindowStyle="None"  
+            Background="Transparent"
+            Height="160" 
+            Width="320">
+
+            <Border CornerRadius="5" Background="#282c38" BorderBrush="#282c38" BorderThickness="2">
+                <Grid Name="BaseGrid" Background="#282c38">
+	             <Grid.RowDefinitions>
+	              <RowDefinition Height="*" />
+	             </Grid.RowDefinitions>
+                    <Rectangle Name="DragArea" Grid.Row="0" Fill="Transparent" />
+                    <StackPanel Grid.Row="0">
+                        <TextBlock Name="Title" Text="Please provide the secret store Master Password!" FontSize="12" FontWeight="Bold" Foreground="White" Margin="10" HorizontalAlignment="Center" VerticalAlignment="Center" />
+                        <PasswordBox Name="InputBox" Height="20" Width="150" Margin="10"/> 
+                        <CheckBox Name="Prestage" Content='Prestage for later use' Foreground="White" HorizontalAlignment="Center" Margin="5"/>
+                        <Button Name="OK" IsDefault="True" Height="25" Width="100" Content='OK' HorizontalAlignment="Center" Margin="10"/>
+                    </StackPanel>   
+                </Grid>
+            </Border>
+        </Window>
+"@
+        ### 
+        $preader = (New-Object System.Xml.XmlNodeReader $pxaml)
+        $pwindow = [Windows.Markup.XamlReader]::Load($preader)
+
+        # get all named controls
+        foreach ($pName in (            
+            $pxaml |             
+            Select-Xml '//*/@Name' |             
+            foreach { $_.Node.Value}            
+            )) {
+            $pwindow | Add-Member NoteProperty -Name "Control_$pName" -Value $pwindow.FindName($pName) -Force          
+        } 
+
+        ###################
+        # Attach the MouseLeftButtonDown event to the Rectangle to drag the window
+        $pwindow.Control_DragArea.Add_MouseLeftButtonDown({
+             $pwindow.DragMove()  # Allow dragging the window
+         })
+        # Attach the MouseLeftButtonDown event to the Title text to drag the window
+        $pwindow.Control_Title.Add_MouseLeftButtonDown({
+             $pwindow.DragMove()  # Allow dragging the window
+         })
+        # Attach the Click event to the OK button to close the popup window
+        $pwindow.Control_OK.Add_Click({
+            $pwindow.close()
+        })
+
+        ###################
+        $pwindow.TopMost = $true
+        $pwindow.ShowDialog()
+
+        ###################
+        # after closing the window, try to unlock the store with the given password, if not empty
+        try {
+            if (!$pwindow.Control_InputBox.Password) {
+                Write-SPOTConsole "ERROR: The provided Master Password is null or empty."
+                Write-SPOTLog "GUI: ERROR: The provided Master Password is null or empty."
+                return
+            }
+            elseif ($pwindow.Control_Prestage.IsChecked) {
+                Register-SPOTMasterPassword -Password $pwindow.Control_InputBox.Password
+                Unlock-SPOTSecretStore
+            }
+            else {
+                Unlock-SPOTSecretStore -MasterPassword $pwindow.Control_InputBox.Password
+            }
+        }
+        catch {
+            Write-SPOTConsole "ERROR: The SPOT secret store could not be unlocked with the provided Master Password."
+            Write-SPOTLog "GUI: ERROR: The SPOT secret store could not be unlocked with the provided Master Password."
+            return
+        }
+        ###################
+        Write-SPOTConsole "The SPOT secret store was unlocked with the provided password."
+        Write-SPOTLog "GUI: The SPOT secret store was unlocked with the provided password."
+
+        ###################
+        $global:syncHash.pwindow = $pwindow
+
+    }
+
 }
 
 #endregion GUI functions
 
 ##############################################################
 # get SPOT path
-$SPOTPath = Get-SPOTPath
-if (!$SPOTPath) {
-    Write-SPOTConsole "ERROR: The SPOT tool was not detected properly: $SPOTPath. Cannot continue."
+try {
+    $SPOTPath = Get-SPOTPath
+}
+catch {
+    Write-SPOTConsole "ERROR: while getting the SPOT path: $_. Cannot continue."
     # disable the Load Project button since there is no SPOT tool properly detected on this system
     $window.Control_LoadProject.IsEnabled = $false
 }
 
 # test for Initialized status
-$SPOTStatus = Get-SPOTStatus
+try {
+    $SPOTStatus = Get-SPOTStatus
+}
+catch {
+    if (($_.Exception.Message -like "*no master password provided*") -or ($_.Exception.Message -like "*error unlocking the secret store*")) {
+        Write-SPOTConsole "Registered master password wrong or no registered master password. Asking for the master password."
+        Write-SPOTLog "GUI: Registered master password wrong or no registered master password. Asking for the master password."
+        Prompt-SPOTMasterPassword
+        if (!(Get-SPOTSecretStoreState)) {
+            Write-SPOTConsole "ERROR: The SPOT secrets could not be unlocked."
+            Write-SPOTLog "GUI: ERROR: The SPOT secrets could not be unlocked."
+            return
+        }
+        ###################
+        $SPOTStatus = Get-SPOTStatus
+    }
+    else {
+        Write-SPOTConsole "ERROR: while getting the SPOT status: $_. Cannot continue."
+        return
+    }
+}
+
 if ($SPOTStatus -ne "Initialized") {
     Write-SPOTConsole "ERROR: The SPOT tool is not initialized. Current status: $SPOTStatus. Cannot continue."
     # disable the Load Project button since the SPOT tool is not properly initialized on this system
@@ -3183,112 +3667,53 @@ $window.Control_LoadProject.Add_Click({
                 return
             }
 
+            #######################
             # unlock secret store to have access to the secret names for GUI display and later to the secrets to load them in the Runbooks
-            $IsSecretStoreUnlocked = Unlock-SPOTSecretStore
-            if (!$IsSecretStoreUnlocked) {
-                Write-SPOTConsole "Registered master password wrong or no registered master password. Asking for the master password."
-                Write-SPOTLog "GUI: Registered master password wrong or no registered master password. Asking for the master password."
-                [xml]$pxaml = @"
-                <Window
-                    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
-                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-                    x:Name="PassWindow"
-                    Title="PassWindow"  
-                    AllowsTransparency="True" 
-                    WindowStyle="None"  
-                    Background="Transparent"
-                    Height="160" 
-                    Width="320">
-
-                    <Border CornerRadius="5" Background="#282c38" BorderBrush="#282c38" BorderThickness="2">
-                        <Grid Name="BaseGrid" Background="#282c38">
-		                    <Grid.RowDefinitions>
-			                    <RowDefinition Height="*" />
-		                    </Grid.RowDefinitions>
-                            <Rectangle Name="DragArea" Grid.Row="0" Fill="Transparent" />
-                            <StackPanel Grid.Row="0">
-                                <TextBlock Name="Title" Text="Please provide the secret store Master Password!" FontSize="12" FontWeight="Bold" Foreground="White" Margin="10" HorizontalAlignment="Center" VerticalAlignment="Center" />
-                                <PasswordBox Name="InputBox" Height="20" Width="150" Margin="10"/> 
-                                <CheckBox Name="Prestage" Content='Prestage for later use' Foreground="White" HorizontalAlignment="Center" Margin="5"/>
-                                <Button Name="OK" IsDefault="True" Height="25" Width="100" Content='OK' HorizontalAlignment="Center" Margin="10"/>
-                            </StackPanel>   
-                        </Grid>
-                    </Border>
-                </Window>
-"@
-                ### 
-                $preader = (New-Object System.Xml.XmlNodeReader $pxaml)
-                $pwindow = [Windows.Markup.XamlReader]::Load($preader)
-
-                # get all named controls
-                foreach ($pName in (            
-                    $pxaml |             
-                    Select-Xml '//*/@Name' |             
-                    foreach { $_.Node.Value}            
-                    )) {
-                    $pwindow | Add-Member NoteProperty -Name "Control_$pName" -Value $pwindow.FindName($pName) -Force          
-                } 
-
-                ###################
-                # Attach the MouseLeftButtonDown event to the Rectangle to drag the window
-                $pwindow.Control_DragArea.Add_MouseLeftButtonDown({
-                     $pwindow.DragMove()  # Allow dragging the window
-                 })
-                # Attach the MouseLeftButtonDown event to the Title text to drag the window
-                $pwindow.Control_Title.Add_MouseLeftButtonDown({
-                     $pwindow.DragMove()  # Allow dragging the window
-                 })
-                # Attach the Click event to the OK button to close the popup window
-                $pwindow.Control_OK.Add_Click({
-                    $pwindow.close()
-                })
-
-                ###################
-                $pwindow.TopMost = $true
-                $pwindow.ShowDialog()
-
-                ###################
-                # after closing the window, try to unlock the store with the given password, if not empty
-                if (!$pwindow.Control_InputBox.Password) {
-                    Write-SPOTConsole "ERROR: The provided Master Password is null or empty."
-                    Write-SPOTLog "GUI: ERROR: The provided Master Password is null or empty."
-                    return
-                }
-                elseif ($pwindow.Control_Prestage.IsChecked) {
-                    PrestageMasterPassword -Password $pwindow.Control_InputBox.Password
-                    $IsSecretStoreUnlocked = UnlockSecretStore
+            try {
+                if ($syncHash.pwindow.Control_InputBox.Password) {
+                    Unlock-SPOTSecretStore -MasterPassword $syncHash.pwindow.Control_InputBox.Password
                 }
                 else {
-                    $IsSecretStoreUnlocked = UnlockSecretStore -MasterPassword $pwindow.Control_InputBox.Password
+                    Unlock-SPOTSecretStore
                 }
-                
-                ###################
-                if (!$IsSecretStoreUnlocked) {
-                    Write-SPOTConsole "ERROR: The SPOT secret store could not be unlocked with the provided Master Password."
-                    Write-SPOTLog "GUI: ERROR: The SPOT secret store could not be unlocked with the provided Master Password."
-                    return
+            }
+            catch {
+                if (($_.Exception.Message -like "*no master password provided*") -or ($_.Exception.Message -like "*error unlocking the secret store*")) {
+                    Write-SPOTConsole "Registered master password wrong or no registered master password. Asking for the master password."
+                    Write-SPOTLog "GUI: Registered master password wrong or no registered master password. Asking for the master password."
+                    Prompt-SPOTMasterPassword
+                    if (!(Get-SPOTSecretStoreState)) {
+                        Write-SPOTConsole "ERROR: The SPOT secrets could not be unlocked."
+                        Write-SPOTLog "GUI: ERROR: The SPOT secrets could not be unlocked."
+                        return
+                    }
                 }
                 else {
-                    Write-SPOTConsole "The SPOT secret store was unlocked with the provided password."
-                    Write-SPOTLog "GUI: The SPOT secret store was unlocked with the provided password."
+                    Write-SPOTConsole "ERROR: while getting the SPOT status: $_. Cannot continue."
+                    return
                 }
             }
 
             #######################
             # check for secrets file and use it if present to refresh the Vault, using the master password if it was given earlier
-            if ($pwindow.Control_InputBox.Password) {
-                Import-SPOTProjectSecrets -ProjectPath $ProjectPath -MasterPassword $pwindow.Control_InputBox.Password
-            }
-            else {
+            try {
+                # import project secrets without master password since the store should be already unlocked from just before
                 Import-SPOTProjectSecrets -ProjectPath $ProjectPath
+            }
+            catch {
+                Write-SPOTConsole "ERROR: The SPOT secrets could not be refreshed."
+                Write-SPOTLog "GUI: ERROR: The SPOT secrets could not be refreshed."
+                return
             }
             
             ######################
             Set-SPOTSmallPG -percent 25
             #######################
             # initialize the SPOT variables with internal and project values
-            $AreOrchVarsLoaded = Initialize-SPOTVariables -ProjectPath $ProjectPath
-            if (!$AreOrchVarsLoaded) {
+            try {
+                Initialize-SPOTVariables -ProjectPath $ProjectPath
+            }
+            catch {
                 Write-SPOTConsole "ERROR: The OrchVars could not be loaded."
                 Write-SPOTLog "GUI: ERROR: The OrchVars could not be loaded."
                 $syncHash.window.Control_LoadProject.Dispatcher.invoke([action]{
@@ -3322,7 +3747,7 @@ $window.Control_LoadProject.Add_Click({
             # and the list of Payload/Step functions (to be used for the Main Runspace Pool initial session state)
             # and the list of ProjectFunctions (to be used by the validations during runbook loading)
             $OrchVars._ProjectFunctions += (Get-SPOTProjectFunctions).Name
-            $OrchVars._StepFunctions = $OrchVars._ProjectFunctions + ("Write-SPOTLog",
+            $OrchVars._StepFunctions = @($OrchVars._ProjectFunctions) + ("Write-SPOTLog",
                                         "Get-SPOTSshNetPath",
                                         "New-SPOTSSHSession",
                                         "New-SPOTSFTPSession",
@@ -3337,6 +3762,7 @@ $window.Control_LoadProject.Add_Click({
                                         "Replace-SPOTLineVars",
                                         "Replace-SPOTLineCred",
                                         "Process-SPOTCommandParamsRF",
+                                        "Process-SPOTCommandParamsLocalRF",
                                         "Transfer-SPOTDataOverPipe",
                                         "Replace-SPOTExitInCode")
             $OrchVars._StepFunctions = $OrchVars._StepFunctions | Select-Object -Unique
@@ -3368,11 +3794,11 @@ $window.Control_LoadProject.Add_Click({
             # OrchVars
             foreach ($var in $OrchVars.GetEnumerator()) {
                 if (!$var.Name.StartsWith("_") -and $var.Value.GetType().Name -ne "hashtable") {
-                    if ($var.Value.GetType().Name -ne "string") {
-                        $ProjectDetailsData += [PSCustomObject]@{Name = $var.Name; Value = "[$($var.Value.GetType().Name)]"; Type = "OrchVars Variables"}
+                    if ($var.Value -as [string]) {
+                        $ProjectDetailsData += [PSCustomObject]@{Name = $var.Name; Value = ($var.Value -as [string]); Type = "OrchVars Variables"}
                     }
                     else {
-                        $ProjectDetailsData += [PSCustomObject]@{Name = $var.Name; Value = $var.Value; Type = "OrchVars Variables"}
+                        $ProjectDetailsData += [PSCustomObject]@{Name = $var.Name; Value = "[$($var.Value.GetType().Name)]"; Type = "OrchVars Variables"}
                     }
                 }
             }
@@ -3502,21 +3928,24 @@ $window.Control_LoadRunbook.Add_Click({
         }
 
         # load the runbook to have the objects available for validation here and for other handling in the main powershell session as well
-        $RunbookGUID = Load-SPOTRunbook -Name $SelectedRunbookName -ArtefactsPath "$($OrchVars._ProjectPath)\__SPOT_Artefacts"
-        if (!$RunbookGUID) {
-            Write-SPOTConsole "ERROR: The runbook ""$SelectedRunbookName"" failed to load. Cannot continue."
-            Write-SPOTLog "GUI: ERROR: The runbook ""$SelectedRunbookName"" failed to load. Cannot continue."
+        try {
+            $RunbookGUID = Load-SPOTRunbook -Name $SelectedRunbookName -ArtefactsPath "$($OrchVars._ProjectPath)\__SPOT_Artefacts"
+        }
+        catch {
+            Write-SPOTConsole "T.ERROR: The runbook ""$SelectedRunbookName"" failed to load: $_."
+            Write-SPOTLog "GUI: T.ERROR: The runbook ""$SelectedRunbookName"" failed to load: $_."
             Set-SPOTSmallPG -percent 0
             $syncHash.window.Dispatcher.invoke([action]{
                 $syncHash.window.Control_LoadProject.IsEnabled = $true
                 $syncHash.window.Control_LoadRunbook.IsEnabled = $true
                 $syncHash.window.Control_LoadRunbook.Content = "Load Runbook"
             })
-            return $false
+            #return $false
+            return
         }
 
         # extract relevant data from the runbooks to be loaded in the treeview
-        $observableTreeData = @(ConvertTo-SPOTTreeNodes -Runbook $AllRunbooks.$RunbookGUID -Main $true)
+        $observableTreeData = [System.Collections.ObjectModel.ObservableCollection[TreeNode]](ConvertTo-SPOTTreeNodes -Runbook $AllRunbooks.$RunbookGUID -Main $true)
 
         # load the relevant data to the treeview, via the dispatcher
         $syncHash.window.Dispatcher.invoke([action]{
@@ -3592,7 +4021,6 @@ $window.Control_StartStop.Add_Click({
 
             # check the status in a loop, until the orchestration is finished
             while ($true) {
-                $observableTreeData = $null
                 Start-Sleep -Seconds 5
 
                 # progress report
@@ -3601,11 +4029,7 @@ $window.Control_StartStop.Add_Click({
                     $GUIStatus = $CurrentStatus
                     Set-SPOTMainPG -percent $GUIStatus
                 }
-
-                # update the Runbook Details from the GUI
-                if (Update-SPOTRunbookNodeObjects -NodeObjects $syncHash.window.Control_MainRunbook.Items) {
-                    $syncHash.window.Control_MainRunbook.Dispatcher.invoke([action]{$syncHash.window.Control_MainRunbook.Items.Refresh() })
-                }
+                $syncHash.window.Control_MainRunbook.Dispatcher.invoke([action]{ Update-SPOTRunbookNodeObjects -NodeObjects $syncHash.window.Control_MainRunbook.Items })
                 Update-SPOTPublishedData
 
                 if ($MainJob.handle.IsCompleted) {break}
@@ -3615,9 +4039,7 @@ $window.Control_StartStop.Add_Click({
             Get-SPOTRunbookJobResult -RunbookJob $MainJob
             
             # one last cycle, to make sure there is no status missed
-            if (Update-SPOTRunbookNodeObjects -NodeObjects $syncHash.window.Control_MainRunbook.Items) {
-                $syncHash.window.Control_MainRunbook.Dispatcher.invoke([action]{$syncHash.window.Control_MainRunbook.Items.Refresh() })
-            }
+            $syncHash.window.Control_MainRunbook.Dispatcher.invoke([action]{ Update-SPOTRunbookNodeObjects -NodeObjects $syncHash.window.Control_MainRunbook.Items })
             Update-SPOTPublishedData
 
             # close and dispose the main worker pool
@@ -3625,7 +4047,7 @@ $window.Control_StartStop.Add_Click({
 
             #######################
             # finished executing runbook
-            # set actual progress here, not 100% as the runbook could be stopped
+            # set actual progress here
             $CurrentStatus = [math]::floor(($AllRunbookSteps.Values.Where({($_.Status -eq "Completed") -or (($_.Status -eq "Error") -and ($_.ContinueOnError -eq $true))}).Count/$AllRunbookSteps.Values.Where({$_.Disabled -eq $false}).Count)*100)
             if ($CurrentStatus -ne $GUIStatus) {
                 $GUIStatus = $CurrentStatus
@@ -3727,7 +4149,6 @@ $window.Control_StartStop.Add_Click({
 
             # check the status in a loop, until the orchestration is finished
             while ($true) {
-                $observableTreeData = $null
                 Start-Sleep -Seconds 5
                 # progress report
                 $CurrentStatus = [math]::floor(($AllRunbookSteps.Values.Where({($_.Status -eq "Completed") -or (($_.Status -eq "Error") -and ($_.ContinueOnError -eq $true))}).Count/$AllRunbookSteps.Values.Where({$_.Disabled -eq $false}).Count)*100)
@@ -3737,9 +4158,7 @@ $window.Control_StartStop.Add_Click({
                 }
 
                 # load the relevant data to the treeview, via the dispatcher, if it has changed
-                if (Update-SPOTRunbookNodeObjects -NodeObjects $syncHash.window.Control_MainRunbook.Items) {
-                    $syncHash.window.Control_MainRunbook.Dispatcher.invoke([action]{$syncHash.window.Control_MainRunbook.Items.Refresh() })
-                }
+                $syncHash.window.Control_MainRunbook.Dispatcher.invoke([action]{ Update-SPOTRunbookNodeObjects -NodeObjects $syncHash.window.Control_MainRunbook.Items })
                 Update-SPOTPublishedData
 
                 if ($MainJob.handle.IsCompleted) {break}
@@ -3749,9 +4168,7 @@ $window.Control_StartStop.Add_Click({
             Get-SPOTRunbookJobResult -RunbookJob $MainJob
             
             # one last cycle, to make sure there is no status missed
-            if (Update-SPOTRunbookNodeObjects -NodeObjects $syncHash.window.Control_MainRunbook.Items) {
-                $syncHash.window.Control_MainRunbook.Dispatcher.invoke([action]{$syncHash.window.Control_MainRunbook.Items.Refresh() })
-            }
+            $syncHash.window.Control_MainRunbook.Dispatcher.invoke([action]{ Update-SPOTRunbookNodeObjects -NodeObjects $syncHash.window.Control_MainRunbook.Items })
             Update-SPOTPublishedData
 
             # close and dispose the main worker pool
@@ -3769,12 +4186,13 @@ $window.Control_StartStop.Add_Click({
 
             #######################
             # finished executing runbook
-            # set actual progress here, not 100% as the runbook could be stopped
-            $CurrentStatus = [math]::floor(($AllRunbookSteps.Values.Where({$_.Status -eq "Completed"}).Count/$AllRunbookSteps.Values.Where({$_.Disabled -eq $false}).Count)*100)
+            # set actual progress here
+            $CurrentStatus = [math]::floor(($AllRunbookSteps.Values.Where({($_.Status -eq "Completed") -or (($_.Status -eq "Error") -and ($_.ContinueOnError -eq $true))}).Count/$AllRunbookSteps.Values.Where({$_.Disabled -eq $false}).Count)*100)
             if ($CurrentStatus -ne $GUIStatus) {
                 $GUIStatus = $CurrentStatus
                 Set-SPOTMainPG -percent $GUIStatus
             }
+
             # if there are still steps in Initial state or steps in Error state that have the CoontinueOnError disabled, rename button to Resume, else, rename the button to Start
             if (($AllRunbookSteps.Values.Where({$_.Status -eq "Initial"}).Count -ne 0) -or ($AllRunbookSteps.Values.Where({($_.Status -eq "Error") -and ($_.ContinueOnError -eq $false)}).Count -ne 0)) {
                 $syncHash.window.Control_StartStop.Dispatcher.invoke([action]{
@@ -4211,6 +4629,9 @@ Returns the current details of the local SPOT PowerShell module.
 .DESCRIPTION
 Returns the current details of the local SPOT PowerShell module, which include data about SPOT version, SPOT status, SPOT capability, Secret Store status, additional tools versions.
 
+.PARAMETER MasterPassword
+Specifies the password to be used for unlocking the secret store, if it is not registered.
+
 .INPUTS
 None. You can't pipe objects to Show-SPOTDetails.
 
@@ -4218,43 +4639,58 @@ None. You can't pipe objects to Show-SPOTDetails.
 System.String. Show-SPOTDetails may return only string output.
 #>
 
+    Param ( 
+        [Parameter(Mandatory=$false)]
+        [ValidateNotNullOrEmpty()]
+        [string]
+        # The password to be used for unlocking the secret store, if it is not prestaged
+        $MasterPassword
+        )
+
     ####################################################################
     Write-SPOTLog "===== Starting function Show-SPOTDetails. ====="
 
     ####################################################################
     # get the SPOT module path
     $SPOTPath = Get-SPOTPath
-    $toolsPath = Join-Path -Path $PSScriptRoot -ChildPath 'Tools'
+    $toolsPath = Join-Path -Path $SPOTPath -ChildPath 'Tools'
 
     ####################################################################
     # get SPOT details
-    Write-SPOTLog "SPOT version      : $((Get-Module -Name SPOT).Version.ToString())"
+    Write-SPOTLog "SPOT version       : $((Get-Module -Name SPOT).Version.ToString())"
     
     ###
-    Write-SPOTLog "SPOT Status       : $(Get-SPOTStatus)"
+    if ($MasterPassword) {
+        $CurrentSPOTStatus = Get-SPOTStatus -MasterPassword $MasterPassword
+    }
+    else {
+        $CurrentSPOTStatus = Get-SPOTStatus
+    }
+    Write-SPOTLog "SPOT Status        : $CurrentSPOTStatus"
 
     ###
-    Write-SPOTLog "SPOT Capability   : $(Show-SPOTCapability)"
+    Write-SPOTLog "SPOT Capability    : $(Show-SPOTCapability)"
     
     ####################################################################
     # get SPOTSecretStore details
-    $IsSecretStoreUnlocked = Unlock-SPOTSecretStore -ErrorAction SilentlyContinue
-    if ($IsSecretStoreUnlocked) {
-        $SSConfig = Get-SecretStoreConfiguration -ErrorAction SilentlyContinue
-        $SVConfig = Get-SecretVault -ErrorAction SilentlyContinue
-        if ($SSConfig.PasswordTimeout -eq "180" -and $SVConfig.Name -contains "SecretStore") {
-            Write-SPOTLog "SPOT Secret Store : Initialized"
-        }
-        else {
-            Write-SPOTLog "SPOT Secret Store : NotInitialized"
-        }
+    $SPOT_SecretStore_Status = Get-SPOTSecretStoreStatus
+    
+    ###
+    Write-SPOTLog "SPOT Secret Store  : $SPOT_SecretStore_Status"
+
+    if ($SPOT_SecretStore_Status -eq "Initialized") {
+        $SPOT_Init_Flag = Get-Secret -Name "_SPOT_INITIALIZATION_FLAG_" -Vault "SecretStore" -AsPlainText -ErrorAction SilentlyContinue
+        $SPOT_Init_Date = [DateTimeOffset]::FromUnixTimeSeconds($SPOT_Init_Flag).ToString("yyyy-MM-ddTHH:mm:ssZ")
+        
+        ###
+        Write-SPOTLog ">> Store.Init.Date : $SPOT_Init_Date"
     }
 
     ####################################################################
     # get tool details
     if (Test-Path -Path "$toolsPath\psexec\PsExec64.exe" -PathType Leaf) {
         $PsExec = Get-Item -Path "$toolsPath\psexec\PsExec64.exe"
-        Write-SPOTLog "PsExec version    : $($PsExec.VersionInfo.FileVersion)"
+        Write-SPOTLog "PsExec version     : $($PsExec.VersionInfo.FileVersion)"
     }
     else {
         Write-SPOTLog "PsExec not detected."
@@ -4262,7 +4698,7 @@ System.String. Show-SPOTDetails may return only string output.
     ###
     if (Test-Path -Path "$toolsPath\SshNet\Renci.SshNet.dll" -PathType Leaf) {
         $SshNet = Get-Item -Path "$toolsPath\SshNet\Renci.SshNet.dll"
-        Write-SPOTLog "SshNet version    : $($SshNet.VersionInfo.FileVersion)"
+        Write-SPOTLog "SshNet version     : $($SshNet.VersionInfo.FileVersion)"
     }
     else {
         Write-SPOTLog "SshNet not detected."
@@ -4283,13 +4719,24 @@ Gets the status of the local SPOT PowerShell module.
 Check if the module files and prerequisistes for running SPOT are set on the local computer (firewall rules, PSSession setting, dependency modules).
 The returned status may be Incomplete, MissingDependencies, NotInitialized or Initialized.
 
+.PARAMETER MasterPassword
+Specifies the password to be used for unlocking the secret store, if it is not registered.
+
 .INPUTS
 None. You can't pipe objects to Get-SPOTStatus.
 
 .OUTPUTS
 System.String. Get-SPOTStatus returns a status string. 
 #>
- 
+
+    Param ( 
+        [Parameter(Mandatory=$false)]
+        [ValidateNotNullOrEmpty()]
+        [string]
+        # The password to be used for unlocking the secret store, if it is not prestaged
+        $MasterPassword
+        )
+         
     ####################################################################
     Write-SPOTLog "===== Starting function Get-SPOTStatus. =====" -Output $false
 
@@ -4455,7 +4902,6 @@ In this example, the password "Passw0rd" is registered on the local computer, in
     # prestage the secure string in a user environment variable
     [Environment]::SetEnvironmentVariable("SPOTKey", "$($SSPassword | ConvertFrom-SecureString)", [System.EnvironmentVariableTarget]::User)
 
-    return $true
 } # end of Register-SPOTMasterPassword function
 
 ######################################################################################################################
@@ -4486,7 +4932,7 @@ Specifies if the existing secrets from the Secret Vault should be deleted or not
 None. You can't pipe objects to Import-SPOTProjectSecrets.
 
 .OUTPUTS
-System.Bool. Import-SPOTProjectSecrets returns only a boolean value, depending on the success of the function. 
+None.
 
 .EXAMPLE
 PS> Import-SPOTProjectSecrets -ProjectPath "C:\test\project" -SecretsFilePath "C:\test\Secrets.yaml" -MasterPassword "Passw0rd" -Cleanup $true
@@ -4541,7 +4987,7 @@ The MasterPassword is not specified because, probably, it is registered locally 
     # before anything, check if the secrets file path is accessible
     if (!(Test-Path -Path $SecretsFilePath -PathType Leaf)) {
         Write-SPOTLog "The secret inputs file, ""$SecretsFilePath"", does not exist or it is not reachable. Nothing to do." -Output $false -DBG $true
-        return $true
+        return
     }
 
     ###########################################
@@ -4549,19 +4995,12 @@ The MasterPassword is not specified because, probably, it is registered locally 
     if (!(Get-SPOTSecretStoreState)) {
         # unlock the secret store
         if ($MasterPassword) {
-            $IsSecretStoreUnlocked = Unlock-SPOTSecretStore -MasterPassword $MasterPassword
+            Unlock-SPOTSecretStore -MasterPassword $MasterPassword
         }
         else {
-            $IsSecretStoreUnlocked = Unlock-SPOTSecretStore
+            Unlock-SPOTSecretStore
         }
-        # check if the unlock worked
-        if (!$IsSecretStoreUnlocked) {
-            Write-SPOTLog "ERROR: The SPOT secret store could not be unlocked." -Output $false
-            return $false
-        }
-        else {
-            Write-SPOTLog "The SPOT secret store was unlocked." -Output $false -DBG $true
-        }
+        Write-SPOTLog "The SPOT secret store was unlocked." -Output $false -DBG $true
     }
 
     #################################################
@@ -4571,7 +5010,7 @@ The MasterPassword is not specified because, probably, it is registered locally 
     # testing project config file path
     if (!(Test-Path -Path $ProjectConfigPath -PathType Leaf)) {
         Write-SPOTLog "ERROR: No project config file detected at the expected location: $ProjectConfigPath. Exiting." -Output $false
-        return $false
+        throw "Import-SPOTProjectSecrets: OrchVars file not found!"
     }
 
     # load the project config file
@@ -4580,8 +5019,8 @@ The MasterPassword is not specified because, probably, it is registered locally 
         $ProjectConfigs = ConvertFrom-Yaml $ProjectConfigsRaw
     }
     catch {
-        Write-SPOTLog "ERROR: while loading the yaml file $ProjectConfigPath. Error details: $_."
-        return $false
+        Write-SPOTLog "ERROR: while loading the yaml file $ProjectConfigPath. Error details: $_." -Output $false
+        throw "Import-SPOTProjectSecrets: error loading OrchVars file!"
     }
 
     if (!$ProjectConfigs._VaultName) {
@@ -4600,8 +5039,8 @@ The MasterPassword is not specified because, probably, it is registered locally 
         $SecretsTable = ConvertFrom-Yaml $Secrets
     }
     catch {
-        Write-SPOTLog "ERROR: while loading the yaml file $SecretsFilePath. Error details: $_."
-        return $false
+        Write-SPOTLog "ERROR: while loading the yaml file $SecretsFilePath. Error details: $_." -Output $false
+        throw "Import-SPOTProjectSecrets: error loading secrets file!"
     }
 
     #################################################
@@ -4612,7 +5051,7 @@ The MasterPassword is not specified because, probably, it is registered locally 
         }
         catch {
             Write-SPOTLog "ERROR: while trying to set new secret with name: $Name. The error was: $_. Cannot continue." -Output $false
-            return $false
+            throw "Import-SPOTProjectSecrets: error loading secret!"
         }
     }
 
@@ -4625,7 +5064,7 @@ The MasterPassword is not specified because, probably, it is registered locally 
         }
         catch {
             Write-SPOTLog "ERROR: while trying to set new credential secret with name: $Name. The error was: $_. Cannot continue." -Output $false
-            return $false
+            throw "Import-SPOTProjectSecrets: error loading secret!"
         }
     }
 
@@ -4652,7 +5091,6 @@ The MasterPassword is not specified because, probably, it is registered locally 
     #################################################
     Write-SPOTLog "===== Finished function Import-SPOTProjectSecrets =====" -Output $false
 
-    return $true
 } # end of Import-SPOTProjectSecrets function
 
 ######################################################################################################################
@@ -4675,7 +5113,7 @@ Specifies the password to be used for unlocking the secret store, usually if it 
 None. You can't pipe objects to Initialize-SPOTSecretStore.
 
 .OUTPUTS
-System.Bool. Initialize-SPOTSecretStore may return only a boolean value, depending on the success of the function.  
+None. 
 
 .EXAMPLE
 PS> Initialize-SPOTSecretStore -MasterPassword "Passw0rd"
@@ -4698,65 +5136,141 @@ In this example the SPOT secret store is initialized with the already registered
     # should be executed only once during SPOT initialization (or when the master password is forgotten) per user per computer!!
 
     ########################################################
-    Write-SPOTLog "===== Starting function Initialize-SPOTSecretStore. =====" -Output $false
+    Write-SPOTLog "===== Starting function Initialize-SPOTSecretStore. ====="
     Import-Module -Name microsoft.powershell.secretstore
     if (!(Get-Module -Name microsoft.powershell.secretstore)) {
-        Write-SPOTLog "ERROR: The ""microsoft.powershell.secretstore"" powershell module was not detected locally. Cannot continue." -Output $false
-        return $false
+        Write-SPOTLog "ERROR: The ""microsoft.powershell.secretstore"" powershell module was not detected locally. Cannot continue."
+        throw "Initialize-SPOTSecretStore: error loading secretstore module!"
     }
 
-    ########################################################
-    # handle the Master Password
-    if ($MasterPassword) {
-        # the master password is available from parameter
-        $SSMasterPassword = $MasterPassword | ConvertTo-SecureString -AsPlainText -Force
-    }
-    else {
-        # get the SPOT master password from the current user environment variable
-        if ('SPOTKey' -in [System.Environment]::GetEnvironmentVariables("User").Keys) {
-            $SSMasterPassword = [System.Environment]::GetEnvironmentVariable('SPOTKey','User') | ConvertTo-SecureString
+    if ((Get-SPOTSecretStoreStatus) -ne "Initialized") {
+        ########################################################
+        # handle the Master Password
+        if ($MasterPassword) {
+            # the master password is available from parameter
+            $SSMasterPassword = $MasterPassword | ConvertTo-SecureString -AsPlainText -Force
         }
         else {
-            Write-SPOTLog "ERROR: The MasterPassword was not found to be prestaged as user environment variable. Cannot continue." -Output $false
-            return $false
+            # get the SPOT master password from the current user environment variable
+            if ('SPOTKey' -in [System.Environment]::GetEnvironmentVariables("User").Keys) {
+                $SSMasterPassword = [System.Environment]::GetEnvironmentVariable('SPOTKey','User') | ConvertTo-SecureString
+            }
+            else {
+                Write-SPOTLog "ERROR: The MasterPassword was not found to be prestaged as user environment variable. Cannot continue."
+                throw "Initialize-SPOTSecretStore: missing prestaged master password!"
+            }
+        }
+
+        ########################################################
+        # reinitialize the secret store and sets its configuration to remain unlocked for 3 minutes after unlocking
+        try {
+            Reset-SecretStore -Password $SSMasterPassword -Scope CurrentUser -Authentication Password -PasswordTimeout 180 -Interaction None -Confirm:$false -Force
+        }
+        catch {
+            Write-SPOTLog "ERROR: while resetting the SecretStore: $_."
+            throw "Initialize-SPOTSecretStore: error resetting secret store!"
+        }
+
+        ########################################################
+        # remove any existing SecretStore Vault
+        try {
+            Get-SecretVault | Where {$_.Name -eq "SecretStore"} | Unregister-SecretVault -Confirm:$false
+        }
+        catch {
+            Write-SPOTLog "ERROR: while removing all existing Vaults: $_."
+            throw "Initialize-SPOTSecretStore: error resetting secret store!"
+        }
+
+        ########################################################
+        # create the default vault from scratch
+        try {
+            Register-SecretVault -Name SecretStore -DefaultVault -ModuleName Microsoft.PowerShell.SecretStore
+        }
+        catch {
+            Write-SPOTLog "ERROR: while creating the default Vault: $_."
+            throw "Initialize-SPOTSecretStore: error resetting secret store!"
+        }
+    
+        ########################################################
+        # unlock the secret vault after resetting
+        Unlock-SecretStore -Password $SSMasterPassword
+
+        ########################################################
+        # add the SPOT secret for flagging the initialization
+        Set-Secret -Name "_SPOT_INITIALIZATION_FLAG_" -Secret "$([DateTimeOffset]::Now.ToUnixTimeSeconds())" -Vault SecretStore
+    }
+    else {
+         Write-SPOTLog " > The SPOT SecretStore is already initialized. Nothing to do."
+    }
+
+    ########################################################
+    Write-SPOTLog "===== Finished function Initialize-SPOTSecretStore. ====="
+
+} # end of Initialize-SPOTSecretStore function
+
+######################################################################################################################
+function Get-SPOTSecretStoreStatus {
+<#
+.SYNOPSIS
+Returns the current status of the local SPOT SecretStore.
+
+.DESCRIPTION
+Returns the current status of the local SPOT SecretStore. It can be Initialized or NotInitialized.
+
+.PARAMETER MasterPassword
+Specifies the password to be used for unlocking the secret store, if it is not registered.
+
+.INPUTS
+None. You can't pipe objects to Get-SPOTSecretStoreStatus.
+
+.OUTPUTS
+System.String. Get-SPOTSecretStoreStatus may return only string output.
+#> 
+
+    Param ( 
+        [Parameter(Mandatory=$false)]
+        [ValidateNotNullOrEmpty()]
+        [string]
+        # The password to be used for unlocking the secret store, if it is not prestaged
+        $MasterPassword
+        )
+
+    #################################
+    if ((Get-SecretVault -ErrorAction SilentlyContinue | Where {$_.Name -eq "SecretStore"})) {
+        #####################
+        # unlock the secrets store, if not already unlocked
+        if (!(Get-SPOTSecretStoreState)) {
+            # unlock the secret store
+            if ($MasterPassword) {
+                Unlock-SPOTSecretStore -MasterPassword $MasterPassword
+            }
+            else {
+                Unlock-SPOTSecretStore
+            }
+            Write-SPOTLog "The SPOT secret store was unlocked." -Output $false -DBG $true
+        }
+
+        #####################
+        # get the SecretStore details
+        $SSConfig = Get-SecretStoreConfiguration -ErrorAction SilentlyContinue
+        if ($SSConfig.PasswordTimeout -eq "180") {
+            $SPOT_Init_Flag = Get-Secret -Name "_SPOT_INITIALIZATION_FLAG_" -Vault "SecretStore" -ErrorAction SilentlyContinue
+            if ($SPOT_Init_Flag) {
+                return "Initialized"
+            }
+            else {
+                return "NotInitialized"
+            }
+        }
+        else {
+            return "NotInitialized"
         }
     }
-
-    ########################################################
-    # reinitialize the secret store and sets its configuration to remain unlocked for 1 hour after unlocking
-    try {
-        Reset-SecretStore -Password $SSMasterPassword -Scope CurrentUser -Authentication Password -PasswordTimeout 180 -Interaction None -Confirm:$false -Force
-    }
-    catch {
-        Write-SPOTLog "ERROR: while resetting the SecretStore: $_." -Output $false
-        return $false
+    else {
+        return "NotInitialized"
     }
 
-    ########################################################
-    # remove any existing Vault
-    try {
-        Unregister-SecretVault -Name *
-    }
-    catch {
-        Write-SPOTLog "ERROR: while removing all existing Vaults: $_." -Output $false
-        return $false
-    }
-
-    ########################################################
-    # create the default vault from scratch
-    try {
-        Register-SecretVault -Name SecretStore -DefaultVault -ModuleName Microsoft.PowerShell.SecretStore
-    }
-    catch {
-        Write-SPOTLog "ERROR: while creating the default Vault: $_." -Output $false
-        return $false
-    }
-    
-    ########################################################
-    Write-SPOTLog "===== Finished function Initialize-SPOTSecretStore. =====" -Output $false
-
-    return $true
-} # end of Initialize-SPOTSecretStore function
+} # end of Get-SPOTSecretStoreStatus function
 
 ######################################################################################################################
 function Get-SPOTProjectFunctionList {

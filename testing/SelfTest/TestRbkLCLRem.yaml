@@ -1,0 +1,32 @@
+Description: TemplateRunbookLCL for testing step type functionality locally
+RunbookParameters:
+    TRBPar1: DefaultRBValue1
+    TRBPar2: DefaultRBValue2
+    OVNSuffix: Default
+RunbookSteps:
+    
+    Step1:
+        Type: PowershellCommandLocal
+        Description: Test local step locally
+        Seq: 1
+        StepParameters:
+            CommandName: Start-STFunction
+            CommandParameters:
+                InputVariable: STRING_TEST_VARIABLE_$RP:TRBPar1
+            ExecPath: C:\temp
+            VariablesToPublish: _spot_Output=LocalStepOutput_$RP:OVNSuffix
+        Disabled: false
+        
+    Step2:
+        Type: PowershellCommandRemote
+        Description: Test remote step locally
+        Seq: 2
+        StepParameters:
+            CommandName: Start-STScript
+            CommandParameters:
+                InputVariable: STRING_TEST_VARIABLE_$RP:TRBPar2
+            ExecPath: C:\temp
+            RemoteComputer: 127.0.0.1
+            Credential: $SV:LocalCred
+            VariablesToPublish: _spot_Output=RemoteStepOutput_$RP:OVNSuffix
+        Disabled: false

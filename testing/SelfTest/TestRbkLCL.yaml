@@ -1,0 +1,179 @@
+Description: TemplateRunbookLCL for testing step type functionality locally
+RunbookSteps:
+    
+    Step1:
+        Type: PowershellCommandLocal
+        Description: Test local step locally
+        Seq: 1
+        StepParameters:
+            CommandName: Start-STFunction
+            CommandParameters:
+                InputVariable: STRING_TEST_VARIABLE_L
+            ExecPath: C:\temp
+            VariablesToPublish:
+            - _spot_Output=LocalStepTest
+        Disabled: false
+        
+    Step2:
+        Type: PowershellCommandRemote
+        Description: Test remote step locally
+        Seq: 2
+        StepParameters:
+            CommandName: Start-STScript
+            CommandParameters:
+                InputVariable: STRING_TEST_VARIABLE_R
+            ExecPath: C:\temp
+            RemoteComputer: 127.0.0.1
+            Credential: $SV:LocalCred
+            VariablesToPublish:
+            - _spot_Output=RemoteStepTest
+        Disabled: false
+
+    Step3:
+        Type: PowershellCommandRemoteSJ
+        Description: Test remoteSJ step locally
+        Seq: 3
+        StepParameters:
+            CommandName: Start-STFunction
+            CommandParameters:
+                InputVariable: STRING_TEST_VARIABLE_RSJ
+            ExecPath: C:\temp
+            RemoteComputer: 127.0.0.1
+            Credential: $SV:LocalCred
+            VariablesToPublish:
+            - _spot_Output=RemoteSJStepTest
+        Disabled: false
+
+    Step4:
+        Type: PowershellCommandRemoteWMI
+        Description: Test remoteSJ step locally
+        Seq: 4
+        StepParameters:
+            CommandName: Start-STScript
+            CommandParameters:
+                InputVariable: STRING_TEST_VARIABLE_RWMI
+            ExecPath: C:\temp
+            RemoteComputer: 127.0.0.1
+            Credential: $SV:LocalCred
+            VariablesToPublish:
+            - _spot_Output=RemoteWMIStepTest
+        Disabled: false
+        
+    Step5:
+        Type: PowershellCommandRemotePsExec
+        Description: Test remoteSJ step locally
+        Seq: 5
+        StepParameters:
+            CommandName: Start-STFunction
+            CommandParameters:
+                InputVariable: STRING_TEST_VARIABLE_RPsExec
+            ExecPath: C:\temp
+            RemoteComputer: 127.0.0.1
+            Credential: $SV:LocalCred
+            VariablesToPublish:
+            - _spot_Output=RemotePSEStepTest
+        Disabled: false
+        
+    Step6:
+        Type: PowershellCommandRemoteOWMI
+        Description: Test remoteSJ step locally
+        Seq: 6
+        StepParameters:
+            CommandName: Start-STScript
+            CommandParameters:
+                InputVariable: STRING_TEST_VARIABLE_ROWMI
+            ExecPath: C:\temp
+            RemoteComputer: 127.0.0.1
+            Credential: $SV:LocalCred
+            VariablesToPublish:
+            - _spot_Output=RemoteOWMIStepTest
+        Disabled: false
+
+    TestRbkLCLRem1:
+        Type: Runbook
+        RunbookName: TestRbkLCLRem
+        Description: nested local runbook test
+        Seq: 7
+        Conditions: $OV:ConditionFlag
+        RunbookParameters:
+            TRBPar1: CallingRBValue1
+            OVNSuffix: NestedLocalRunbook
+        ContinueOnError: false
+        Disabled: false
+        
+    TestRbkLCLRem2:
+        Type: Runbook
+        RunbookName: TestRbkLCLRem
+        Description: nested remote runbook test
+        Seq: 8
+        Conditions: $OV:ConditionFlag
+        RunbookParameters:
+            TRBPar2: RemoteCallingRBValue2
+            OVNSuffix: NestedRemoteRunbook
+        ContinueOnError: false
+        RemoteParameters:
+            ExecFunction: PowershellCommandRemote
+            RemoteComputer: 127.0.0.1
+            Credential: $SV:LocalCred
+        Disabled: false
+
+    TestRbkLCLRem3:
+        Type: Runbook
+        RunbookName: TestRbkLCLRem
+        Description: nested remoteWMI runbook test
+        Seq: 9
+        Conditions: $OV:ConditionFlag
+        RunbookParameters:
+            TRBPar1: RemoteWMICallingRBValue1
+            TRBPar2: RemoteWMICallingRBValue2
+            OVNSuffix: NestedRemoteWMIRunbook
+        ContinueOnError: false
+        RemoteParameters:
+            ExecFunction: PowershellCommandRemoteWMI
+            RemoteComputer: 127.0.0.1
+            Credential: $SV:LocalCred
+        Disabled: false
+
+    TestRbkLCLRem4:
+        Type: Runbook
+        RunbookName: TestRbkLCLRem
+        Description: nested remotePSE runbook test
+        Seq: 10
+        Conditions: $OV:ConditionFlag
+        RunbookParameters:
+            TRBPar1: RemotePSECallingRBValue1
+            TRBPar2: RemotePSECallingRBValue2
+            OVNSuffix: NestedRemotePSERunbook
+        ContinueOnError: false
+        RemoteParameters:
+            ExecFunction: PowershellCommandRemotePsExec
+            RemoteComputer: 127.0.0.1
+            Credential: $SV:LocalCred
+        Disabled: false
+
+    TestRbkLCLRem5:
+        Type: Runbook
+        RunbookName: TestRbkLCLRem
+        Description: nested remoteOWMI runbook test
+        Seq: 11
+        Conditions: $OV:ConditionFlag
+        RunbookParameters:
+            TRBPar1: RemoteOWMICallingRBValue1
+            TRBPar2: RemoteOWMICallingRBValue2
+            OVNSuffix: NestedRemoteOWMIRunbook
+        ContinueOnError: false
+        RemoteParameters:
+            ExecFunction: PowershellCommandRemoteOWMI
+            RemoteComputer: 127.0.0.1
+            Credential: $SV:LocalCred
+        Disabled: false
+        
+    Step20:
+        Type: PowershellCommandLocal
+        Description: Check all test results
+        Seq: 20
+        StepParameters:
+            CommandName: Check-STResults
+            CommandParameters:
+                PublishedVars: $PV:.
+        Disabled: false

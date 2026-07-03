@@ -3,6 +3,14 @@
 # v1.1 - 17.05.2026 - added the RunbookParameters functionality in Execute-SPOTRunbook, Replace-SPOTLineVars
 #                   - introduced Replace-SPOTVarsInRunbookJIT and Replace-SPOTVarsInRunbookStepJIT (just in time replace functions)
 #                   - fixed single line step output in PowershellCommandRemote reported as failed
+# v1.2 - 03.07.2026 - changed the error behavior of some internal functions to use throw; corrected Process-SPOTCommandParamsRF
+#                   - improved the type functions to better handle step output in case of error; added Process-SPOTCommandParamsLocalRF
+#                   - better error handling in Execute-SPOTRunbook, Get-SPOTRunbookJobResult and Finalize-SPOTRemoteExecution
+#                     for remote runbook execution; for WMI related step types the remote powershell process has been set to hidden 
+#                   - improved the custom PSSessionConfiguration handling inside the PowershellCommandRemote type function
+#                   - added AsSystem for remote runbook execution with supporting ExecFunctions; 
+#                   - improved PowershellCommandRemote, PowershellCommandRemoteSJ and Start-SPOTRunbookJobRemote
+#                   - added support for references (including mixed strings) inside multiple VariablesToPublish entries
 # 
 #
 #
@@ -131,21 +139,69 @@ if (!($TCPTestResult.TcpTestSucceeded)) {
 ######################################
 # setup the remote PSSessionConfiguration to avoid "double hop" limitations
 try {
-    Invoke-Command -ComputerName $RemoteComputer -Credential $Credential -ScriptBlock {
-        if (Get-PSSessionConfiguration -ErrorAction SilentlyContinue | Where {$_.Name -eq "SPOTConfig"}) {
-            Write-Output ">>> WARNING: The SPOTConfig PSSession configuration was detected (previous execution did not end clean). Trying to remove it."
-            Unregister-PSSessionConfiguration -Name "SPOTConfig" -Force -ErrorAction SilentlyContinue
+    $CleanupSPOTConfig = Invoke-Command -ComputerName $RemoteComputer -Credential $Credential -ScriptBlock {
+        # get all sessions (includes the current one due to this Invoke-Command)
+        $WinRMSessions = Get-WSManInstance -ResourceURI Shell -Enumerate
+        # check SPOTConfig existence and usage
+        $SpotConfig = Get-PSSessionConfiguration -ErrorAction SilentlyContinue | Where {$_.Name -eq "SPOTConfig"}
+        if ($SpotConfig) {
+            # the SPOT PSSession Config already exists
+            ########################################
+            # check first if the existing SPOT PSSession Config is in use
+            $InUse = $false
+            if ($WinRMSessions | Where {($_.ResourceUri -like "*SPOTConfig") -and ($_.State -eq "Connected")}) {
+                $InUse = $true
+            }
+            ########################################
+            # check if the same credentials are used or not 
+            if ($SpotConfig.RunAsUser -ne $args[0].UserName) {
+                # other credentials used in the SPOT PSSession Config
+                if ($InUse) {
+                    # return error and stop the step as this may break a parent runbook
+                    throw "PowershellCommandRemote: the SPOTConfig PSSessionConfiguration is already in use with another credential!"
+                }
+                else {
+                    # before restarting the WinRM service, check if other PSSessions are connected
+                    if (($WinRMSessions | Where {($_.ResourceUri -like "*Microsoft.PowerShell") -and ($_.State -eq "Connected")}).Count -gt 1) {
+                        # return error and stop the step as this may break a parent runbook
+                        throw "PowershellCommandRemote: there is already another PSSession connected to the same target computer!"
+                    }
+                    else {
+                        Unregister-PSSessionConfiguration -Name "SPOTConfig" -Force -ErrorAction SilentlyContinue | Out-Null
+                        $true
+                        Register-PSSessionConfiguration -Name "SPOTConfig" -RunAsCredential $args[0] -Force -ErrorAction Stop | Out-Null
+                    }
+                }
+            }
+            else {
+                # the same credentials are used in the SPOT PSSession Config; it can be used as is
+                if ($InUse) {
+                    # return false to avoid deleting the already existing SPOT PSSession Config at the end
+                    return $false
+                }
+                else {
+                    # return true to delete the already existing SPOT PSSession Config at the end
+                    return $true
+                }
+            }
         }
-        Register-PSSessionConfiguration -Name "SPOTConfig" -RunAsCredential $args[0] -Force -ErrorAction Stop | Out-Null
+        else {
+            if (($WinRMSessions | Where {($_.ResourceUri -like "*Microsoft.PowerShell") -and ($_.State -eq "Connected")}).Count -gt 1) {
+                # return error and stop the step as this may break a parent runbook
+                throw "PowershellCommandRemote: there is already another PSSession connected to the same target computer!"
+            }
+            else {
+                $true
+                Register-PSSessionConfiguration -Name "SPOTConfig" -RunAsCredential $args[0] -Force -ErrorAction Stop | Out-Null
+            }
+        }
     } -ArgumentList $Credential
 }
 catch {
-    Write-SPOTLog ">>> ERROR while creating the PSSession Admin Config on the ""$RemoteComputer"" remote computer: $_."
+    Write-SPOTLog ">>> ERROR while creating the SPOT PSSession Admin Config on the ""$RemoteComputer"" remote computer: $_."
     # cleanup in case of error
     Invoke-Command -ComputerName $RemoteComputer -Credential $Credential -ScriptBlock {
-        if (Get-PSSessionConfiguration -ErrorAction SilentlyContinue | Where {$_.Name -eq "SPOTConfig"}) {
-            Unregister-PSSessionConfiguration -Name "SPOTConfig" -Force -ErrorAction SilentlyContinue
-        }
+        Get-PSSessionConfiguration -ErrorAction SilentlyContinue | Where {$_.Name -eq "SPOTConfig"} | Unregister-PSSessionConfiguration -Force -ErrorAction SilentlyContinue
     }
     return $false
 }
@@ -159,9 +215,9 @@ try {
 catch {
     Write-SPOTLog ">>> ERROR while creating the PSSession to the ""$RemoteComputer"" remote computer: $_."
     # cleanup in case of error
-    Invoke-Command -ComputerName $RemoteComputer -Credential $Credential -ScriptBlock {
-        if (Get-PSSessionConfiguration -ErrorAction SilentlyContinue | Where {$_.Name -eq "SPOTConfig"}) {
-            Unregister-PSSessionConfiguration -Name "SPOTConfig" -Force -ErrorAction SilentlyContinue
+    if ($CleanupSPOTConfig) {
+        Invoke-Command -ComputerName $RemoteComputer -Credential $Credential -ScriptBlock {
+            Get-PSSessionConfiguration -ErrorAction SilentlyContinue | Where {$_.Name -eq "SPOTConfig"} | Unregister-PSSessionConfiguration -Force -ErrorAction SilentlyContinue
         }
     }
     return $false
@@ -170,14 +226,16 @@ catch {
 ######################################
 if ($CommandParameters) {
     # there are command parameters defined; checking for $RFI or $RFO (file variables) and managing the file/folder transfer to the target computer
-    $CmdParametersRF = Process-SPOTCommandParamsRF -CommandParameters $CommandParameters -PSSession $session
-    if ($CmdParametersRF -eq $false) {
-        Write-SPOTLog ">>> ERROR while processing Referenced Files/Folders on the ""$RemoteComputer"" remote computer. Cannot continue."
+    try {
+        $CmdParametersRF = Process-SPOTCommandParamsRF -CommandParameters $CommandParameters -PSSession $session
+    }
+    catch {
+        Write-SPOTLog ">>> T.ERROR while processing Referenced Files/Folders on the ""$RemoteComputer"" remote computer: $_."
         # cleanup in case of error
         Remove-PSSession -Session $session -Confirm:$false -ErrorAction SilentlyContinue
-        Invoke-Command -ComputerName $RemoteComputer -Credential $Credential -ScriptBlock {
-            if (Get-PSSessionConfiguration -ErrorAction SilentlyContinue | Where {$_.Name -eq "SPOTConfig"}) {
-                Unregister-PSSessionConfiguration -Name "SPOTConfig" -Force -ErrorAction SilentlyContinue
+        if ($CleanupSPOTConfig) {
+            Invoke-Command -ComputerName $RemoteComputer -Credential $Credential -ScriptBlock {
+                Get-PSSessionConfiguration -ErrorAction SilentlyContinue | Where {$_.Name -eq "SPOTConfig"} | Unregister-PSSessionConfiguration -Force -ErrorAction SilentlyContinue
             }
         }
         return $false
@@ -241,12 +299,12 @@ try {
     } -ArgumentList $RemoteObjects
 }
 catch {
-    Write-SPOTLog ">>> ERROR preparing the PSSession to the ""$RemoteComputer"" remote computer: $_."
+    Write-SPOTLog ">>> T.ERROR while preparing the PSSession to the ""$RemoteComputer"" remote computer: $_."
     # cleanup in case of error
     Remove-PSSession -Session $session -Confirm:$false -ErrorAction SilentlyContinue
-    Invoke-Command -ComputerName $RemoteComputer -Credential $Credential -ScriptBlock {
-        if (Get-PSSessionConfiguration -ErrorAction SilentlyContinue | Where {$_.Name -eq "SPOTConfig"}) {
-            Unregister-PSSessionConfiguration -Name "SPOTConfig" -Force -ErrorAction SilentlyContinue
+    if ($CleanupSPOTConfig) {
+        Invoke-Command -ComputerName $RemoteComputer -Credential $Credential -ScriptBlock {
+            Get-PSSessionConfiguration -ErrorAction SilentlyContinue | Where {$_.Name -eq "SPOTConfig"} | Unregister-PSSessionConfiguration -Force -ErrorAction SilentlyContinue
         }
     }
     return $false
@@ -260,6 +318,7 @@ $PCROutput = Invoke-Command -Session $session -ScriptBlock {
         $_spot_Output += . $_spot_Cmd @_spot_CmdP *>&1 | Out-String -Stream -OutVariable _spot_SO
     }
     catch {
+        $_spot_SO = @($_spot_SO)
         $_spot_SO += "############# ORCHESTRATOR LOGGING: TERMINATING ERROR while trying to execute the command ""$_spot_Cmd"" remotely. #############"
         # error handling depending on where the error was caught
         if (($_.ScriptStackTrace -split "`n").Count -eq 1) {
@@ -307,11 +366,17 @@ $PCROutput = Invoke-Command -Session $session -ScriptBlock {
     $_spot_Output
 }
 
+######################
+if (!$PCROutput) {
+    Write-SPOTLog " ############# ORCHESTRATOR LOGGING: ERROR: no output from ""$RemoteComputer""! PSSession state: $($session.State). Continuing with cleanup. #############"
+    $PCROutput = $false
+}
+
 ######################################
 # capturing now the variables declared for publish, if they are available
 if ($_spot_VTPs) {
     # capture remotely the variable values remotely; place them in the $_spot_VTPs array; make them available locally with overwrite
-    $_spot_VTPs = Invoke-Command -Session $session -ScriptBlock {
+    $_spot_VTPs = Invoke-Command -Session $session -ErrorAction SilentlyContinue -ScriptBlock {
         foreach ($_spot_i in $_spot_VTPs) {
             $_spot_i.VarValue = Get-Variable -Name $_spot_i.VarName -ErrorAction SilentlyContinue -ValueOnly
         }
@@ -337,11 +402,11 @@ foreach ($rf in $RemoteTempFolders) {
     } -ArgumentList $rf
 }
 Remove-PSSession -Session $session -Confirm:$false
-Invoke-Command -ComputerName $RemoteComputer -Credential $Credential -ErrorAction SilentlyContinue -ScriptBlock {
-    if (Get-PSSessionConfiguration | Where {$_.Name -eq "SPOTConfig"}) {
-        Unregister-PSSessionConfiguration -Name "SPOTConfig" -Force
+if ($CleanupSPOTConfig) {
+    Invoke-Command -ComputerName $RemoteComputer -Credential $Credential -ScriptBlock {
+        Get-PSSessionConfiguration -ErrorAction SilentlyContinue | Where {$_.Name -eq "SPOTConfig"} | Unregister-PSSessionConfiguration -Force -ErrorAction SilentlyContinue
     }
-} 
+}
 
 ######################################
 Write-SPOTLog " ############# ORCHESTRATOR LOGGING: Finished step function ""$CommandName"" on remote computer ""$RemoteComputer"". Command output below. #############"
@@ -483,50 +548,13 @@ $_spot_HostFunctions = [scriptblock]::Create([System.Text.Encoding]::UTF8.GetStr
 ######################################
 # manage $RFI and $RFO parameters, if any
 if ($_spot_CmdP) {
-    foreach ($_spot_cp in $($_spot_CmdP.Keys)) {
-        $_spot_LocalItem = $null
-        if ($_spot_CmdP.$_spot_cp.GetType().Name -ne "String") {
-            continue
-        }
-        if ($_spot_CmdP.$_spot_cp.StartsWith('$RFI:')) {
-            # reference to a local file detected, get the local item
-            $_spot_LocalItem = Get-Item -Path "$($OrchVars._ProjectPath)\$(($_spot_CmdP.$_spot_cp -split ":")[1])" -ErrorAction SilentlyContinue
-            if ($_spot_LocalItem) {
-                Write-SPOTLog ">>> The RFI for parameter ""$_spot_cp"" and value ""$($_spot_CmdP.$_spot_cp)"" was detected as ""$($_spot_LocalItem.FullName)"", a file. Managing the local path." -DBG $true
-                # change the parameter to the local item full path
-                $_spot_CmdP.$_spot_cp = $_spot_LocalItem.FullName
-            }
-            else {
-                Write-SPOTLog ">>> ERROR: The RFI for parameter ""$_spot_cp"" and value ""$($_spot_CmdP.$_spot_cp)"" was not detected in the project folder. Cannot continue."
-                return $false
-            }
-        }
-        elseif ($_spot_CmdP.$_spot_cp.StartsWith('$RFO:')) {
-            # reference to a local folder detected, get the local item
-            if (($_spot_CmdP.$_spot_cp -split ":")[1] -eq "SSHNET") {
-                $_spot_LocalItem = Get-Item -Path $OrchVars._SshNetPath -ErrorAction SilentlyContinue
-            }
-            elseif (($_spot_CmdP.$_spot_cp -split ":")[1] -eq "PSEXEC") {
-                $_spot_LocalItem = Get-Item -Path $OrchVars._PsExecPath -ErrorAction SilentlyContinue
-            }
-            else {
-                $_spot_LocalItem = Get-Item -Path "$($OrchVars._ProjectPath)\$(($_spot_CmdP.$_spot_cp -split ":")[1])" -ErrorAction SilentlyContinue
-            }
-            if ($_spot_LocalItem) {
-                if ($_spot_LocalItem.PSIsContainer) {
-                    Write-SPOTLog ">>> The RFO for parameter ""$_spot_cp"" and value ""$($_spot_CmdP.$_spot_cp)"" was detected as ""$($_spot_LocalItem.FullName)"", a folder. Managing the local path." -DBG $true
-                }
-                else {
-                    Write-SPOTLog ">>> The RFO for parameter ""$_spot_cp"" and value ""$($_spot_CmdP.$_spot_cp)"" was detected as ""$($_spot_LocalItem.FullName)"", a file. Managing the local path." -DBG $true
-                }
-                # change the parameter to the local item full path
-                $_spot_CmdP.$_spot_cp = $_spot_LocalItem.FullName
-            }
-            else {
-                Write-SPOTLog ">>> ERROR: The RFO for parameter ""$_spot_cp"" and value ""$($_spot_CmdP.$_spot_cp)"" was not detected in the project folder. Cannot continue."
-                return $false
-            }
-        }
+    # there are command parameters defined; checking for $RFI or $RFO (file variables) and managing the file/folder local path
+    try {
+        Process-SPOTCommandParamsLocalRF -CommandParameters $_spot_CmdP
+    }
+    catch {
+        Write-SPOTLog ">>> T.ERROR while processing Referenced Files/Folders locally: $_."
+        return $false
     }
 }
 
@@ -540,6 +568,7 @@ try {
     $_spot_Output += . $_spot_CommandName @_spot_CmdP *>&1 | Out-String -Stream -OutVariable _spot_SO    
 }
 catch {
+    $_spot_SO = @($_spot_SO)
     $_spot_SO += "############# ORCHESTRATOR LOGGING: TERMINATING ERROR while trying to execute the step function ""$_spot_CommandName"" locally. #############"
     # error handling depending on where the error was caught
     if (($_.ScriptStackTrace -split "`n").Count -le 2) {
@@ -767,6 +796,7 @@ function PowershellCommandRemoteSJ {
             $_spot_Output += . $args.Command @_spot_cmdP *>&1 | Out-String -Stream -OutVariable _spot_SO 
         }
         catch {
+            $_spot_SO = @($_spot_SO)
             $_spot_SO += "############# ORCHESTRATOR LOGGING: TERMINATING ERROR while trying to execute the step function ""$($args.Command)"" using ScheduledJob. #############"
             # error handling depending on where the error was caught
             if (($_.ScriptStackTrace -split "`n").Count -le 2) {
@@ -912,7 +942,7 @@ try {
     $session = New-PSSession -ComputerName $RemoteComputer -Credential $Credential -SessionOption (New-PSSessionOption -OpenTimeout 30000) -ErrorAction Stop
 }
 catch {
-    Write-SPOTLog " >>> ERROR while creating PSSession to the ""$RemoteComputer"" remote computer: $_."
+    Write-SPOTLog " >>> T.ERROR while creating PSSession to the ""$RemoteComputer"" remote computer: $_."
     return $false
 }
 
@@ -929,7 +959,7 @@ try {
     } -ArgumentList (Get-Command | Where {$_.Name -in ("Execute-SPOTScheduledJob","Write-SPOTLog")})
 }
 catch {
-    Write-SPOTLog ">>> ERROR loading PSSession functions to the ""$RemoteComputer"" remote computer: $_."
+    Write-SPOTLog ">>> T.ERROR while loading PSSession functions to the ""$RemoteComputer"" remote computer: $_."
     # cleanup
     Remove-PSSession -Session $session -Confirm:$false
     return $false
@@ -944,9 +974,11 @@ Invoke-Command -Session $session -ScriptBlock {[System.Environment]::SetEnvironm
 # check if referenced file paths are present inside the command parameters
 if ($STParameters.ArgumentList.CommandParameters) {
     # there are command parameters defined; checking for $RFI or $RFO (file variables) and managing the file/folder transfer to the target computer
-    $CmdParametersRF = Process-SPOTCommandParamsRF -CommandParameters $STParameters.ArgumentList.CommandParameters -PSSession $session
-    if ($CmdParametersRF -eq $false) {
-        Write-SPOTLog ">>> ERROR while processing Referenced Files/Folders on the ""$RemoteComputer"" remote computer. Cannot continue."
+    try {
+        $CmdParametersRF = Process-SPOTCommandParamsRF -CommandParameters $STParameters.ArgumentList.CommandParameters -PSSession $session
+    }
+    catch {
+        Write-SPOTLog ">>> T.ERROR while processing Referenced Files/Folders on the ""$RemoteComputer"" remote computer: $_."
         # cleanup
         Remove-PSSession -Session $session -Confirm:$false
         return $false
@@ -968,13 +1000,19 @@ Invoke-Command -Session $session -ScriptBlock {
 
 ######################################
 # launch the ScheduledJob in the PSSession
-Invoke-Command -Session $session -ArgumentList $STParameters -ScriptBlock { 
-    # set as parameters the first object from the argumentlist; it should only be one hashtable
-    $IST = $args[0]
-    # convert back to ScriptBlock part to Scriptblock, after it has been deserialized to string by the scheduled task/job processing
-    $IST.ScriptBlock = [ScriptBlock]::Create($IST.ScriptBlock)
-    # call the function to use Scheduled Job
-    . Execute-SPOTScheduledJob @IST
+try {
+    Invoke-Command -Session $session -ArgumentList $STParameters -ScriptBlock { 
+        # set as parameters the first object from the argumentlist; it should only be one hashtable
+        $IST = $args[0]
+        # convert back to ScriptBlock part to Scriptblock, after it has been deserialized to string by the scheduled task/job processing
+        $IST.ScriptBlock = [ScriptBlock]::Create($IST.ScriptBlock)
+        # call the function to use Scheduled Job
+        . Execute-SPOTScheduledJob @IST
+    }
+}
+catch {
+    Write-SPOTLog ">>> T.ERROR while executing SPOTScheduledJob on the ""$RemoteComputer"" remote computer: $_."
+    return $false
 }
 
 ######################################
@@ -992,7 +1030,7 @@ if ($SJOutput) {
         $OH = [System.Management.Automation.PSSerializer]::Deserialize([System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($SJOutput)))
     }
     catch {
-        Write-SPOTLog "ERROR: while trying to deserialize the OutputHash: $_."
+        Write-SPOTLog "ERROR while trying to deserialize the OutputHash: $_."
     }
     ######################################
     # handling the Published Variables
@@ -1004,7 +1042,7 @@ if ($SJOutput) {
     $returnOutput = $OH.Output
 }
 else {
-    Write-SPOTLog " ############# ORCHESTRATOR LOGGING: ERROR: the expected output from ""$RemoteComputer"" is null or empty! Continuing with session cleanup. #############"
+    Write-SPOTLog " ############# ORCHESTRATOR LOGGING: ERROR: no output from ""$RemoteComputer""! PSSession state: $($session.State). Continuing with cleanup. #############"
     $returnOutput = $false
 }
 
@@ -1230,6 +1268,7 @@ function PowershellCommandRemoteWMI {
                 $_spot_Output += . $_spot_AH.Command @_spot_cmdP *>&1 | Out-String -Stream -OutVariable _spot_SO
             }
             catch {
+                $_spot_SO = @($_spot_SO)
                 $_spot_SO += "############# ORCHESTRATOR LOGGING: TERMINATING ERROR while trying to execute the step function ""$($_spot_AH.Command)"" over WMI. #############"
                 if (($_.ScriptStackTrace -split "`n").Count -eq 1) {
                     $_spot_SO += " >>>>>> ERROR encountered inside the SPOT tool function ""PowershellCommandRemoteWMI""."
@@ -1405,9 +1444,11 @@ $WMIParameters.ArgumentList.Functions = Get-Command | Where {$_.Name -in $_spot_
 # inject the needed Referenced Files/Folders in the WMI arguments
 if ($WMIParameters.ArgumentList.CommandParameters) {
     # there are command parameters defined; checking for $RFI or $RFO (file variables) and managing the file/folder transfer to the target computer
-    $CmdParametersRF = Process-SPOTCommandParamsRF -CommandParameters $WMIParameters.ArgumentList.CommandParameters
-    if ($CmdParametersRF -eq $false) {
-        Write-SPOTLog ">>> ERROR while processing Referenced Files/Folders on the ""$RemoteComputer"" remote computer for the ""$($WMIParameters.ArgumentList.Command)"" command. Cannot continue."
+    try {
+        $CmdParametersRF = Process-SPOTCommandParamsRF -CommandParameters $WMIParameters.ArgumentList.CommandParameters
+    }
+    catch {
+        Write-SPOTLog ">>> T.ERROR while processing Referenced Files/Folders on the ""$RemoteComputer"" remote computer for the ""$($WMIParameters.ArgumentList.Command)"" command: $_."
         return $false
     }
     $WMIParameters.ArgumentList.CommandParameters    = $CmdParametersRF.CommandParameters
@@ -1424,7 +1465,7 @@ $encodedArgumentList = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.Ge
 try {
     $CimSession = New-CimSession -ComputerName $RemoteComputer -Credential $Credential -SessionOption (New-CimSessionOption -Protocol Dcom)
     $holderData = Invoke-CimMethod -CimSession $CimSession -ClassName Win32_Process -MethodName Create `
-        -Arguments @{ CommandLine = "powershell.exe -encodedCommand $encodedCommand -encodedArguments $encodedArguments" }
+        -Arguments @{ CommandLine = "powershell.exe -WindowStyle Hidden -encodedCommand $encodedCommand -encodedArguments $encodedArguments" }
 }
 catch {
     Write-SPOTLog  " ############# ORCHESTRATOR LOGGING: ERROR while invoking the WMI Method on the ""$RemoteComputer"" remote computer: $_"
@@ -1445,9 +1486,11 @@ else {
 
 ######################################
 # start the Data Transfer handling between the local computer and the remote computer
-. Transfer-SPOTDataOverPipe -encodedArgumentList $encodedArgumentList -RemoteComputer $RemoteComputer
-if (!$tempData) {
-    Write-SPOTLog  " ############# ORCHESTRATOR LOGGING: ERROR: There is no result data received from the ""$RemoteComputer"" remote computer. #############"
+try {
+    . Transfer-SPOTDataOverPipe -encodedArgumentList $encodedArgumentList -RemoteComputer $RemoteComputer
+}
+catch {
+    Write-SPOTLog  " ############# ORCHESTRATOR LOGGING: ERROR: while transferring data to/from ""$RemoteComputer"" remote computer: $_. #############"
     return $false
 }
 
@@ -1692,6 +1735,7 @@ function PowershellCommandRemotePsExec {
                 $_spot_Output += . $_spot_AH.Command @_spot_CmdP *>&1 | Out-String -Stream -OutVariable _spot_SO
             }
             catch {
+                $_spot_SO = @($_spot_SO)
                 $_spot_SO += "############# ORCHESTRATOR LOGGING: TERMINATING ERROR while trying to execute the step function ""$($_spot_AH.Command)"" over PsExec. #############"
                 if (($_.ScriptStackTrace -split "`n").Count -le 1) {
                     $_spot_SO += " >>>>>> ERROR encountered inside the SPOT tool function ""PowershellCommandRemotePsExec""."
@@ -1870,9 +1914,11 @@ $PsExecParameters.ArgumentList.Functions = Get-Command | Where {$_.Name -in $_sp
 # inject the needed Referenced Files/Folders in the PsExec arguments
 if ($PsExecParameters.ArgumentList.CommandParameters) {
     # there are command parameters defined; checking for $RFI or $RFO (file variables) and managing the file/folder transfer to the target computer
-    $CmdParametersRF = Process-SPOTCommandParamsRF -CommandParameters $PsExecParameters.ArgumentList.CommandParameters
-    if ($CmdParametersRF -eq $false) {
-        Write-SPOTLog ">>> ERROR while processing Referenced Files/Folders on the ""$RemoteComputer"" remote computer for the ""$($PsExecParameters.ArgumentList.Command)"" command. Cannot continue."
+    try {
+        $CmdParametersRF = Process-SPOTCommandParamsRF -CommandParameters $PsExecParameters.ArgumentList.CommandParameters
+    }
+    catch {
+        Write-SPOTLog ">>> T.ERROR while processing Referenced Files/Folders on the ""$RemoteComputer"" remote computer for the ""$($PsExecParameters.ArgumentList.Command)"" command: $_."
         return $false
     }
     $PsExecParameters.ArgumentList.CommandParameters    = $CmdParametersRF.CommandParameters
@@ -1928,9 +1974,11 @@ else {
 
 ######################################
 # start the Data Transfer handling between the local computer and the remote computer
-. Transfer-SPOTDataOverPipe -encodedArgumentList $encodedArgumentList -RemoteComputer $RemoteComputer
-if (!$tempData) {
-    Write-SPOTLog  " ############# ORCHESTRATOR LOGGING: ERROR: There is no result data received from the ""$RemoteComputer"" remote computer. #############"
+try {
+    . Transfer-SPOTDataOverPipe -encodedArgumentList $encodedArgumentList -RemoteComputer $RemoteComputer
+}
+catch {
+    Write-SPOTLog  " ############# ORCHESTRATOR LOGGING: ERROR: while transferring data to/from ""$RemoteComputer"" remote computer: $_. #############"
     return $false
 }
 
@@ -2168,6 +2216,7 @@ function PowershellCommandRemoteOWMI {
                 $_spot_Output += . $_spot_AH.Command @_spot_cmdP *>&1 | Out-String -Stream -OutVariable _spot_SO
             }
             catch {
+                $_spot_SO = @($_spot_SO)
                 $_spot_SO += "############# ORCHESTRATOR LOGGING: TERMINATING ERROR while trying to execute the step function ""$($_spot_AH.Command)"" over OWMI. #############"
                 if (($_.ScriptStackTrace -split "`n").Count -eq 1) {
                     $_spot_SO += " >>>>>> ERROR encountered inside the SPOT tool function ""PowershellCommandRemoteOWMI""."
@@ -2342,9 +2391,11 @@ $WMIParameters.ArgumentList.Functions = Get-Command | Where {$_.Name -in $_spot_
 # inject the needed Referenced Files/Folders in the WMI arguments
 if ($WMIParameters.ArgumentList.CommandParameters) {
     # there are command parameters defined; checking for $RFI or $RFO (file variables) and managing the file/folder transfer to the target computer
-    $CmdParametersRF = Process-SPOTCommandParamsRF -CommandParameters $WMIParameters.ArgumentList.CommandParameters
-    if ($CmdParametersRF -eq $false) {
-        Write-SPOTLog ">>> ERROR while processing Referenced Files/Folders on the ""$RemoteComputer"" remote computer for the ""$($WMIParameters.ArgumentList.Command)"" command. Cannot continue."
+    try {
+        $CmdParametersRF = Process-SPOTCommandParamsRF -CommandParameters $WMIParameters.ArgumentList.CommandParameters
+    }
+    catch {
+        Write-SPOTLog ">>> T.ERROR while processing Referenced Files/Folders on the ""$RemoteComputer"" remote computer for the ""$($WMIParameters.ArgumentList.Command)"" command: $_."
         return $false
     }
     $WMIParameters.ArgumentList.CommandParameters    = $CmdParametersRF.CommandParameters
@@ -2362,7 +2413,7 @@ try {
     $CimSession = New-CimSession -ComputerName $RemoteComputer -Credential $Credential -SessionOption (New-CimSessionOption -Protocol Dcom)
     Get-CimInstance -CimSession $CimSession -Namespace "root\SPOT_TD" -ClassName "SPOT_CC" -Filter "ID = 1" -ErrorAction SilentlyContinue | Set-CimInstance -Property @{Data="StatusCleared"}
     $holderData = Invoke-CimMethod -CimSession $CimSession -ClassName Win32_Process -MethodName Create `
-        -Arguments @{ CommandLine = "powershell.exe -encodedCommand $encodedCommand -encodedArguments $encodedArguments" }
+        -Arguments @{ CommandLine = "powershell.exe -WindowStyle Hidden -encodedCommand $encodedCommand -encodedArguments $encodedArguments" }
 }
 catch {
     Write-SPOTLog  " ############# ORCHESTRATOR LOGGING: ERROR while invoking the WMI Method on the ""$RemoteComputer"" remote computer: $_"
@@ -2596,29 +2647,48 @@ function Execute-SPOTRunbook {
         ###############
         Write-SPOTLog ">>> Get the initial PSRemoting trust value." -DBG $true 
         # Enable-PSRemoting -Force -SkipNetworkProfileCheck
-        $InitialTHValue = (Get-Item WSMan:\localhost\Client\TrustedHosts).Value
-
-        ###############
-        Write-SPOTLog ">>> Set the PSRemoting trust value to trust all (*)." -DBG $true 
+        ########
         try {
-            Set-Item WSMan:\localhost\Client\TrustedHosts -Value '*' -Force
+            $InitialTHValue = (Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WSMAN\Client" -Name "trusted_hosts" -ErrorAction Stop).trusted_hosts
         }
         catch {
-            Write-SPOTLog "__##__ERROR while setting the PSRemoting trust value: $_.__##__" -DBG $true
-            throw "Execute-SPOTRunbook: failed to set PSRemoting trust value!"
+            Write-SPOTLog "__##__Could not get the initial WinRM TrustedHosts value: $_.__##__" -DBG $true
+            throw "Execute-SPOTRunbook: the TrustedHosts initial value could not be determined!"
         }
-
+        
         ###############
-        Write-SPOTLog ">>> Get initial and set the AcceptEULA for PsExec temporarily for the remote usage." -DBG $true 
-        $InitialSysinternalsReg = Test-Path -Path "HKCU:\Software\Sysinternals\PsExec" -PathType Container
-        if ($InitialSysinternalsReg) {
-            $InitialSysinternalsEula = (Get-ItemProperty -Path "HKCU:\Software\Sysinternals\PsExec" -ErrorAction SilentlyContinue).EulaAccepted
+        if ($InitialTHValue -ne '*') {
+            Write-SPOTLog ">>> Set the PSRemoting trust value to trust all (*)." -DBG $true 
+            try {
+                New-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WSMAN\Client" -Name "trusted_hosts" -PropertyType String -Value '*' -Force -Confirm:$false -ErrorAction Stop
+            }
+            catch {
+                Write-SPOTLog "__##__ERROR while setting the PSRemoting trust value: $_.__##__" -DBG $true
+                throw "Execute-SPOTRunbook: failed to set PSRemoting trust value!"
+            }
         }
-        else {
-            New-Item -Path "HKCU:\Software\Sysinternals\PsExec" -Confirm:$false -Force | Out-Null
+        
+        ###############
+        Write-SPOTLog ">>> Get initial and set the AcceptEULA for PsExec temporarily for the remote usage." -DBG $true
+        try {
+            $InitialSysinternalsReg = Test-Path -Path "HKCU:\Software\Sysinternals\PsExec" -PathType Container
+            if ($InitialSysinternalsReg) {
+                Write-SPOTLog ">>>> Initial PsExec registry key found." -DBG $true
+                $InitialSysinternalsEula = (Get-ItemProperty -Path "HKCU:\Software\Sysinternals\PsExec" -ErrorAction SilentlyContinue).EulaAccepted
+                Write-SPOTLog ">>>> Initial SysinternalsEula for PsExec registry entry: $InitialSysinternalsEula." -DBG $true
+            }
+            else {
+                Write-SPOTLog ">>>> Initial PsExec registry key not found. Creating it now." -DBG $true
+                New-Item -Path "HKCU:\Software\Sysinternals\PsExec" -Confirm:$false -Force | Out-Null
+            }
+            Write-SPOTLog ">>>> Setting SysinternalsEula for PsExec registry entry now." -DBG $true
+            Set-ItemProperty -Path "HKCU:\Software\Sysinternals\PsExec" -Name "EulaAccepted" -Value 1 -Confirm:$false -Force
         }
-        Set-ItemProperty -Path "HKCU:\Software\Sysinternals\PsExec" -Name "EulaAccepted" -Value 1 -Confirm:$false -Force
-
+        catch {
+            Write-SPOTLog "__##__ERROR while handling the PsExec AcceptEULA value: $_.__##__" -DBG $true
+            throw "Execute-SPOTRunbook: error handling the PsExec AcceptEULA value!"
+        }
+        
         ###############
         $ToRemoveSPOTFWRule = $false
         if (!(Get-NetFirewallRule | Where {$_.DisplayName -eq "Allow TCP 5985/445/22/23 Outbound"})) {
@@ -2654,7 +2724,13 @@ function Execute-SPOTRunbook {
             Write-SPOTLog "__##__STOP COMMAND DETECTED! SIGNALLING THE ENTIRE RUNBOOK TO STOP.__##__"
             $Runbook.StopFlag = $true
             if ($Remote) {
-                . Finalize-SPOTRemoteExecution -Runbook $Runbook -InitialTHValue $InitialTHValue -ToRemoveSPOTFWRule $ToRemoveSPOTFWRule -InitialSysinternalsReg $InitialSysinternalsReg -InitialSysinternalsEula $InitialSysinternalsEula
+                try {
+                    . Finalize-SPOTRemoteExecution -Runbook $Runbook -InitialTHValue $InitialTHValue -ToRemoveSPOTFWRule $ToRemoveSPOTFWRule -InitialSysinternalsReg $InitialSysinternalsReg -InitialSysinternalsEula $InitialSysinternalsEula
+                }
+                catch {
+                    Write-SPOTLog "__##__ERROR: while finalizing the remote runbook execution: $_.__##__"
+                    throw "Execute-SPOTRunbook: finalizing remote runbook execution failure!"
+                }
             }
             return $true
         }
@@ -2710,13 +2786,13 @@ function Execute-SPOTRunbook {
                     Write-SPOTLog "__##__RunbookStep ""$($Step.Name)"" detected with status ""$($Step.Status)"".__##__" -DBG $true
                     if ($Step.GetType().Name -eq "Runbook") {
                         # split based on remote or not
-                        if ($Step.RemoteParams.RemoteComputer) {
+                        if ($Step.RemoteParameters.RemoteComputer) {
                             # this is a remote runbook execution
                             Write-SPOTLog "__##__Resuming remote Runbook ""$($Step.Name)"" execution with GUID ""$($Step.GUID)"".__##__" -DBG $true
-                            $CurrentJbs += Start-SPOTRunbookJobRemote -GUID $Step.GUID -ExecFunction $Step.RemoteParams.ExecFunction -RemoteComputer $Step.RemoteParams.RemoteComputer -Credential $Step.RemoteParams.Credential -Resume $true
+                            $CurrentJbs += Start-SPOTRunbookJobRemote -GUID $Step.GUID -Resume $true
                         }
                         else {
-                            Write-SPOTLog "__##__Resuming Runbook ""$($Step.Name)"" execution with GUID ""$($Step.GUID)"".__##__" -DBG $true
+                            Write-SPOTLog "__##__Resuming local Runbook ""$($Step.Name)"" execution with GUID ""$($Step.GUID)"".__##__" -DBG $true
                             $CurrentJbs += Start-SPOTRunbookJob -GUID $Step.GUID -Resume $true
                         }
                     }
@@ -2737,13 +2813,13 @@ function Execute-SPOTRunbook {
             else {
                 if ($Step.GetType().Name -eq "Runbook") {
                     # case for local or remote runbook job, as there are two distinct functions for these
-                    if ($Step.RemoteParams.RemoteComputer) {
+                    if ($Step.RemoteParameters.RemoteComputer) {
                         # this was a remote runbook execution
                         Write-SPOTLog "__##__Starting remote Runbook ""$($Step.Name)"" execution with GUID ""$($Step.GUID)"".__##__" -DBG $true
-                        $CurrentJbs += Start-SPOTRunbookJobRemote -GUID $Step.GUID -ExecFunction $Step.RemoteParams.ExecFunction -RemoteComputer $Step.RemoteParams.RemoteComputer -Credential $Step.RemoteParams.Credential
+                        $CurrentJbs += Start-SPOTRunbookJobRemote -GUID $Step.GUID
                     }
                     else {
-                        Write-SPOTLog "__##__Starting Runbook ""$($Step.Name)"" execution with GUID ""$($Step.GUID)"".__##__" -DBG $true
+                        Write-SPOTLog "__##__Starting local Runbook ""$($Step.Name)"" execution with GUID ""$($Step.GUID)"".__##__" -DBG $true
                         $CurrentJbs += Start-SPOTRunbookJob -GUID $Step.GUID
                     }
                 }
@@ -2792,7 +2868,13 @@ function Execute-SPOTRunbook {
                 Write-SPOTLog "__##__ERROR: Some steps in the current sequence without the flag ContinueOnError returned failure. Stopping the entire runbook.__##__"
                 if ($Remote) {
                     # populate the RunbookArtefacts and RunbookSummary variables to be published and available to the calling environment
-                    . Finalize-SPOTRemoteExecution -Runbook $Runbook -InitialTHValue $InitialTHValue -ToRemoveSPOTFWRule $ToRemoveSPOTFWRule -InitialSysinternalsReg $InitialSysinternalsReg -InitialSysinternalsEula $InitialSysinternalsEula
+                    try {
+                        . Finalize-SPOTRemoteExecution -Runbook $Runbook -InitialTHValue $InitialTHValue -ToRemoveSPOTFWRule $ToRemoveSPOTFWRule -InitialSysinternalsReg $InitialSysinternalsReg -InitialSysinternalsEula $InitialSysinternalsEula
+                    }
+                    catch {
+                        Write-SPOTLog "__##__ERROR: while finalizing the remote runbook execution: $_.__##__"
+                        throw "Execute-SPOTRunbook: finalizing remote runbook execution failure!"
+                    }
                 }
                 throw "Execute-SPOTRunbook: step failure!"
             }
@@ -2802,8 +2884,14 @@ function Execute-SPOTRunbook {
     # archive the output logs from the target Runbook and load the content into a variable, to be published and made available back in the calling SPOT enviroment
     if ($Remote) {
         # prepare the data for the parent runbook
-        . Finalize-SPOTRemoteExecution -Runbook $Runbook -InitialTHValue $InitialTHValue -ToRemoveSPOTFWRule $ToRemoveSPOTFWRule -InitialSysinternalsReg $InitialSysinternalsReg -InitialSysinternalsEula $InitialSysinternalsEula
-
+        try {
+            . Finalize-SPOTRemoteExecution -Runbook $Runbook -InitialTHValue $InitialTHValue -ToRemoveSPOTFWRule $ToRemoveSPOTFWRule -InitialSysinternalsReg $InitialSysinternalsReg -InitialSysinternalsEula $InitialSysinternalsEula
+        }
+        catch {
+            Write-SPOTLog "__##__ERROR: while finalizing the remote runbook execution: $_.__##__"
+            throw "Execute-SPOTRunbook: finalizing remote runbook execution failure!"
+        }
+        
         # close and dispose the main worker pool from this main remote runbook execution environment
         $_spot_MainWorkerPool.Dispose()
     }
@@ -2889,27 +2977,12 @@ function Start-SPOTRunbookJobRemote {
         [ValidateNotNullOrEmpty()]
         [bool]
         # if true, the runbook steps will execute only the steps that are not already in state Completed
-        $Resume = $false, 
-        [Parameter(Mandatory=$true)]
-        [ValidateNotNullOrEmpty()]
-        [string]
-        # the name of the SPOT remote function to be used
-        $ExecFunction, 
-        [Parameter(Mandatory=$true)]
-        [ValidateNotNullOrEmpty()]
-        [string]
-        # the target IP or hostname of the remote computer to be used for the runbook execution
-        $RemoteComputer, 
-        [Parameter(Mandatory=$true)]
-        [ValidateNotNullOrEmpty()]
-        [System.Management.Automation.PSCredential]
-        # the credentials to connect to the remote computer
-        $Credential  
+        $Resume = $false
     )
 
     ########
     $Runbook = $AllRunbooks.$GUID
-    Write-SPOTLog "__###__Starting remote job for Runbook ""$($Runbook.Name)"" with function ""$ExecFunction"" and credential ""$($Credential.UserName)"" on target host: ""$RemoteComputer"".__###__" -Output $false -DBG $true
+    Write-SPOTLog "__###__Starting job for remote Runbook ""$($Runbook.Name)"" with function ""$($Runbook.RemoteParameters.ExecFunction)"" and credential ""$($Runbook.RemoteParameters.Credential.UserName)"" on remote computer ""$($Runbook.RemoteParameters.RemoteComputer)"".__###__" -Output $false -DBG $true
 
     ########
     # first thing, we make sure the StopFlag is set to false to be able to execute and initialize the StartTime
@@ -2917,7 +2990,7 @@ function Start-SPOTRunbookJobRemote {
     $Runbook.StartTime = Get-date
 
     ########
-    Write-SPOTLog "__###__Preparing parameters for Runbook ""$($Runbook.Name)"".__###__" -Output $false -DBG $true
+    Write-SPOTLog "__###__Preparing parameters for remote Runbook ""$($Runbook.Name)"".__###__" -Output $false -DBG $true
     # define the composition key for the main runbook; it will be transported to the destination as a securestring
     $RunbookCompKey = "$(-join (((48..57)+(97..122)) * 80 | Get-Random -Count 32 |%{[char]$_}))"
 
@@ -2925,6 +2998,7 @@ function Start-SPOTRunbookJobRemote {
     $CloneRunbook = Decompose-SPOTRunbook -InputRunbook $Runbook -Key $RunbookCompKey
     $b64Serialized = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes([management.automation.psserializer]::Serialize($CloneRunbook, 10)))
 
+    ########
     $FunctionParameters = @{
         GUID = $GUID
         Remote = $true
@@ -2936,12 +3010,8 @@ function Start-SPOTRunbookJobRemote {
             Runbook = $b64Serialized
             PublishedData = $PublishedData
             SVars = $SVars
-        } 
-    }
-    if ($Resume) {
-        $FunctionParameters += @{
-            Resume = $true
         }
+        Resume = $Resume
     }
     if ($OrchVars._PsExecPath) {
         $FunctionParameters += @{
@@ -2959,11 +3029,17 @@ function Start-SPOTRunbookJobRemote {
     $FunctionParams = @{
         CommandName        = "Execute-SPOTRunbook"
         CommandParameters  = $FunctionParameters
-        RemoteComputer     = $RemoteComputer
-        Credential         = $Credential
+        RemoteComputer     = $Runbook.RemoteParameters.RemoteComputer
+        Credential         = $Runbook.RemoteParameters.Credential
         VariablesToPublish = ("RunbookSummary=RunbookSummary_$GUID","PublishedData=PublishedData_$GUID","RunbookArtefacts=RunbookArtefacts_$GUID")
     }
+    if ($Runbook.RemoteParameters.AsSystem) {
+        $FunctionParams += @{
+            AsSystem = $true
+        }
+    }
 
+    ########
     foreach ($cpar in $($FunctionParams.CommandParameters.Keys)) {
         if ($FunctionParams.CommandParameters.$cpar.GetType().Name -ne "String") {
             continue
@@ -3021,8 +3097,8 @@ function Start-SPOTRunbookJobRemote {
     
     ########
     Write-SPOTLog "__###__Launching remote job for Runbook ""$($Runbook.Name)"".__###__" -Output $false -DBG $true
-    $RunbookJob           = & $ExecFunction @FunctionParams
-    $RunbookJob.Target    = $RemoteComputer
+    $RunbookJob           = & $Runbook.RemoteParameters.ExecFunction @FunctionParams
+    $RunbookJob.Target    = $Runbook.RemoteParameters.RemoteComputer
     $RunbookJob.GUID      = $GUID
     $RunbookJob.Name      = $Runbook.Name
     $RunbookJob.Type      = "Runbook"
@@ -3064,7 +3140,7 @@ function Start-SPOTRunbookStepJob {
 
     ########
     Write-SPOTLog "__#__Launching job for runbookstep ""$($RunbookStep.Name)"".__#__" -Output $false -DBG $true
-    $fParams = $RunbookStep.FunctionParams
+    $fParams = $RunbookStep.StepParameters
 
     ########
     # try to detect if this is a parallel execution (potential parallel parameter is "RemoteComputer")
@@ -3091,21 +3167,21 @@ function Start-SPOTRunbookStepJob {
     $Targets = $Targets | Select-Object -Unique
 
     ########
-    if ($RunbookStep.Function -like "*Remote*") {
+    if ($RunbookStep.Type -like "*Remote*") {
         # for remotely executed functions, we might have RFO references; managing here the archive creation and propagation to all step jobs (single or multiple)
-        foreach ($cpar in $($RunbookStep.FunctionParams.CommandParameters.Keys)) {
-            if ($RunbookStep.FunctionParams.CommandParameters.$cpar) {
-                if ($RunbookStep.FunctionParams.CommandParameters.$cpar.GetType().Name -eq "String") {
-                    if ($RunbookStep.FunctionParams.CommandParameters.$cpar.StartsWith('$RFO:')) {
+        foreach ($cpar in $($RunbookStep.StepParameters.CommandParameters.Keys)) {
+            if ($RunbookStep.StepParameters.CommandParameters.$cpar) {
+                if ($RunbookStep.StepParameters.CommandParameters.$cpar.GetType().Name -eq "String") {
+                    if ($RunbookStep.StepParameters.CommandParameters.$cpar.StartsWith('$RFO:')) {
                         # get the local item path
-                        if (($RunbookStep.FunctionParams.CommandParameters.$cpar -split ":")[1] -eq "SSHNET") {
+                        if (($RunbookStep.StepParameters.CommandParameters.$cpar -split ":")[1] -eq "SSHNET") {
                             $LocalFilePath = $OrchVars._SshNetPath
                         }
-                        elseif (($RunbookStep.FunctionParams.CommandParameters.$cpar -split ":")[1] -eq "PSEXEC") {
+                        elseif (($RunbookStep.StepParameters.CommandParameters.$cpar -split ":")[1] -eq "PSEXEC") {
                             $LocalFilePath = $OrchVars._PsExecPath
                         }
                         else {
-                            $LocalFilePath = "$($OrchVars._ProjectPath)\$(($RunbookStep.FunctionParams.CommandParameters.$cpar -split ":")[1])"
+                            $LocalFilePath = "$($OrchVars._ProjectPath)\$(($RunbookStep.StepParameters.CommandParameters.$cpar -split ":")[1])"
                         }
                         # get the local item
                         $LocalItem = Get-Item -Path $LocalFilePath -ErrorAction SilentlyContinue
@@ -3114,7 +3190,7 @@ function Start-SPOTRunbookStepJob {
                             continue
                         }
                         # manage the archive of the folder
-                        Write-SPOTLog "__#__The referenced item for parameter $cpar and value ""$($RunbookStep.FunctionParams.CommandParameters.$cpar)"" was detected as ""$($LocalItem.FullName)"". Managing the local folder archiving.__#__" -Output $false -DBG $true
+                        Write-SPOTLog "__#__The referenced item for parameter $cpar and value ""$($RunbookStep.StepParameters.CommandParameters.$cpar)"" was detected as ""$($LocalItem.FullName)"". Managing the local folder archiving.__#__" -Output $false -DBG $true
                         if ($LocalItem.Attributes -eq "Directory") {
                             # there is no file referenced, just the folder, so use it as is
                             $LocalFolder = $LocalItem
@@ -3135,7 +3211,7 @@ function Start-SPOTRunbookStepJob {
                             ReferencedFileName = $ReferencedFileName
                         }
                         # leave the same UniqueID inside the original command parameter
-                        $RunbookStep.FunctionParams.CommandParameters.$cpar = '$RFO:'+$UniqueID
+                        $RunbookStep.StepParameters.CommandParameters.$cpar = '$RFO:'+$UniqueID
                     }
                 }
             }
@@ -3147,7 +3223,7 @@ function Start-SPOTRunbookStepJob {
         # this is an implied parallel execution
         foreach ($Target in $Targets) {
             $RunbookStepJob = $null
-            $fParams = Get-SPOTDeepClone -InputObject $RunbookStep.FunctionParams
+            $fParams = Get-SPOTDeepClone -InputObject $RunbookStep.StepParameters
             Write-SPOTLog "__#__Starting StepJob for RunbookStep ""$($RunbookStep.Name)"" on target ""$Target"".__#__" -Output $false -DBG $true
             # modify the target parameter to apply to single targets, as we have parallel execution here
             $fParams.RemoteComputer = $Target
@@ -3157,7 +3233,7 @@ function Start-SPOTRunbookStepJob {
                 Write-SPOTLog "__#__Adding the -$Target suffix to all VariablesToPublish.__#__" -Output $false -DBG $true
                 $fParams.VariablesToPublish = $fParams.VariablesToPublish | % {$_+"-$Target"}
             }
-            $RunbookStepJob           = & $RunbookStep.Function @fParams
+            $RunbookStepJob           = & $RunbookStep.Type @fParams
             $RunbookStepJob.Target    = $Target
             $RunbookStepJob.GUID      = $GUID
             $RunbookStepJob.Name      = $RunbookStep.Name
@@ -3168,9 +3244,9 @@ function Start-SPOTRunbookStepJob {
     }
     else {
         # this is a normal/single execution
-        $fParams = Get-SPOTDeepClone -InputObject $RunbookStep.FunctionParams
+        $fParams = Get-SPOTDeepClone -InputObject $RunbookStep.StepParameters
         Write-SPOTLog "__#__Starting StepJob for RunbookStep ""$($RunbookStep.Name)"" on a single target.__#__" -Output $false -DBG $true
-        $RunbookStepJob           = & $RunbookStep.Function @fParams
+        $RunbookStepJob           = & $RunbookStep.Type @fParams
         $RunbookStepJob.GUID      = $GUID
         $RunbookStepJob.Name      = $RunbookStep.Name
         $RunbookStepJob.Type      = "RunbookStep"
@@ -3277,7 +3353,7 @@ function Get-SPOTRunbookJobResult {
 
         # set a flag for remote execution
         $Remote = $false
-        if ($Runbook.RemoteParams.RemoteComputer) {
+        if ($Runbook.RemoteParameters.RemoteComputer) {
             $Remote = $true
         }
 
@@ -3322,13 +3398,17 @@ function Get-SPOTRunbookJobResult {
             $TempFile = Get-Item -Path $TFP -Force
             if ($TempFile) {
                 if ($PublishedData["RunbookArtefacts_$($Runbook.GUID)"]) {
-                    Set-Content -Path $TempFile.FullName -Value $PublishedData["RunbookArtefacts_$($Runbook.GUID)"] -Confirm:$false -Force
-                    Extract-SPOTArchive -ZipPath $TFP -TargetFolder $Runbook.ArtefactsPath
+                    if ($PublishedData["RunbookArtefacts_$($Runbook.GUID)"].ToString() -ne "") {
+                        [System.IO.File]::WriteAllBytes($TempFile.FullName,$PublishedData["RunbookArtefacts_$($Runbook.GUID)"])
+                        Extract-SPOTArchive -ZipPath $TempFile.FullName -TargetFolder $Runbook.ArtefactsPath
+                    }
+                    else {
+                        Write-SPOTLog "WARNING: No value published for RunbookArtefacts!!"
+                    }
                 }
                 else {
                     Write-SPOTLog "WARNING: No value published for RunbookArtefacts!!"
                 }
-                
                 # the archive file can be cleaned up right now
                 Remove-Item -Path $TFP -Confirm:$false -Force -ErrorAction SilentlyContinue
             }
@@ -3610,15 +3690,15 @@ function Get-SPOTRunbookStepJobResult {
                         $RunbookStep.Status = $MainStatus
 
                         # delete any potential RFO archives locally
-                        if ($RunbookStep.Function -like "*Remote*") {
+                        if ($RunbookStep.Type -like "*Remote*") {
                             # for remotely executed functions, we might have RFO references; if yes, cleaning them up
-                            foreach ($cpar in $($RunbookStep.FunctionParams.CommandParameters.Keys)) {
-                                if ($RunbookStep.FunctionParams.CommandParameters.$cpar.GetType().Name -ne "String") {
+                            foreach ($cpar in $($RunbookStep.StepParameters.CommandParameters.Keys)) {
+                                if ($RunbookStep.StepParameters.CommandParameters.$cpar.GetType().Name -ne "String") {
                                     continue
                                 }
-                                if ($RunbookStep.FunctionParams.CommandParameters.$cpar.StartsWith('$RFO:')) {
+                                if ($RunbookStep.StepParameters.CommandParameters.$cpar.StartsWith('$RFO:')) {
                                     Write-SPOTLog "__#__For RunbookStep ""$($RunbookStep.Name)"" the command parameter ""$cpar"" has a RFO reference. Cleaning up.__#__" -DBG $true
-                                    $UniqueID = ($RunbookStep.FunctionParams.CommandParameters.$cpar -split ":")[1]
+                                    $UniqueID = ($RunbookStep.StepParameters.CommandParameters.$cpar -split ":")[1]
                                     $LocalArchivePath = $OrchVars._RFOMap.$UniqueID.LocalArchivePath
                                     if ($LocalArchivePath) {
                                         Remove-Item -Path $LocalArchivePath -Confirm:$false -Force -ErrorAction SilentlyContinue
@@ -3649,14 +3729,14 @@ function Get-SPOTRunbookStepJobResult {
                     $RunbookStep.Status = $result.Status
 
                     # delete any potential RFO archives locally
-                    if ($RunbookStep.Function -like "*Remote*") {
+                    if ($RunbookStep.Type -like "*Remote*") {
                         # for remotely executed functions, we might have RFO references; if yes, cleaning them up
-                        foreach ($cpar in $($RunbookStep.FunctionParams.CommandParameters.Keys)) {
-                            if ($RunbookStep.FunctionParams.CommandParameters.$cpar) {
-                                if ($RunbookStep.FunctionParams.CommandParameters.$cpar.GetType().Name -eq "String") {
-                                    if ($RunbookStep.FunctionParams.CommandParameters.$cpar.StartsWith('$RFO:')) {
+                        foreach ($cpar in $($RunbookStep.StepParameters.CommandParameters.Keys)) {
+                            if ($RunbookStep.StepParameters.CommandParameters.$cpar) {
+                                if ($RunbookStep.StepParameters.CommandParameters.$cpar.GetType().Name -eq "String") {
+                                    if ($RunbookStep.StepParameters.CommandParameters.$cpar.StartsWith('$RFO:')) {
                                         Write-SPOTLog "__#__For RunbookStep ""$($RunbookStep.Name)"" the command parameter ""$cpar"" has a RFO reference. Cleaning up.__#__" -DBG $true
-                                        $UniqueID = ($RunbookStep.FunctionParams.CommandParameters.$cpar -split ":")[1]
+                                        $UniqueID = ($RunbookStep.StepParameters.CommandParameters.$cpar -split ":")[1]
                                         $LocalArchivePath = $OrchVars._RFOMap.$UniqueID.LocalArchivePath
                                         if ($LocalArchivePath) {
                                             Remove-Item -Path $LocalArchivePath -Confirm:$false -Force -ErrorAction SilentlyContinue
@@ -3743,6 +3823,8 @@ function Finalize-SPOTRemoteExecution {
         # the main runbook object
         $Runbook, 
         [Parameter(Mandatory=$true)]
+        [AllowNull()]
+        [AllowEmptyString()]
         [string]
         # the initial TrustedHosts value
         $InitialTHValue, 
@@ -3755,6 +3837,8 @@ function Finalize-SPOTRemoteExecution {
         # the flag for the initial existence of the PsExec reg key
         $InitialSysinternalsReg, 
         [Parameter(Mandatory=$true)]
+        [AllowNull()]
+        [AllowEmptyString()]
         [string]
         # the initial value of the PsExec eula
         $InitialSysinternalsEula 
@@ -3767,7 +3851,7 @@ function Finalize-SPOTRemoteExecution {
     # populate the RunbookArtefacts variable to be published and available to the calling environment
     if (Test-Path -Path $Runbook.ArtefactsPath) {
         Create-SPOTArchive -TargetFolder $Runbook.ArtefactsPath -ZipPath "$($Runbook.ArtefactsPath).zip"
-        $RunbookArtefacts = Get-Content -Path "$($Runbook.ArtefactsPath).zip" -Raw
+        $RunbookArtefacts = [System.IO.File]::ReadAllBytes("$($Runbook.ArtefactsPath).zip")
     }
     else {
         Write-SPOTLog "WARNING: The Artefacts path ""$($Runbook.ArtefactsPath)"" was not detected. PublishedVariables will not contain the logs!!"
@@ -3780,7 +3864,7 @@ function Finalize-SPOTRemoteExecution {
     ###############
     # undo the SPOT environment changes
     Write-SPOTLog ">>> Revert the initial PSRemoting trust value." -DBG $true
-    Set-Item WSMan:\localhost\Client\TrustedHosts -Value $InitialTHValue -Force
+    New-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WSMAN\Client" -Name "trusted_hosts" -PropertyType String -Value $InitialTHValue -Force -Confirm:$false
 
     ###############
     if ($ToRemoveSPOTFWRule) {
@@ -3825,102 +3909,70 @@ Param (
     $RbParameters
     )
 
-    # targeting PV references, mixed string references involving all reference types, all "." references
+    # targeting PV references, mixed string references involving all reference types and all applicable "." references
     #####
     Write-SPOTLog "Starting function Replace-SPOTVarsInRunbookStepJIT for RunbookStep ""$($RunbookStep.Name)""." -Output $false -DBG $true
 
     # conditions
     if ($RunbookStep.Conditions) {
         $RunbookStep.Conditions = $RunbookStep.Conditions | foreach {
-            if ($_.GetType().Name -eq "String") {
-                if ($_.StartsWith("`$PV:")) {
-                    Write-SPOTLog " > Evaluating the RunbookStep ""$($RunbookStep.Name)"" Condition ""$_"" >>>" -Output $false -DBG $true
-                    $condition = $_
-                    try {
-                        $condition = Invoke-Expression -Command "`$PublishedData.$(($condition -split ":")[1].Trim())"
+            if ($_) {
+                if ($_.GetType().Name -eq "String") {
+                    if ($_.StartsWith("`$PV:")) {
+                        Write-SPOTLog " > Evaluating the RunbookStep ""$($RunbookStep.Name)"" Condition ""$_"" >>>" -Output $false -DBG $true
+                        try {
+                            $_ = Invoke-Expression -Command "`$PublishedData.$(($_ -split ":")[1].Trim())"
+                        }
+                        catch {
+                            Write-SPOTLog " >> ERROR: while replacing PV in Condition: $_." -Output $false
+                            throw "Replace-SPOTVarsInRunbookStepJIT: error processing condition!"
+                        }
+                        Write-SPOTLog " >> INFO: Condition value evaluated to ""$_""." -Output $false -DBG $true
                     }
-                    catch {
-                        Write-SPOTLog " >> ERROR: while replacing PV in Condition: $_." -Output $false
-                        throw "Replace-SPOTVarsInRunbookStepJIT: error processing condition!"
-                    }
-                    $_ = $condition
-                    Write-SPOTLog " >> INFO: Condition value evaluated to ""$_""." -Output $false -DBG $true
+                    $_
                 }
-                $_
+                else {
+                    Write-SPOTLog " >> INFO: Current Condition ""$_"" for the RunbookStep ""$($RunbookStep.Name)"" is not of type string! Leaving it unchanged." -Output $false
+                    $_
+                }
             }
             else {
-                Write-SPOTLog " >> WARNING: Current Condition ""$_"" for the RunbookStep ""$($RunbookStep.Name)"" is not of type string! Leaving it unchanged." -Output $false
+                # return the empty value as this is important for conditions
                 $_
             }
         }
     }
 
     # step parameters
-    foreach ($i in $($RunbookStep.FunctionParams.Keys)) {
+    foreach ($i in $($RunbookStep.StepParameters.Keys)) {
         $Splitted = $null
-        if ($RunbookStep.FunctionParams.$i) { 
-            if (($RunbookStep.FunctionParams.$i).GetType().Name -eq "String") {
-                $Splitted = ($RunbookStep.FunctionParams.$i).Trim() -split ":"
+        if ($RunbookStep.StepParameters.$i) { 
+            if (($RunbookStep.StepParameters.$i).GetType().Name -eq "String") {
+                $Splitted = ($RunbookStep.StepParameters.$i).Trim() -split ":"
                 if ($Splitted.Count -eq 2) {
                     # a single reference is present
-                    switch ($Splitted[0]) {
-                        #########################################
-                        "`$RP" {
-                            # single reference to RP (only the '.' reference expected)
-                            Write-SPOTLog " > Current step parameter ""$i"" detected as single `$RP reference." -Output $false -DBG $true
-                            if ($Splitted[1] -eq '.') {
-                                Write-SPOTLog " >> INFO: The current RP reference is for the full RP, as expected at this point. Replacing it now." -Output $false -DBG $true
-                                $RunbookStep.FunctionParams.$i = $RbParameters
-                            }
-                            else {
-                                Write-SPOTLog " >> ERROR: The current RP reference is not ""."", as expected at this point, but rather ""$($RunbookStep.FunctionParams.$i)"". Something went wrong. Cannot continue." -Output $false
-                                throw "Replace-SPOTVarsInRunbookStepJIT: error processing step parameter!"
-                            }
+                    if ($Splitted[0] -eq "`$PV") {
+                        Write-SPOTLog " > Current step parameter ""$i"" detected as single `$PV reference." -Output $false -DBG $true
+                        try {
+                            $RunbookStep.StepParameters.$i = Invoke-Expression -Command "`$PublishedData.$($Splitted[1])"
                         }
-                        #########################################
-                        "`$SV" {
-                            # single reference to SV (only the '.' reference expected)
-                            Write-SPOTLog " > Current step parameter ""$i"" detected as single `$SV reference." -Output $false -DBG $true
-                            if ($Splitted[1] -eq '.') {
-                                Write-SPOTLog " >> INFO: The current SV reference is for the full SV, as expected at this point. Replacing it now." -Output $false -DBG $true
-                                $RunbookStep.FunctionParams.$i = $SVars
-                            }
-                            else {
-                                Write-SPOTLog " >> ERROR: The current SV reference is not ""."", as expected at this point, but rather ""$($RunbookStep.FunctionParams.$i)"". Something went wrong. Cannot continue." -Output $false
-                                throw "Replace-SPOTVarsInRunbookStepJIT: error processing step parameter!"
-                            }
+                        catch {
+                            Write-SPOTLog " >> ERROR: while replacing PV in step parameter: $_." -Output $false
+                            throw "Replace-SPOTVarsInRunbookStepJIT: error processing step parameter!"
                         }
-                        #########################################
-                        "`$PV" {
-                            # single reference to PV
-                            Write-SPOTLog " > Current step parameter ""$i"" detected as single `$PV reference." -Output $false -DBG $true
-                            if ($Splitted[1] -eq '.') {
-                                Write-SPOTLog " >> INFO: The current PV reference is for the full PV. Replacing it now." -Output $false -DBG $true
-                                $RunbookStep.FunctionParams.$i = $PublishedData
-                            }
-                            else {
-                                try {
-                                    $RunbookStep.FunctionParams.$i = Invoke-Expression -Command "`$PublishedData.$($Splitted[1])"
-                                }
-                                catch {
-                                    Write-SPOTLog " >> ERROR: while replacing PV in step parameter: $_." -Output $false
-                                    throw "Replace-SPOTVarsInRunbookStepJIT: error processing step parameter!"
-                                }
-                                Write-SPOTLog " >> INFO: Changed the step parameter ""$i"" into ""$($RunbookStep.FunctionParams.$i)""." -Output $false -DBG $true
-                            }
-                        }
+                        Write-SPOTLog " >> INFO: Changed the step parameter ""$i"" into ""$($RunbookStep.StepParameters.$i)""." -Output $false -DBG $true
                     }
                 }
                 # if mixed string reference is present, process it
-                if ($RunbookStep.FunctionParams.$i) {
-                    if (($RunbookStep.FunctionParams.$i).GetType().Name -eq "String") {
-                        if (($RunbookStep.FunctionParams.$i).Contains("`$RP:") -or `
-                            ($RunbookStep.FunctionParams.$i).Contains("`$OV:") -or `
-                            ($RunbookStep.FunctionParams.$i).Contains("`$SV:") -or `
-                            ($RunbookStep.FunctionParams.$i).Contains("`$PV:")) {
-                            Write-SPOTLog " > Changing the RunbookStep ""$($RunbookStep.Name)"" step parameter ""$i"" as string line >>>" -Output $false -DBG $true
-                            $RunbookStep.FunctionParams.$i = Replace-SPOTLineVars -line $RunbookStep.FunctionParams.$i -SVars $SVars -PVars $PublishedData -RPars $RbParameters
-                            Write-SPOTLog " >> Into: ""$($RunbookStep.FunctionParams.$i)""." -Output $false -DBG $true
+                if ($RunbookStep.StepParameters.$i) {
+                    if (($RunbookStep.StepParameters.$i).GetType().Name -eq "String") {
+                        if (($RunbookStep.StepParameters.$i).Contains("`$RP:") -or `
+                            ($RunbookStep.StepParameters.$i).Contains("`$OV:") -or `
+                            ($RunbookStep.StepParameters.$i).Contains("`$SV:") -or `
+                            ($RunbookStep.StepParameters.$i).Contains("`$PV:")) {
+                            Write-SPOTLog " > Processing the RunbookStep ""$($RunbookStep.Name)"" step parameter ""$i"" as string line >>>" -Output $false -DBG $true
+                            $RunbookStep.StepParameters.$i = Replace-SPOTLineVars -line $RunbookStep.StepParameters.$i -SVars $SVars -PVars $PublishedData -RPars $RbParameters
+                            Write-SPOTLog " >> Into: ""$($RunbookStep.StepParameters.$i)""." -Output $false -DBG $true
                         }
                     }
                 }
@@ -3928,12 +3980,55 @@ Param (
         }
     }
 
+    # VariablesToPublish
+    if ($RunbookStep.StepParameters.VariablesToPublish) {
+        $RunbookStep.StepParameters.VariablesToPublish = $RunbookStep.StepParameters.VariablesToPublish | foreach {
+            if ($_) {
+                if ($_.GetType().Name -eq "String") {
+                    Write-SPOTLog " > Evaluating the RunbookStep ""$($RunbookStep.Name)"" VariablesToPublish entry ""$_"" >>>" -Output $false -DBG $true
+                    if (($_ -split ":").Count -eq 2) {
+                        ###############################
+                        # only single referenced PV expected at this point
+                        if ($_.StartsWith("`$PV:")) {
+                            try {
+                                $_ = Invoke-Expression -Command "`$PublishedData.$(($_ -split ":")[1].Trim())"
+                            }
+                            catch {
+                                Write-SPOTLog " >> ERROR: while replacing PV in VariablesToPublish entry: $_." -Output $false
+                                throw "Replace-SPOTVarsInRunbookStep: error replacing PV reference!"
+                            }
+                            Write-SPOTLog " >> INFO: VariablesToPublish entry value evaluated to ""$_""." -Output $false -DBG $true
+                        }
+                    }
+                    ###############################
+                    # if mixed string reference is present, process it
+                    if ($_) {
+                        if ($_.GetType().Name -eq "String") {
+                            if ($_.Contains("`$RP:") -or `
+                                $_.Contains("`$OV:") -or `
+                                $_.Contains("`$SV:") -or `
+                                $_.Contains("`$PV:")) {
+                                Write-SPOTLog " > Processing the RunbookStep ""$($RunbookStep.Name)"" VariablesToPublish entry ""$_"" as string line >>>" -Output $false -DBG $true
+                                $_ = Replace-SPOTLineVars -line $_ -SVars $SVars -PVars $PublishedData -RPars $RbParameters
+                                Write-SPOTLog " >> Into: ""$_""." -Output $false -DBG $true
+                            }
+                        }
+                        $_
+                    }
+                }
+                else {
+                    Write-SPOTLog " >> WARNING: Current VariablesToPublish entry ""$_"" for the RunbookStep ""$($RunbookStep.Name)"" is not of type string! Leaving it out." -Output $false
+                }
+            }
+        }
+    }
+
     # command parameters (for runbookSteps)
-    foreach ($i in $($RunbookStep.FunctionParams.CommandParameters.Keys)) {
+    foreach ($i in $($RunbookStep.StepParameters.CommandParameters.Keys)) {
         $Splitted = $null
-        if ($RunbookStep.FunctionParams.CommandParameters.$i) { 
-            if (($RunbookStep.FunctionParams.CommandParameters.$i).GetType().Name -eq "String") {
-                $Splitted = ($RunbookStep.FunctionParams.CommandParameters.$i).Trim() -split ":"
+        if ($RunbookStep.StepParameters.CommandParameters.$i) { 
+            if (($RunbookStep.StepParameters.CommandParameters.$i).GetType().Name -eq "String") {
+                $Splitted = ($RunbookStep.StepParameters.CommandParameters.$i).Trim() -split ":"
                 if ($Splitted.Count -eq 2) {
                     # a single reference is present
                     switch ($Splitted[0]) {
@@ -3943,10 +4038,10 @@ Param (
                             Write-SPOTLog " > Current command parameter ""$i"" detected as single `$RP reference." -Output $false -DBG $true
                             if ($Splitted[1] -eq '.') {
                                 Write-SPOTLog " >> INFO: The current RP reference is for the full RP, as expected at this point. Replacing it now." -Output $false -DBG $true
-                                $RunbookStep.FunctionParams.CommandParameters.$i = $RbParameters
+                                $RunbookStep.StepParameters.CommandParameters.$i = $RbParameters
                             }
                             else {
-                                Write-SPOTLog " >> ERROR: The current RP reference is not ""."", as expected at this point, but rather ""$($RunbookStep.FunctionParams.CommandParameters.$i)"". Something went wrong. Cannot continue." -Output $false
+                                Write-SPOTLog " >> ERROR: The current RP reference is not ""."", as expected at this point, but rather ""$($RunbookStep.StepParameters.CommandParameters.$i)"". Something went wrong. Cannot continue." -Output $false
                                 throw "Replace-SPOTVarsInRunbookStepJIT: error processing command parameter!"
                             }
                         }
@@ -3956,10 +4051,10 @@ Param (
                             Write-SPOTLog " > Current command parameter ""$i"" detected as single `$SV reference." -Output $false -DBG $true
                             if ($Splitted[1] -eq '.') {
                                 Write-SPOTLog " >> INFO: The current SV reference is for the full SV, as expected at this point. Replacing it now." -Output $false -DBG $true
-                                $RunbookStep.FunctionParams.CommandParameters.$i = $SVars
+                                $RunbookStep.StepParameters.CommandParameters.$i = $SVars
                             }
                             else {
-                                Write-SPOTLog " >> ERROR: The current SV reference is not ""."", as expected at this point, but rather ""$($RunbookStep.FunctionParams.CommandParameters.$i)"". Something went wrong. Cannot continue." -Output $false
+                                Write-SPOTLog " >> ERROR: The current SV reference is not ""."", as expected at this point, but rather ""$($RunbookStep.StepParameters.CommandParameters.$i)"". Something went wrong. Cannot continue." -Output $false
                                 throw "Replace-SPOTVarsInRunbookStepJIT: error processing command parameter!"
                             }
                         }
@@ -3969,31 +4064,31 @@ Param (
                             Write-SPOTLog " > Current command parameter ""$i"" detected as single `$PV reference." -Output $false -DBG $true
                             if ($Splitted[1] -eq '.') {
                                 Write-SPOTLog " >> INFO: The current PV reference is for the full PV. Replacing it now." -Output $false -DBG $true
-                                $RunbookStep.FunctionParams.CommandParameters.$i = $PublishedData
+                                $RunbookStep.StepParameters.CommandParameters.$i = $PublishedData
                             }
                             else {
                                 try {
-                                    $RunbookStep.FunctionParams.CommandParameters.$i = Invoke-Expression -Command "`$PublishedData.$($Splitted[1])"
+                                    $RunbookStep.StepParameters.CommandParameters.$i = Invoke-Expression -Command "`$PublishedData.$($Splitted[1])"
                                 }
                                 catch {
                                     Write-SPOTLog " >> ERROR: while replacing PV in command parameter: $_." -Output $false
                                     throw "Replace-SPOTVarsInRunbookStepJIT: error processing command parameter!"
                                 }
-                                Write-SPOTLog " >> INFO: Changed the command parameter ""$i"" into ""$($RunbookStep.FunctionParams.CommandParameters.$i)""." -Output $false -DBG $true
+                                Write-SPOTLog " >> INFO: Changed the command parameter ""$i"" into ""$($RunbookStep.StepParameters.CommandParameters.$i)""." -Output $false -DBG $true
                             }
                         }
                     }
                 }
                 # if mixed string reference is present, process it
-                if ($RunbookStep.FunctionParams.CommandParameters.$i) {
-                    if (($RunbookStep.FunctionParams.CommandParameters.$i).GetType().Name -eq "String") {
-                        if (($RunbookStep.FunctionParams.CommandParameters.$i).Contains("`$RP:") -or `
-                            ($RunbookStep.FunctionParams.CommandParameters.$i).Contains("`$OV:") -or `
-                            ($RunbookStep.FunctionParams.CommandParameters.$i).Contains("`$SV:") -or `
-                            ($RunbookStep.FunctionParams.CommandParameters.$i).Contains("`$PV:")) {
-                            Write-SPOTLog " > Changing the RunbookStep ""$($RunbookStep.Name)"" command parameter ""$i"" as string line >>>" -Output $false -DBG $true
-                            $RunbookStep.FunctionParams.CommandParameters.$i = Replace-SPOTLineVars -line $RunbookStep.FunctionParams.CommandParameters.$i -SVars $SVars -PVars $PublishedData -RPars $RbParameters
-                            Write-SPOTLog " >> Into: ""$($RunbookStep.FunctionParams.CommandParameters.$i)""." -Output $false -DBG $true
+                if ($RunbookStep.StepParameters.CommandParameters.$i) {
+                    if (($RunbookStep.StepParameters.CommandParameters.$i).GetType().Name -eq "String") {
+                        if (($RunbookStep.StepParameters.CommandParameters.$i).Contains("`$RP:") -or `
+                            ($RunbookStep.StepParameters.CommandParameters.$i).Contains("`$OV:") -or `
+                            ($RunbookStep.StepParameters.CommandParameters.$i).Contains("`$SV:") -or `
+                            ($RunbookStep.StepParameters.CommandParameters.$i).Contains("`$PV:")) {
+                            Write-SPOTLog " > Processing the RunbookStep ""$($RunbookStep.Name)"" command parameter ""$i"" as string line >>>" -Output $false -DBG $true
+                            $RunbookStep.StepParameters.CommandParameters.$i = Replace-SPOTLineVars -line $RunbookStep.StepParameters.CommandParameters.$i -SVars $SVars -PVars $PublishedData -RPars $RbParameters
+                            Write-SPOTLog " >> Into: ""$($RunbookStep.StepParameters.CommandParameters.$i)""." -Output $false -DBG $true
                         }
                     }
                 }
@@ -4022,24 +4117,28 @@ Param (
     # conditions (no RP references should be here at this point so starting with conditions)
     if ($Runbook.Conditions) {
         $Runbook.Conditions = $Runbook.Conditions | foreach {
-            if ($_.GetType().Name -eq "String") {
-                if ($_.StartsWith("`$PV:")) {
-                    Write-SPOTLog " > Evaluating the Runbook ""$($Runbook.Name)"" Condition ""$_"" >>>" -Output $false -DBG $true
-                    $condition = $_
-                    try {
-                        $condition = Invoke-Expression -Command "`$PublishedData.$(($condition -split ":")[1].Trim())"
+            if ($_) {
+                if ($_.GetType().Name -eq "String") {
+                    if ($_.StartsWith("`$PV:")) {
+                        Write-SPOTLog " > Evaluating the Runbook ""$($Runbook.Name)"" Condition ""$_"" >>>" -Output $false -DBG $true
+                        try {
+                            $_ = Invoke-Expression -Command "`$PublishedData.$(($_ -split ":")[1].Trim())"
+                        }
+                        catch {
+                            Write-SPOTLog " >> ERROR: while replacing PV in Condition: $_." -Output $false
+                            throw "Replace-SPOTVarsInRunbookJIT: error processing condition!"
+                        }
+                        Write-SPOTLog " >> INFO: Condition value evaluated to ""$_""." -Output $false -DBG $true
                     }
-                    catch {
-                        Write-SPOTLog " >> ERROR: while replacing PV in Condition: $_." -Output $false
-                        throw "Replace-SPOTVarsInRunbookJIT: error processing condition!"
-                    }
-                    $_ = $condition
-                    Write-SPOTLog " >> INFO: Condition value evaluated to ""$_""." -Output $false -DBG $true
+                    $_
                 }
-                $_
+                else {
+                    Write-SPOTLog " >> INFO: Current Condition ""$_"" for the Runbook ""$($Runbook.Name)"" is not of type string! Leaving it unchanged." -Output $false
+                    $_
+                }
             }
             else {
-                Write-SPOTLog " >> WARNING: Current Condition ""$_"" for the Runbook ""$($Runbook.Name)"" is not of type string! Leaving it unchanged." -Output $false
+                # return the empty value as this is important for conditions
                 $_
             }
         }
@@ -4054,39 +4153,16 @@ Param (
                     $Splitted = ($Runbook.RunbookParameters.$i).Trim() -split ":"
                     if ($Splitted.Count -eq 2) {
                         # a single reference is present
-                        switch ($Splitted[0]) {
-                            #########################################
-                            "`$SV" {
-                                # single reference to SV (only the '.' reference expected)
-                                Write-SPOTLog " > Current runbook parameter ""$i"" detected as single `$SV reference." -Output $false -DBG $true
-                                if ($Splitted[1] -eq '.') {
-                                    Write-SPOTLog " >> INFO: The current SV reference is for the full SV, as expected at this point. Replacing it now." -Output $false -DBG $true
-                                    $Runbook.RunbookParameters.$i = $SVars
-                                }
-                                else {
-                                    Write-SPOTLog " >> ERROR: The current SV reference is not ""."", as expected at this point, but rather ""$($Runbook.RunbookParameters.$i)"". Something went wrong. Cannot continue." -Output $false
-                                    throw "Replace-SPOTVarsInRunbookJIT: error processing runbook parameter!"
-                                }
+                        if ($Splitted[0] -eq "`$PV") {
+                            Write-SPOTLog " > Current runbook parameter ""$i"" detected as single `$PV reference." -Output $false -DBG $true
+                            try {
+                                $Runbook.RunbookParameters.$i = Invoke-Expression -Command "`$PublishedData.$($Splitted[1])"
                             }
-                            #########################################
-                            "`$PV" {
-                                # single reference to PV
-                                Write-SPOTLog " > Current runbook parameter ""$i"" detected as single `$PV reference." -Output $false -DBG $true
-                                if ($Splitted[1] -eq '.') {
-                                    Write-SPOTLog " >> INFO: The current PV reference is for the full PV. Replacing it now." -Output $false -DBG $true
-                                    $Runbook.RunbookParameters.$i = $PublishedData
-                                }
-                                else {
-                                    try {
-                                        $Runbook.RunbookParameters.$i = Invoke-Expression -Command "`$PublishedData.$($Splitted[1])"
-                                    }
-                                    catch {
-                                        Write-SPOTLog " >> ERROR: while replacing PV in runbook parameter: $_." -Output $false
-                                        throw "Replace-SPOTVarsInRunbookJIT: error processing runbook parameter!"
-                                    }
-                                    Write-SPOTLog " >> INFO: Changed the runbook parameter ""$i"" into ""$($Runbook.RunbookParameters.$i)""." -Output $false -DBG $true
-                                }
+                            catch {
+                                Write-SPOTLog " >> ERROR: while replacing PV in runbook parameter: $_." -Output $false
+                                throw "Replace-SPOTVarsInRunbookJIT: error processing runbook parameter!"
                             }
+                            Write-SPOTLog " >> INFO: Changed the runbook parameter ""$i"" into ""$($Runbook.RunbookParameters.$i)""." -Output $false -DBG $true
                         }
                     }
                 }
@@ -4095,32 +4171,25 @@ Param (
     }
 
     # remote parameters
-    if ($Runbook.RemoteParams) {
-        foreach ($i in $($Runbook.RemoteParams.Keys)) {
+    if ($Runbook.RemoteParameters) {
+        foreach ($i in $($Runbook.RemoteParameters.Keys)) {
             $Splitted = $null
-            if ($Runbook.RemoteParams.$i) { 
-                if (($Runbook.RemoteParams.$i).GetType().Name -eq "String") {
-                    $Splitted = ($Runbook.RemoteParams.$i).Trim() -split ":"
+            if ($Runbook.RemoteParameters.$i) { 
+                if (($Runbook.RemoteParameters.$i).GetType().Name -eq "String") {
+                    $Splitted = ($Runbook.RemoteParameters.$i).Trim() -split ":"
                     if ($Splitted.Count -eq 2) {
                         # a single reference is present
                         if ($Splitted[0] -eq "`$PV") {
-                            #########################################
-                            # single reference to PV
                             Write-SPOTLog " > Current remote parameter ""$i"" detected as single `$PV reference." -Output $false -DBG $true
-                            if ($Splitted[1] -eq '.') {
-                                Write-SPOTLog " >> INFO: The current PV reference is for the full PV. Replacing it now." -Output $false -DBG $true
-                                $Runbook.RemoteParams.$i = $PublishedData
+                            try {
+                                $Runbook.RemoteParameters.$i = Invoke-Expression -Command "`$PublishedData.$($Splitted[1])"
                             }
-                            else {
-                                try {
-                                    $Runbook.RemoteParams.$i = Invoke-Expression -Command "`$PublishedData.$($Splitted[1])"
-                                }
-                                catch {
-                                    Write-SPOTLog " >> ERROR: while replacing PV in remote parameter: $_." -Output $false
-                                    throw "Replace-SPOTVarsInRunbookJIT: error processing remote parameter!"
-                                }
-                                Write-SPOTLog " >> INFO: Changed the remote parameter ""$i"" into ""$($Runbook.RemoteParams.$i)""." -Output $false -DBG $true
+                            catch {
+                                Write-SPOTLog " >> ERROR: while replacing PV in remote parameter: $_." -Output $false
+                                throw "Replace-SPOTVarsInRunbookJIT: error processing remote parameter!"
                             }
+                            Write-SPOTLog " >> INFO: Changed the remote parameter ""$i"" into ""$($Runbook.RemoteParameters.$i)""." -Output $false -DBG $true
+                            
                         }
                     }
                 }
@@ -4484,11 +4553,13 @@ function Decompose-SPOTRunbook {
         $FunctionParams = $null
         if ($Step.GetType().Name -eq "RunbookStep") {
             # FunctionParams may contain secrets, so decompose these hashtables
-            $FunctionParams = Decompose-SPOTHashTableVariable -InputVariable $Step.FunctionParams -Key $Key
+            $FunctionParams = Decompose-SPOTHashTableVariable -InputVariable $Step.StepParameters -Key $Key
 
             # initialize a new RunbookStep object with the same parameters
-            $CloneStep = [RunbookStep]::new($Step.Name, $Step.Conditions, $Step.Description, $Step.Seq, $Step.Function, $FunctionParams)
+            $CloneStep = [RunbookStep]::new($Step.Name, $Step.Seq, $Step.Type, $FunctionParams)
             $CloneStep.GUID                   = $Step.GUID
+            $CloneStep.Conditions             = $Step.Conditions
+            $CloneStep.Description            = $Step.Description
             $CloneStep.Status                 = $Step.Status
             $CloneStep.MultiStatus            = Get-SPOTDeepClone -InputObject $Step.MultiStatus
             $CloneStep.StartTime              = $Step.StartTime
@@ -4514,11 +4585,12 @@ function Decompose-SPOTRunbook {
     ##########################
     # at the end, initialize a new Runbook object with the same parameters
     # RemoteParameters may contain secrets, so decompose these hashtables
-    $RemoteParams = Decompose-SPOTHashTableVariable -InputVariable $InputRunbook.RemoteParams -Key $Key
 
     # initialize a new Runbook object with the same parameters
-    $CloneRunbook = [Runbook]::new($InputRunbook.Name, $InputRunbook.Conditions, $InputRunbook.Description, $InputRunbook.Seq, $CloneRunbookSteps, $RemoteParams)
+    $CloneRunbook = [Runbook]::new($InputRunbook.Name, $InputRunbook.Seq)
     $CloneRunbook.GUID              = $InputRunbook.GUID
+    $CloneRunbook.Conditions        = $InputRunbook.Conditions
+    $CloneRunbook.Description       = $InputRunbook.Description
     $CloneRunbook.Status            = $InputRunbook.Status
     $CloneRunbook.MultiStatus       = Get-SPOTDeepClone -InputObject $InputRunbook.MultiStatus
     $CloneRunbook.StartTime         = $InputRunbook.StartTime
@@ -4528,6 +4600,8 @@ function Decompose-SPOTRunbook {
     $CloneRunbook.ContinueOnError   = $InputRunbook.ContinueOnError
     $CloneRunbook.ArtefactsPath     = $InputRunbook.ArtefactsPath
     $CloneRunbook.RunbookParameters = Decompose-SPOTHashTableVariable -InputVariable $InputRunbook.RunbookParameters -Key $Key
+    $CloneRunbook.RemoteParameters  = Decompose-SPOTHashTableVariable -InputVariable $InputRunbook.RemoteParameters -Key $Key
+    $CloneRunbook.RunbookSteps     += $CloneRunbookSteps
 
     # force stop flag to false
     $CloneRunbook.StopFlag = $false
@@ -4562,11 +4636,13 @@ function Recompose-SPOTRunbook {
         
         if (($DStep | gm | Select -Property TypeName -First 1).TypeName -eq "Deserialized.RunbookStep") {
             # FunctionParams may contain secrets, so recompose these hashtables
-            $FunctionParams = Recompose-SPOTHashTableVariable -InputVariable $DStep.FunctionParams -Key $Key
+            $FunctionParams = Recompose-SPOTHashTableVariable -InputVariable $DStep.StepParameters -Key $Key
 
             # initialize a new RunbookStep object with the same parameters
-            $Step = [RunbookStep]::new($DStep.Name, $DStep.Conditions, $DStep.Description, $DStep.Seq, $DStep.Function, $FunctionParams)
+            $Step = [RunbookStep]::new($DStep.Name, $DStep.Seq, $DStep.Type, $FunctionParams)
             $Step.GUID                   = $DStep.GUID
+            $Step.Conditions             = $DStep.Conditions
+            $Step.Description            = $DStep.Description
             $Step.Status                 = $DStep.Status
             $Step.MultiStatus            = Get-SPOTDeepClone -InputObject $DStep.MultiStatus
             $Step.StartTime              = $DStep.StartTime
@@ -4595,11 +4671,12 @@ function Recompose-SPOTRunbook {
     ##########################
     # at the end, initialize a new Runbook object with the same parameters
     # RemoteParameters may contain secrets, so recompose these hashtables
-    $RemoteParams = Recompose-SPOTHashTableVariable -InputVariable $DRunbook.RemoteParams -Key $Key
 
     # initialize a new Runbook object with the same parameters
-    $Runbook = [Runbook]::new($DRunbook.Name, $DRunbook.Conditions, $DRunbook.Description, $DRunbook.Seq, $RunbookSteps, $RemoteParams)
+    $Runbook = [Runbook]::new($DRunbook.Name, $DRunbook.Seq)
     $Runbook.GUID              = $DRunbook.GUID
+    $Runbook.Conditions        = $DRunbook.Conditions
+    $Runbook.Description       = $DRunbook.Description
     $Runbook.Status            = $DRunbook.Status
     $Runbook.MultiStatus       = Get-SPOTDeepClone -InputObject $DRunbook.MultiStatus
     $Runbook.StartTime         = $DRunbook.StartTime
@@ -4608,7 +4685,9 @@ function Recompose-SPOTRunbook {
     $Runbook.Disabled          = $DRunbook.Disabled
     $Runbook.ContinueOnError   = $DRunbook.ContinueOnError
     $Runbook.ArtefactsPath     = $DRunbook.ArtefactsPath
+    $Runbook.RemoteParameters  = Recompose-SPOTHashTableVariable -InputVariable $DRunbook.RemoteParameters -Key $Key
     $Runbook.RunbookParameters = Recompose-SPOTHashTableVariable -InputVariable $DRunbook.RunbookParameters -Key $Key
+    $Runbook.RunbookSteps     += $RunbookSteps
 
     # force stop flag to false
     $Runbook.StopFlag          = $false
@@ -5185,10 +5264,12 @@ function New-SPOTSFTPSession {
 
     #################################
     # test/detect the local Renci.SSHNet.dll file
-    $SshNetPath = Get-SPOTSshNetPath -SshNetPath $SshNetPath
-    if (!$SshNetPath) {
-        Write-SPOTLog "ERROR: The SshNetPath was not provided/determined/detected. Cannot continue." -Output $false
-        return $false
+    try {
+        $SshNetPath = Get-SPOTSshNetPath -SshNetPath $SshNetPath -ErrorAction Stop
+    }
+    catch {
+        Write-SPOTLog "T.ERROR: The SshNetPath was not provided/determined/detected: $_." -Output $false
+        throw "New-SPOTSFTPSession: SshNetPath not detected!"
     }
 
     #########################
@@ -5198,7 +5279,7 @@ function New-SPOTSFTPSession {
     }
     else {
         Write-SPOTLog "ERROR: The detected PowerShell version is too low. Cannot continue." -Output $false
-        return $false
+        throw "New-SPOTSFTPSession: PowerShell version is too low!"
     }
 
     #########################
@@ -5209,15 +5290,15 @@ function New-SPOTSFTPSession {
     }
     catch {
         Write-SPOTLog "ERROR: while detecting .NET Framework version: $_." -Output $false
-        return $false
+        throw "New-SPOTSFTPSession: error detecting .NET version!"
     }
     if ($NetVersion -lt 461308) {
         Write-SPOTLog "ERROR: the .NET Framework version is not 4.7.1 or greater. Cannot continue." -Output $false
-        return $false
+        throw "New-SPOTSFTPSession: .NET version too low!"
     }
     if (!$NetInstallPath) {
         Write-SPOTLog "ERROR: the .NET Framework install path could not be determined. Cannot continue." -Output $false
-        return $false
+        throw "New-SPOTSFTPSession: error detecting .NET path!"
     }
 
     #########################
@@ -5235,20 +5316,20 @@ function New-SPOTSFTPSession {
             }
             catch {
                 Write-SPOTLog "ERROR: while loading the objects inside the TrustedHosts file in the provided path ""$TrustedHostsFilePath"": $_." -Output $false
-                return $false
+                throw "New-SPOTSFTPSession: error loading Trusted Hosts!"
             }
             if ($TrustedHostKeys) {
                 $RequiredProperties = @("TargetHost","Port","KeyType","Fingerprint")
                 $MissingObjectProperties = $RequiredProperties | Where-Object { $_ -notin $TrustedHostKeys[0].PSObject.Properties.Name }
                 if ($MissingObjectProperties) {
                     Write-SPOTLog "ERROR: at least the first TrustedHosts object is missing some required properties: $($MissingObjectProperties -join ","). Cannot continue." -Output $false
-                    return $false
+                    throw "New-SPOTSFTPSession: error loading Trusted Hosts!"
                 }
             }
             else {
                 # no objects found; file cannot be used
                 Write-SPOTLog "ERROR: the provided TrustedHosts file has no usable data. Cannot continue." -Output $false
-                return $false
+                throw "New-SPOTSFTPSession: error loading Trusted Hosts!"
             }
             # using the TrustedHosts file; if the received key fingeprint does not match in the TrustedHosts file abort the connection
             $ValidateSSHKey = $true
@@ -5256,7 +5337,7 @@ function New-SPOTSFTPSession {
         else {
             # TrustedHosts file path provided but not detected; abort the connection
             Write-SPOTLog "ERROR: the TrustedHosts file path was provided but the file was not found. Cannot continue." -Output $false
-            return $false
+            throw "New-SPOTSFTPSession: error loading Trusted Hosts!"
         }
     }
 
@@ -5384,7 +5465,7 @@ public class HostKeyHandler
     catch {
         Write-SPOTLog "ERROR: while trying to connect to the target IP: $_." -Output $false
         Write-SPOTLog "INFO: SSH server key details: $($handlerObj.Logs)." -Output $false
-        return $false
+        throw "New-SPOTSFTPSession: error connecting to target!"
     }
 
     #########################
@@ -5408,8 +5489,8 @@ public class HostKeyHandler
         return $sftp
     }
     else {
-        Write-SPOTLog "===== Function New-SPOTSFTPSession for the target ""$TargetIP"" NOT successfull and returning false =====" -Output $false -DBG $true
-        return $false
+        Write-SPOTLog "===== Function New-SPOTSFTPSession for the target ""$TargetIP"" NOT successfull and throwing error =====" -Output $false -DBG $true
+        throw "New-SPOTSFTPSession: error connecting to target!"
     }
 } # end of New-SPOTSFTPSession function
 
@@ -5447,10 +5528,12 @@ function New-SPOTSSHSession {
 
     #################################
     # test/detect the local Renci.SSHNet.dll file
-    $SshNetPath = Get-SPOTSshNetPath -SshNetPath $SshNetPath
-    if (!$SshNetPath) {
-        Write-SPOTLog "ERROR: The SshNetPath was not provided/determined/detected. Cannot continue." -Output $false
-        return $false
+    try {
+        $SshNetPath = Get-SPOTSshNetPath -SshNetPath $SshNetPath -ErrorAction Stop
+    }
+    catch {
+        Write-SPOTLog "T.ERROR: The SshNetPath was not provided/determined/detected: $_." -Output $false
+        throw "New-SPOTSSHSession: SshNetPath not detected!"
     }
 
     #########################
@@ -5460,7 +5543,7 @@ function New-SPOTSSHSession {
     }
     else {
         Write-SPOTLog "ERROR: The detected PowerShell version is too low. Cannot continue." -Output $false
-        return $false
+        throw "New-SPOTSSHSession: PowerShell version is too low!"
     }
 
     #########################
@@ -5471,15 +5554,15 @@ function New-SPOTSSHSession {
     }
     catch {
         Write-SPOTLog "ERROR: while detecting .NET Framework version: $_." -Output $false
-        return $false
+        throw "New-SPOTSSHSession: error detecting .NET version!"
     }
     if ($NetVersion -lt 461308) {
         Write-SPOTLog "ERROR: the .NET Framework version is not 4.7.1 or greater. Cannot continue." -Output $false
-        return $false
+        throw "New-SPOTSSHSession: .NET version too low!"
     }
     if (!$NetInstallPath) {
         Write-SPOTLog "ERROR: the .NET Framework install path could not be determined. Cannot continue." -Output $false
-        return $false
+        throw "New-SPOTSSHSession: error detecting .NET path!"
     }
     
     #########################
@@ -5497,20 +5580,20 @@ function New-SPOTSSHSession {
             }
             catch {
                 Write-SPOTLog "ERROR: while loading the objects inside the TrustedHosts file in the provided path ""$TrustedHostsFilePath"": $_." -Output $false
-                return $false
+                throw "New-SPOTSSHSession: error loading Trusted Hosts!"
             }
             if ($TrustedHostKeys) {
                 $RequiredProperties = @("TargetHost","Port","KeyType","Fingerprint")
                 $MissingObjectProperties = $RequiredProperties | Where-Object { $_ -notin $TrustedHostKeys[0].PSObject.Properties.Name }
                 if ($MissingObjectProperties) {
                     Write-SPOTLog "ERROR: at least the first TrustedHosts object is missing some required properties: $($MissingObjectProperties -join ","). Cannot continue." -Output $false
-                    return $false
+                    throw "New-SPOTSSHSession: error loading Trusted Hosts!"
                 }
             }
             else {
                 # no objects found; file cannot be used
                 Write-SPOTLog "ERROR: the TrustedHosts file has no usable data. Cannot continue." -Output $false
-                return $false
+                throw "New-SPOTSSHSession: error loading Trusted Hosts!"
             }
             # using the TrustedHosts file; if the received key fingeprint does not match in the TrustedHosts file abort the connection
             $ValidateSSHKey = $true
@@ -5518,7 +5601,7 @@ function New-SPOTSSHSession {
         else {
             # TrustedHosts file path provided but not detected; abort the connection
             Write-SPOTLog "ERROR: the TrustedHosts file path was provided but the file was not found. Cannot continue." -Output $false
-            return $false
+            throw "New-SPOTSSHSession: error loading Trusted Hosts!"
         }
     }
 
@@ -5648,7 +5731,7 @@ public class HostKeyHandler
     catch {
         Write-SPOTLog "ERROR: while trying to connect to the target IP: $_." -Output $false
         Write-SPOTLog "INFO: SSH server key details: $($handlerObj.Logs)." -Output $false
-        return $false
+        throw "New-SPOTSSHSession: error connecting to target!"
     }
 
     #########################
@@ -5672,8 +5755,8 @@ public class HostKeyHandler
         return $sshClient
     }
     else {
-        Write-SPOTLog "===== Function New-SPOTSSHSession for the target ""$TargetIP"" NOT successfull and returning false =====" -Output $false -DBG $true
-        return $false
+        Write-SPOTLog "===== Function New-SPOTSSHSession for the target ""$TargetIP"" NOT successfull and and throwing error =====" -Output $false -DBG $true
+        throw "New-SPOTSSHSession: error connecting to target!"
     }
 } # end of New-SPOTSSHSession function
 
@@ -5681,6 +5764,7 @@ public class HostKeyHandler
 function Get-SPOTSshNetPath {
     Param (
         [Parameter(Mandatory=$false)]
+        [AllowNull()]
         [string]
         # the local path to the Renci.SSHNet.dll file
         $SshNetPath 
@@ -5702,7 +5786,7 @@ function Get-SPOTSshNetPath {
             }
             else {
                 Write-SPOTLog "ERROR: No Posh-SSH module detected after trying to load it, or version too low." -Output $false
-                return 
+                throw "Get-SPOTSshNetPath: Posh-SSH module (fallback) not found!"
             }
         }
     }
@@ -5724,7 +5808,7 @@ function Get-SPOTSshNetPath {
                 }
                 else {
                     Write-SPOTLog "ERROR: No Posh-SSH module detected after trying to load it, or version too low." -Output $false
-                    return
+                    throw "Get-SPOTSshNetPath: Posh-SSH module (fallback) not found!"
                 }
             }
         }
@@ -5927,7 +6011,6 @@ function Create-SPOTRsPool {
     }
     $sessionState.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new("_spot_FunctionNames", $RSPoolFunctions.Name, "Injected Step Functions"))
     $sessionState.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new("OrchVars", $OrchVars, "SPOT Orchestration Variables"))
-    #$sessionState.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new("SVars", $SVars, "SPOT Secret Variables"))
 
     ######################################
     # create runspace pool and open
@@ -6004,7 +6087,6 @@ function Create-SPOTRunbookStepRunspace {
     }
     $sessionState.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new("_spot_FunctionNames", $RunspaceFunctions.Name, "Injected Step Functions"))
     $sessionState.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new("OrchVars", $OrchVars, "SPOT Orchestration Variables"))
-    #$sessionState.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new("SVars", $SVars, "SPOT Secret Variables"))
 
     ######################################
     # create runspace and open
@@ -6035,7 +6117,6 @@ function Process-SPOTCommandParamsRF {
     )
 
     # if the pssession parameter is not provided, the function will process the references by placing the content inside the command parameters themselves
-
     #######################################
     $ReturnHashtable = @{
         CommandParameters = $CommandParameters
@@ -6050,43 +6131,45 @@ function Process-SPOTCommandParamsRF {
         }
         # check for $RFI or $RFO (file variables) and manage the file/folder transfer to the target computer over the command parameters themselves
         foreach ($cpar in $($ReturnHashtable.CommandParameters.Keys)) {
-            if ($ReturnHashtable.CommandParameters.$cpar.GetType().Name -ne "String") {
-                continue
-            }
-            if ($ReturnHashtable.CommandParameters.$cpar.StartsWith('$RFI:')) {
-                # reference to a local file detected
-                $LocalFile = $null
-                # get the local file
-                $LocalFile = Get-Item -Path "$($OrchVars._ProjectPath)\$(($ReturnHashtable.CommandParameters.$cpar -split ":")[1])" -ErrorAction SilentlyContinue
-                if ($LocalFile) {
-                    Write-SPOTLog ">>> The RFI for parameter ""$cpar"" and value ""$($ReturnHashtable.CommandParameters.$cpar)"" was detected as ""$($LocalFile.FullName)"". Managing the transfer to the remote computer inside the step command parameteres." -Output $false -DBG $true
-                    # add this parameter name to the list of parameters to be transformed into files on the remote computer
-                    $ReturnHashtable.CommandParametersRFI += $cpar
-                    # add the file content as the parameter value
-                    $ReturnHashtable.CommandParameters.$cpar = [System.IO.File]::ReadAllBytes($LocalFile.FullName)
+            if ($ReturnHashtable.CommandParameters.$cpar) {
+                if ($ReturnHashtable.CommandParameters.$cpar.GetType().Name -ne "String") {
+                    continue
                 }
-                else {
-                    Write-SPOTLog ">>> ERROR: The RFI for parameter ""$cpar"" and value ""$($CommandParameters.$cpar)"" was not detected. Cannot continue." -Output $false
-                    return $false
+                if ($ReturnHashtable.CommandParameters.$cpar.StartsWith('$RFI:')) {
+                    # reference to a local file detected
+                    $LocalFile = $null
+                    # get the local file
+                    $LocalFile = Get-Item -Path "$($OrchVars._ProjectPath)\$(($ReturnHashtable.CommandParameters.$cpar -split ":")[1])" -ErrorAction SilentlyContinue
+                    if ($LocalFile) {
+                        Write-SPOTLog ">>> The RFI for parameter ""$cpar"" and value ""$($ReturnHashtable.CommandParameters.$cpar)"" was detected as ""$($LocalFile.FullName)"". Managing the transfer to the remote computer inside the step command parameteres." -Output $false -DBG $true
+                        # add this parameter name to the list of parameters to be transformed into files on the remote computer
+                        $ReturnHashtable.CommandParametersRFI += $cpar
+                        # add the file content as the parameter value
+                        $ReturnHashtable.CommandParameters.$cpar = [System.IO.File]::ReadAllBytes($LocalFile.FullName)
+                    }
+                    else {
+                        Write-SPOTLog ">>> ERROR: The RFI for parameter ""$cpar"" and value ""$($CommandParameters.$cpar)"" was not detected. Cannot continue." -Output $false
+                        throw "Process-SPOTCommandParamsRF: RFI not detected!"
+                    }
                 }
-            }
-            if ($ReturnHashtable.CommandParameters.$cpar.StartsWith('$RFO:')) {
-                # reference to a local folder detected
-                $UniqueID = ($ReturnHashtable.CommandParameters.$cpar -split ":")[1]
-                $LocalArchivePath = $OrchVars._RFOMap.$UniqueID.LocalArchivePath
-                # get the local archive file, as indicated by the UniqueID from this parameter 
-                # local archive file created before this point in time, so that it can be reused in case of implied parallel executions
-                $LocalArchiveFile = Get-Item -Path $LocalArchivePath -ErrorAction SilentlyContinue
-                if (!$LocalArchiveFile) {
-                    Write-SPOTLog ">>> ERROR: The RFO archive file for parameter ""$cpar"" and value ""$($ReturnHashtable.CommandParameters.$cpar)"" was not detected. Path is ""$LocalArchivePath"". Cannot continue." -Output $false
-                    return $false
-                }
-                else {
-                    # the referenced local archive file is found, managing the transfer
-                    Write-SPOTLog ">>> The RFO archive file for parameter ""$cpar"" and value ""$($ReturnHashtable.CommandParameters.$cpar)"" was detected as ""$LocalArchivePath"". Managing the transfer to the remote computer inside the step command parameteres." -Output $false -DBG $true
-                    $ReturnHashtable.CommandParametersRFO.$cpar = $ReturnHashtable.CommandParameters.$cpar
-                    # add the file content as the parameter value
-                    $ReturnHashtable.CommandParameters.$cpar = [System.IO.File]::ReadAllBytes($LocalArchiveFile.FullName)
+                elseif ($ReturnHashtable.CommandParameters.$cpar.StartsWith('$RFO:')) {
+                    # reference to a local folder detected
+                    $UniqueID = ($ReturnHashtable.CommandParameters.$cpar -split ":")[1]
+                    $LocalArchivePath = $OrchVars._RFOMap.$UniqueID.LocalArchivePath
+                    # get the local archive file, as indicated by the UniqueID from this parameter 
+                    # local archive file created before this point in time, so that it can be reused in case of implied parallel executions
+                    $LocalArchiveFile = Get-Item -Path $LocalArchivePath -ErrorAction SilentlyContinue
+                    if (!$LocalArchiveFile) {
+                        Write-SPOTLog ">>> ERROR: The RFO archive file for parameter ""$cpar"" and value ""$($ReturnHashtable.CommandParameters.$cpar)"" was not detected. Path is ""$LocalArchivePath"". Cannot continue." -Output $false
+                        throw "Process-SPOTCommandParamsRF: RFO not detected!"
+                    }
+                    else {
+                        # the referenced local archive file is found, managing the transfer
+                        Write-SPOTLog ">>> The RFO archive file for parameter ""$cpar"" and value ""$($ReturnHashtable.CommandParameters.$cpar)"" was detected as ""$LocalArchivePath"". Managing the transfer to the remote computer inside the step command parameteres." -Output $false -DBG $true
+                        $ReturnHashtable.CommandParametersRFO.$cpar = $ReturnHashtable.CommandParameters.$cpar
+                        # add the file content as the parameter value
+                        $ReturnHashtable.CommandParameters.$cpar = [System.IO.File]::ReadAllBytes($LocalArchiveFile.FullName)
+                    }
                 }
             }
         }
@@ -6100,89 +6183,91 @@ function Process-SPOTCommandParamsRF {
         }
         # check for $RFI or $RFO (file variables) and manage the file/folder transfer to the target computer over the PSSession
         foreach ($cpar in $($ReturnHashtable.CommandParameters.Keys)) {
-            if ($ReturnHashtable.CommandParameters.$cpar.GetType().Name -ne "String") {
-                continue
-            }
-            if ($ReturnHashtable.CommandParameters.$cpar.StartsWith('$RFI:')) {
-                # reference to a local file detected
-                $LocalFile = $null
-                $RemoteTempFile = $null
-                # get the local file
-                $LocalFile = Get-Item -Path "$($OrchVars._ProjectPath)\$(($ReturnHashtable.CommandParameters.$cpar -split ":")[1])" -ErrorAction SilentlyContinue
-                if ($LocalFile) {
-                    Write-SPOTLog ">>> The RFI for parameter ""$cpar"" and value ""$($ReturnHashtable.CommandParameters.$cpar)"" was detected as ""$($LocalFile.FullName)"". Managing the file transfer to the remote computer over PSSession." -Output $false -DBG $true
-                    $RemoteTempFile = Invoke-Command -Session $PSSession -ScriptBlock {
-                        $_spot_TFP = [System.IO.Path]::GetTempFileName(); Get-Item -Path $_spot_TFP -Force
-                    }
-                    if ($RemoteTempFile.FullName) {
-                        # try to copy the file to the remote computer
-                        try {
-                            Copy-Item -Path $LocalFile.FullName -Destination $RemoteTempFile.FullName -ToSession $PSSession -Force -Confirm:$false
+            if ($ReturnHashtable.CommandParameters.$cpar) {
+                if ($ReturnHashtable.CommandParameters.$cpar.GetType().Name -ne "String") {
+                    continue
+                }
+                if ($ReturnHashtable.CommandParameters.$cpar.StartsWith('$RFI:')) {
+                    # reference to a local file detected
+                    $LocalFile = $null
+                    $RemoteTempFile = $null
+                    # get the local file
+                    $LocalFile = Get-Item -Path "$($OrchVars._ProjectPath)\$(($ReturnHashtable.CommandParameters.$cpar -split ":")[1])" -ErrorAction SilentlyContinue
+                    if ($LocalFile) {
+                        Write-SPOTLog ">>> The RFI for parameter ""$cpar"" and value ""$($ReturnHashtable.CommandParameters.$cpar)"" was detected as ""$($LocalFile.FullName)"". Managing the file transfer to the remote computer over PSSession." -Output $false -DBG $true
+                        $RemoteTempFile = Invoke-Command -Session $PSSession -ScriptBlock {
+                            $_spot_TFP = [System.IO.Path]::GetTempFileName(); Get-Item -Path $_spot_TFP -Force
                         }
-                        catch {
-                            Write-SPOTLog ">>> ERROR: While trying to copy the local file ""$($LocalFile.FullName)"" to the remote computer: $_." -Output $false
-                            return $false
+                        if ($RemoteTempFile.FullName) {
+                            # try to copy the file to the remote computer
+                            try {
+                                Copy-Item -Path $LocalFile.FullName -Destination $RemoteTempFile.FullName -ToSession $PSSession -Force -Confirm:$false
+                            }
+                            catch {
+                                Write-SPOTLog ">>> ERROR: While trying to copy the local file ""$($LocalFile.FullName)"" to the remote computer: $_." -Output $false
+                                throw "Process-SPOTCommandParamsRF: RFI copy error!"
+                            }
+                            # change the parameter to the remote temp file path
+                            $ReturnHashtable.CommandParameters.$cpar = $RemoteTempFile.FullName
+                            # add the remote file path to the list of files to be deleted at the end of the execution
+                            $ReturnHashtable.RemoteTempFiles += $RemoteTempFile.FullName
+                            Write-SPOTLog ">>> The RFI for parameter ""$cpar"" was transfered to the remote computer and the value changed to ""$($RemoteTempFile.FullName)""." -Output $false -DBG $true
                         }
-                        # change the parameter to the remote temp file path
-                        $ReturnHashtable.CommandParameters.$cpar = $RemoteTempFile.FullName
-                        # add the remote file path to the list of files to be deleted at the end of the execution
-                        $ReturnHashtable.RemoteTempFiles += $RemoteTempFile.FullName
-                        Write-SPOTLog ">>> The RFI for parameter ""$cpar"" was transfered to the remote computer and the value changed to ""$($RemoteTempFile.FullName)""." -Output $false -DBG $true
+                        else {
+                            Write-SPOTLog ">>> ERROR: The remote temporary file failed to create on the remote computer. Cannot continue." -Output $false
+                            throw "Process-SPOTCommandParamsRF: RFI temp file error!"
+                        }
                     }
                     else {
-                        Write-SPOTLog ">>> ERROR: The remote temporary file failed to create on the remote computer. Cannot continue." -Output $false
-                        return $false
+                        Write-SPOTLog ">>> ERROR: The RFI for parameter ""$cpar"" and value ""$($ReturnHashtable.CommandParameters.$cpar)"" was not detected in the project folder. Cannot continue." -Output $false
+                        throw "Process-SPOTCommandParamsRF: RFI not detected!"
                     }
-                }
-                else {
-                    Write-SPOTLog ">>> ERROR: The RFI for parameter ""$cpar"" and value ""$($ReturnHashtable.CommandParameters.$cpar)"" was not detected in the project folder. Cannot continue." -Output $false
-                    return $false
-                }
-            } 
-            elseif ($ReturnHashtable.CommandParameters.$cpar.StartsWith('$RFO:')) {
-                # reference to a local folder detected
-                $UniqueID = ($ReturnHashtable.CommandParameters.$cpar -split ":")[1]
-                $ReferencedFileName = $OrchVars._RFOMap.$UniqueID.ReferencedFileName
-                $LocalArchivePath = $OrchVars._RFOMap.$UniqueID.LocalArchivePath
-                # get the local archive file, as indicated by the UniqueID from this parameter
-                $LocalArchiveFile = Get-Item -Path $LocalArchivePath -ErrorAction SilentlyContinue
-                if (!$LocalArchiveFile) {
-                    Write-SPOTLog ">>> ERROR: The RFO archive file for parameter ""$cpar"" and value ""$($ReturnHashtable.CommandParameters.$cpar)"" was not detected. Path is ""$LocalArchivePath"". Cannot continue." -Output $false
-                    return $false
-                }
-                else {
-                    # the referenced local archive file is found, managing the transfer
-                    Write-SPOTLog ">>> The RFO archive file for parameter ""$cpar"" and value ""$($ReturnHashtable.CommandParameters.$cpar)"" was detected as ""$LocalArchivePath"". Managing the transfer to the remote computer over PSSession." -Output $false -DBG $true
-                    # create a temp remote file
-                    $RemoteTempFile = Invoke-Command -Session $PSSession -ScriptBlock {
-                        $_spot_TFP = [System.IO.Path]::GetTempFileName(); Get-Item -Path $_spot_TFP -Force
-                    }
-                    if (!($RemoteTempFile.FullName)) {
-                        Write-SPOTLog ">>> ERROR: The remote temporary file failed to create on the remote computer. Cannot continue." -Output $false
-                        return $false
+                } 
+                elseif ($ReturnHashtable.CommandParameters.$cpar.StartsWith('$RFO:')) {
+                    # reference to a local folder detected
+                    $UniqueID = ($ReturnHashtable.CommandParameters.$cpar -split ":")[1]
+                    $ReferencedFileName = $OrchVars._RFOMap.$UniqueID.ReferencedFileName
+                    $LocalArchivePath = $OrchVars._RFOMap.$UniqueID.LocalArchivePath
+                    # get the local archive file, as indicated by the UniqueID from this parameter
+                    $LocalArchiveFile = Get-Item -Path $LocalArchivePath -ErrorAction SilentlyContinue
+                    if (!$LocalArchiveFile) {
+                        Write-SPOTLog ">>> ERROR: The RFO archive file for parameter ""$cpar"" and value ""$($ReturnHashtable.CommandParameters.$cpar)"" was not detected. Path is ""$LocalArchivePath"". Cannot continue." -Output $false
+                        throw "Process-SPOTCommandParamsRF: RFO not detected!"
                     }
                     else {
-                        # try to copy the folder archive to the remote computer
-                        try {
-                            Copy-Item -Path $LocalArchivePath -Destination $RemoteTempFile.FullName -ToSession $PSSession -Force -Confirm:$false
+                        # the referenced local archive file is found, managing the transfer
+                        Write-SPOTLog ">>> The RFO archive file for parameter ""$cpar"" and value ""$($ReturnHashtable.CommandParameters.$cpar)"" was detected as ""$LocalArchivePath"". Managing the transfer to the remote computer over PSSession." -Output $false -DBG $true
+                        # create a temp remote file
+                        $RemoteTempFile = Invoke-Command -Session $PSSession -ScriptBlock {
+                            $_spot_TFP = [System.IO.Path]::GetTempFileName(); Get-Item -Path $_spot_TFP -Force
                         }
-                        catch {
-                            Write-SPOTLog ">>> ERROR: While trying to copy the local folder archive ""$LocalArchivePath"" to the remote computer: $_." -Output $false
-                            return $false
+                        if (!($RemoteTempFile.FullName)) {
+                            Write-SPOTLog ">>> ERROR: The remote temporary file failed to create on the remote computer. Cannot continue." -Output $false
+                            throw "Process-SPOTCommandParamsRF: RFO temp file error!"
                         }
-                        # extract the archive remotely
-                        Invoke-Command -Session $PSSession -ScriptBlock {
-                            $_spot_Item = Get-Item -Path $_spot_TFP -Force
-                            Add-Type -Assembly "system.io.compression.filesystem"
-                            [io.compression.zipfile]::ExtractToDirectory($_spot_TFP,"$($_spot_Item.Directory)\$($_spot_Item.BaseName)")
-                            # the archive file can be cleaned up right now
-                            Remove-Item -Path $_spot_TFP -Confirm:$false -Force -ErrorAction SilentlyContinue
+                        else {
+                            # try to copy the folder archive to the remote computer
+                            try {
+                                Copy-Item -Path $LocalArchivePath -Destination $RemoteTempFile.FullName -ToSession $PSSession -Force -Confirm:$false
+                            }
+                            catch {
+                                Write-SPOTLog ">>> ERROR: While trying to copy the local folder archive ""$LocalArchivePath"" to the remote computer: $_." -Output $false
+                                throw "Process-SPOTCommandParamsRF: RFO copy file error!"
+                            }
+                            # extract the archive remotely
+                            Invoke-Command -Session $PSSession -ScriptBlock {
+                                $_spot_Item = Get-Item -Path $_spot_TFP -Force
+                                Add-Type -Assembly "system.io.compression.filesystem"
+                                [io.compression.zipfile]::ExtractToDirectory($_spot_TFP,"$($_spot_Item.Directory)\$($_spot_Item.BaseName)")
+                                # the archive file can be cleaned up right now
+                                Remove-Item -Path $_spot_TFP -Confirm:$false -Force -ErrorAction SilentlyContinue
+                            }
+                            # change the parameter to the remote temp file in folder path
+                            $ReturnHashtable.CommandParameters.$cpar = "$($RemoteTempFile.Directory)\$($RemoteTempFile.BaseName)\$ReferencedFileName"
+                            # add the remote folder path to the list of items to be deleted at the end of the execution
+                            $ReturnHashtable.RemoteTempFolders += "$($RemoteTempFile.Directory)\$($RemoteTempFile.BaseName)"
+                            Write-SPOTLog ">>> The RFO for parameter ""$cpar"" was transfered to the remote computer and value changed to ""$($ReturnHashtable.CommandParameters.$cpar)""." -Output $false -DBG $true
                         }
-                        # change the parameter to the remote temp file in folder path
-                        $ReturnHashtable.CommandParameters.$cpar = "$($RemoteTempFile.Directory)\$($RemoteTempFile.BaseName)\$ReferencedFileName"
-                        # add the remote folder path to the list of items to be deleted at the end of the execution
-                        $ReturnHashtable.RemoteTempFolders += "$($RemoteTempFile.Directory)\$($RemoteTempFile.BaseName)"
-                        Write-SPOTLog ">>> The RFO for parameter ""$cpar"" was transfered to the remote computer and value changed to ""$($ReturnHashtable.CommandParameters.$cpar)""." -Output $false -DBG $true
                     }
                 }
             }
@@ -6191,13 +6276,73 @@ function Process-SPOTCommandParamsRF {
     else {
         #######################################
         Write-SPOTLog "ERROR: the provided PSSession is not opened. Cannot continue." -Output $false
-        return $false
+        throw "Process-SPOTCommandParamsRF: PSSession not opened!"
     }
 
     #######################################
     return $ReturnHashtable
 
 } #end of Process-SPOTCommandParamsRF function
+
+######################################################################################################################
+function Process-SPOTCommandParamsLocalRF {
+    Param (
+        [Parameter(Mandatory=$true)]
+        [ValidateNotNullOrEmpty()]
+        [hashtable]
+        # the set of command parameters to be processed
+        $CommandParameters
+    )
+
+    ######################################
+    # manage local $RFI and $RFO parameters
+    foreach ($_spot_cp in $($CommandParameters.Keys)) {
+        $_spot_LocalItem = $null
+        if ($CommandParameters.$_spot_cp.GetType().Name -ne "String") {
+            continue
+        }
+        if ($CommandParameters.$_spot_cp.StartsWith('$RFI:')) {
+            # reference to a local file detected, get the local item
+            $_spot_LocalItem = Get-Item -Path "$($OrchVars._ProjectPath)\$(($CommandParameters.$_spot_cp -split ":")[1])" -ErrorAction SilentlyContinue
+            if ($_spot_LocalItem) {
+                Write-SPOTLog ">>> The RFI for parameter ""$_spot_cp"" and value ""$($CommandParameters.$_spot_cp)"" was detected as ""$($_spot_LocalItem.FullName)"", a file. Managing the local path." -DBG $true
+                # change the parameter to the local item full path
+                $CommandParameters.$_spot_cp = $_spot_LocalItem.FullName
+            }
+            else {
+                Write-SPOTLog ">>> ERROR: The RFI for parameter ""$_spot_cp"" and value ""$($CommandParameters.$_spot_cp)"" was not detected in the project folder. Cannot continue."
+                throw "Process-SPOTCommandParamsLocalRF: local referenced item not found!"
+            }
+        }
+        elseif ($CommandParameters.$_spot_cp.StartsWith('$RFO:')) {
+            # reference to a local folder detected, get the local item
+            if (($CommandParameters.$_spot_cp -split ":")[1] -eq "SSHNET") {
+                $_spot_LocalItem = Get-Item -Path $OrchVars._SshNetPath -ErrorAction SilentlyContinue
+            }
+            elseif (($CommandParameters.$_spot_cp -split ":")[1] -eq "PSEXEC") {
+                $_spot_LocalItem = Get-Item -Path $OrchVars._PsExecPath -ErrorAction SilentlyContinue
+            }
+            else {
+                $_spot_LocalItem = Get-Item -Path "$($OrchVars._ProjectPath)\$(($CommandParameters.$_spot_cp -split ":")[1])" -ErrorAction SilentlyContinue
+            }
+            if ($_spot_LocalItem) {
+                if ($_spot_LocalItem.PSIsContainer) {
+                    Write-SPOTLog ">>> The RFO for parameter ""$_spot_cp"" and value ""$($CommandParameters.$_spot_cp)"" was detected as ""$($_spot_LocalItem.FullName)"", a folder. Managing the local path." -DBG $true
+                }
+                else {
+                    Write-SPOTLog ">>> The RFO for parameter ""$_spot_cp"" and value ""$($CommandParameters.$_spot_cp)"" was detected as ""$($_spot_LocalItem.FullName)"", a file. Managing the local path." -DBG $true
+                }
+                # change the parameter to the local item full path
+                $CommandParameters.$_spot_cp = $_spot_LocalItem.FullName
+            }
+            else {
+                Write-SPOTLog ">>> ERROR: The RFO for parameter ""$_spot_cp"" and value ""$($CommandParameters.$_spot_cp)"" was not detected in the project folder. Cannot continue."
+                throw "Process-SPOTCommandParamsLocalRF: local referenced item not found!"
+            }
+        }
+    }
+
+} #end of Process-SPOTCommandParamsLocalRF function
 
 ######################################################################################################################
 function Transfer-SPOTDataOverPipe {
@@ -6224,13 +6369,13 @@ try {
 }
 catch {
     Write-SPOTLog  " ############# ORCHESTRATOR LOGGING: ERROR: while connecting to Pipe1 on ""$RemoteComputer"" remote computer: $_ #############"
-    return $false
+    throw "Transfer-SPOTDataOverPipe: error connecting to pipe!"
 }
 
 if ($PipeObjectLocal1.IsConnected -eq $false) {
     Write-SPOTLog  " ############# ORCHESTRATOR LOGGING: ERROR: the client connection to Pipe1 on ""$RemoteComputer"" remote computer is not established after the timeout. #############"
     $PipeObjectLocal1.dispose()
-    return $false
+    throw "Transfer-SPOTDataOverPipe: error connecting to pipe!"
 }
 
 Write-SPOTLog " ############# ORCHESTRATOR LOGGING: Starting to send the data over Pipe1 on ""$RemoteComputer"" remote computer. #############" -DBG $true
@@ -6253,13 +6398,13 @@ try {
 }
 catch {
     Write-SPOTLog  " ############# ORCHESTRATOR LOGGING: ERROR: while connecting to Pipe2 on ""$RemoteComputer"" remote computer: $_ #############"
-    return $false
+    throw "Transfer-SPOTDataOverPipe: error connecting to pipe!"
 }
 # check the connection from the remote computer
 if ($PipeObjectLocal2.IsConnected -eq $false) {
     Write-SPOTLog  " ############# ORCHESTRATOR LOGGING: ERROR: the client connection to Pipe2 on ""$RemoteComputer"" remote computer is not established after the timeout. #############"
     $PipeObjectLocal2.dispose()
-    return $false
+    throw "Transfer-SPOTDataOverPipe: error connecting to pipe!"
 }
 
 Write-SPOTLog " ############# ORCHESTRATOR LOGGING: Waiting to receive the data over Pipe2 from ""$RemoteComputer"" remote computer. #############" -DBG $true
@@ -6276,7 +6421,7 @@ $streamReader.dispose()
 $PipeObjectLocal2.dispose()
 if (!$tempData) {
     Write-SPOTLog  " ############# ORCHESTRATOR LOGGING: ERROR: Timed out waiting for the output object or object null from the ""$RemoteComputer"" remote computer over Pipe2. #############"
-    return $false
+    throw "Transfer-SPOTDataOverPipe: error getting pipe data!"
 }
 
 ####################################################

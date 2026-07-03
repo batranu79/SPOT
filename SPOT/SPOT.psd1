@@ -1,6 +1,7 @@
 # Module manifest for module 'SPOT'
 # v1.0 - 26.04.2026 - initial version
 # v1.1 - 17.05.2026 - new released version
+# v1.2 - 03.07.2026 - new released version; new public functions added
 #
 #
 #
@@ -12,10 +13,10 @@
     RootModule = 'SPOT.psm1'
 
     # Version number of this module.
-    ModuleVersion = '1.1.0'
+    ModuleVersion = '1.1.1'
 
     # ID used to uniquely identify this module
-    GUID = '6665598f-1fdb-4f8f-88d1-b349e495c04c'
+    GUID = '1fba18ac-d6a5-4291-aebc-c9466e6fa253'
 
     # Author of this module
     Author = 'Narcis-Ionel Mircea'
@@ -49,6 +50,9 @@
                         'Register-SPOTMasterPassword',
                         'Import-SPOTProjectSecrets',
                         'Initialize-SPOTSecretStore',
+                        'Get-SPOTSecretStoreStatus',
+                        'Remove-SPOTProjectSecrets',
+                        'Show-SPOTProjectSecretsInfo',
                         'Get-SPOTPath',
                         'Get-SPOTStatus',
                         'Show-SPOTDetails',

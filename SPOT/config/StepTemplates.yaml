@@ -108,8 +108,9 @@ RunbookSteps:
             VariablesToPublish: 
         Disabled: false
         
-    TemplateRunbook6a:
+    TemplateRunbook1:
         Type: Runbook
+        RunbookName: TemplateRunbook
         Description: 
         Seq: 10
         Conditions: 
@@ -180,7 +181,7 @@ RunbookSteps:
             RemoteComputer: 
             Credential: 
         
-    TemplateRunbook16a:
+    TemplateRunbook2:
         Type: Runbook
         Seq: 10
         # RemoteParameters:
