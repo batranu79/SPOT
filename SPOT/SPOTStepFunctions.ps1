@@ -2,6 +2,7 @@
 # v1.0 - 26.04.2026 - initial version
 # v1.1 - 17.05.2026 - fixed the Upload-FolderSFTP recursive call; 
 #                   - updated the Execute-SSHScript and Execute-TelnetScript to work with the updated Replace-SPOTLineVars
+# v1.2 - 31.08.2026 - small correction in all functions; added functions Reboot-LinuxComputer and Reboot-WindowsComputer
 #
 #
 #
@@ -112,10 +113,6 @@ The logging is disabled and the path to the SshNet tool is specified, as they sh
     #################################
     # connect over SFTP to the target IP
     $SFTPSession = New-SPOTSFTPSession -TargetIP $TargetIP -Port $Port -Credential $Credential -TrustedHostsFilePath $TrustedHostsFilePath -SshNetPath $SshNetPath
-    if ($SFTPSession -eq $false) {
-        Write-SPOTLog "ERROR: the SFTP Session could not be established. Cannot continue." -Output $OutputFlag
-        throw "Set-FileExecutableSFTP: SFTP Session not established!"
-    }
 
     #################################
     # test path existence
@@ -281,10 +278,6 @@ The logging is disabled and the path to the SshNet tool is specified, as they sh
     #################################
     # connect over SFTP to the target IP
     $SFTPSession = New-SPOTSFTPSession -TargetIP $TargetIP -Port $Port -Credential $Credential -TrustedHostsFilePath $TrustedHostsFilePath -SshNetPath $SshNetPath
-    if ($SFTPSession -eq $false) {
-        Write-SPOTLog "ERROR: the SFTP Session could not be established. Cannot continue." -Output $OutputFlag
-        throw "Download-FileSFTP: SFTP Session not established!"
-    }
 
     #################################
     # test remote (source) file path existence
@@ -485,10 +478,6 @@ The logging is disabled and the path to the SshNet tool is specified, as they sh
     #################################
     # connect over SFTP to the target IP
     $SFTPSession = New-SPOTSFTPSession -TargetIP $TargetIP -Port $Port -Credential $Credential -TrustedHostsFilePath $TrustedHostsFilePath -SshNetPath $SshNetPath
-    if ($SFTPSession -eq $false) {
-        Write-SPOTLog "ERROR: the SFTP Session could not be established. Cannot continue." -Output $OutputFlag
-        throw "Upload-FileSFTP: SFTP Session not established!"
-    }
 
     #######################################
     # check if the file is already present remotely
@@ -685,10 +674,6 @@ The logging is disabled and the path to the SshNet tool is specified, as they sh
     #################################
     # connect over SFTP to the target IP
     $SFTPSession = New-SPOTSFTPSession -TargetIP $TargetIP -Port $Port -Credential $Credential -TrustedHostsFilePath $TrustedHostsFilePath -SshNetPath $SshNetPath
-    if ($SFTPSession -eq $false) {
-        Write-SPOTLog "ERROR: the SFTP Session could not be established. Cannot continue." -Output $OutputFlag
-        throw "Download-FolderSFTP: SFTP Session not established!"
-    }
 
     #################################
     # do the folder download
@@ -934,10 +919,6 @@ The logging is disabled and the path to the SshNet tool is specified, as they sh
     #################################
     # connect over SFTP to the target IP
     $SFTPSession = New-SPOTSFTPSession -TargetIP $TargetIP -Port $Port -Credential $Credential -TrustedHostsFilePath $TrustedHostsFilePath -SshNetPath $SshNetPath
-    if ($SFTPSession -eq $false) {
-        Write-SPOTLog "ERROR: the SFTP Session could not be established. Cannot continue." -Output $OutputFlag
-        throw "Upload-FolderSFTP: SFTP Session not established!"
-    }
 
     #################################
     # make sure the remote (target) folder path exists
@@ -1167,10 +1148,6 @@ The logging is disabled and the path to the SshNet tool is specified, as they sh
     #################################
     # connect over SFTP to the target IP
     $SFTPSession = New-SPOTSFTPSession -TargetIP $TargetIP -Port $Port -Credential $Credential -TrustedHostsFilePath $TrustedHostsFilePath -SshNetPath $SshNetPath
-    if ($SFTPSession -eq $false) {
-        Write-SPOTLog "ERROR: the SFTP Session could not be established. Cannot continue." -Output $OutputFlag
-        throw "Test-FilePathSFTP: SFTP Session not established!"
-    }
 
     #################################
     # Test the target path
@@ -1302,10 +1279,6 @@ The logging is disabled and the path to the SshNet tool is specified, as they sh
     #################################
     # connect over SFTP to the target IP
     $SFTPSession = New-SPOTSFTPSession -TargetIP $TargetIP -Port $Port -Credential $Credential -TrustedHostsFilePath $TrustedHostsFilePath -SshNetPath $SshNetPath
-    if ($SFTPSession -eq $false) {
-        Write-SPOTLog "ERROR: the SFTP Session could not be established. Cannot continue." -Output $OutputFlag
-        throw "Test-FolderPathSFTP: SFTP Session not established!"
-    }
 
     #################################
     # Test the target path
@@ -1775,10 +1748,6 @@ The overall script execution stops if more than 60 seconds pass.
     #################################
     # create a SSH Session to the target IP
     $_spot_SSHSession = New-SPOTSSHSession -TargetIP $TargetIP -Port $Port -Credential $Credential -SshNetPath $SshNetPath -TrustedHostsFilePath $TrustedHostsFilePath -ErrorAction SilentlyContinue
-    if ($_spot_SSHSession.IsConnected -ne $true) {
-        Write-SPOTLog "ERROR: the SSH Session could not be established. Cannot continue."
-        throw "Execute-BashScript: SFTP Session not established!"
-    }
 
     #################################
     # create a SSH Shell Stream suitable for advanced output processing
@@ -2276,10 +2245,6 @@ The path to the SshNet tool and the $SecVars are not specified, as it should whe
     #################################
     # create a SSH Session to the target IP
     $SSHSession = New-SPOTSSHSession -TargetIP $TargetIP -Port $Port -Credential $Credential -TrustedHostsFilePath $TrustedHostsFilePath -SshNetPath $SshNetPath
-    if ($SSHSession -eq $false) {
-        Write-SPOTLog "ERROR: the SSH Session could not be established. Cannot continue."
-        throw "Execute-SSHScript: SSH Session not established!"
-    }
 
     #################################
     # create a SSH Shell Stream suitable for advanced output processing
@@ -2750,3 +2715,925 @@ The path to the $SecVars is not specified, as it should when executing locally i
     $_spot_FullOutput
 
 } # end of Execute-TelnetScript function
+
+######################################################################################################################
+function Reboot-LinuxComputer {
+<#
+.SYNOPSIS
+Triggers remotely a restart of a Linux computer and waits for the startup to finish afterwards.
+
+.DESCRIPTION
+The target Linux remote computer is restarted over SSH and then it is checked for completion of the restart
+using the "systemctl is-system-running" command or testing the "runlevel", depending on the type of Linux.
+
+.PARAMETER TargetComputer
+Specifies the IP Address or hostname of the target Linux computer.
+
+.PARAMETER Port
+Specifies the SSH Port to be used, in case it is not the standard one.
+
+.PARAMETER Credential
+Specifies the SSH credential to be used for remote authentication.
+
+.PARAMETER TrustedHostsFilePath
+Specifies the file path for a SPOT Trusted Hosts csv file to be used for SSH key validation.
+If this parameter is not specified or empty, the SSH key validation is not enabled.
+
+.PARAMETER SshNetPath
+Specifies the local path to the Renci.SSHNet.dll file.
+
+.INPUTS
+None. You can't pipe objects to Reboot-LinuxComputer.
+
+.OUTPUTS
+System.String. Reboot-LinuxComputer may return only logging output. 
+
+.EXAMPLE
+PS> Reboot-LinuxComputer -TargetComputer "192.168.0.2" -Port "722" -Credential $SSHCredential -Timeout 360 -SshNetPath "C:\temp\tools\SshNet\Renci.SshNet.dll" -TrustedHostsFilePath "C:\temp\hFile.csv"
+In this example the target computer "192.168.0.2" is restarted using the custom SSH port "722" and a timeout of 6 minutes.
+The SshNetPath is specified for cases it cannot be detected automatically inside SPOT.
+The TrustedHostsFilePath is also specified in order to perform a validation of the SSH Key of the target computer during the SSH session initializations.
+
+.EXAMPLE
+PS> Reboot-LinuxComputer -TargetComputer "192.168.0.2" -Port "722" -Credential $SSHCredential -Timeout 360
+In this example the target computer "192.168.0.2" is restarted using the custom SSH port "722" and a timeout of 6 minutes.
+#>
+
+    Param (
+        [Parameter(Mandatory=$true)]
+        [ValidateNotNullOrEmpty()]
+        [string]
+        # the target IP Address or hostname on which to perform the reboot
+        $TargetComputer,
+        [Parameter(Mandatory=$false)]
+        [ValidateNotNullOrEmpty()]
+        [int]
+        # the port to be used, in case it is different from the default
+        $Port = 22,
+        [Parameter(Mandatory=$false)]
+        [ValidateNotNullOrEmpty()]
+        [int]
+        # the number of seconds to wait for the entire reboot to complete
+        $Timeout = 300, 
+        [Parameter(Mandatory=$true)]
+        [ValidateNotNullOrEmpty()]
+        [System.Management.Automation.PSCredential]
+        # the SSH credential to be used for remote authentication
+        $Credential,
+        [Parameter(Mandatory=$false)]
+        [AllowNull()]
+        [string]
+        # the path to the TrustedHosts file
+        $TrustedHostsFilePath,
+        [Parameter(Mandatory=$false)]
+        [string]
+        # the local path to the Renci.SSHNet.dll file
+        $SshNetPath
+        )
+    
+    # the targetIP network host should be a Linux computer
+
+    ######################
+    Write-SPOTLog "Starting function Reboot-LinuxComputer with the parameters: TargetComputer $TargetComputer, Port $Port and Timeout $Timeout."
+
+    ######################
+    # testing the availability of the TCP port on the remote computer
+    $TCPTestResult = Test-SPOTTCPPort -TargetIP $TargetComputer -TCPPort $Port
+    if (!($TCPTestResult.TcpTestSucceeded)) {
+        Write-SPOTLog "ERROR: The connectivity to the SSH port for host $TargetComputer is not successfull. Ping test result was: $($TCPTestResult.PingSucceeded)."
+        throw "Reboot-LinuxComputer: SSH port unreachable!"
+    }
+
+    ######################
+    # establish if ping will be used later for more verbosity
+    if ($TCPTestResult.PingSucceeded) {
+        $PingAvailable = $true
+    }
+    else {
+        $PingAvailable = $false
+    }
+
+    #################################
+    # test/detect the local Renci.SSHNet.dll file
+    $SshNetPath = Get-SPOTSshNetPath -SshNetPath $SshNetPath
+    if (!$SshNetPath) {
+        Write-SPOTLog "ERROR: The SshNetPath was not provided/determined/detected. Cannot continue."
+        throw "Reboot-LinuxComputer: SshNetPath not provided/determined/detected!"
+    }
+
+    #################################
+    #region: bash scripts
+
+    ################
+    $RebootScript = @'
+#!/bin/bash
+
+####################
+if [[ "$OSTYPE" != "linux"* ]]; then
+    echo "ERROR: This script is only supported on Linux." >&2
+    echo "Detected OS: $OSTYPE"
+    exit 1
+fi
+
+####################
+command -v shutdown >/dev/null 2>&1 || {
+    echo "ERROR: Expected reboot command not found." >&2
+    exit 1
+}
+
+####################
+if [ "$(id -u)" -eq 0 ]; then
+
+    echo "RUNNING_AS_ROOT"
+    reboot_output="$(shutdown -r +1 2>&1)"
+    reboot_status=$?
+
+####################
+elif sudo -n true 2>/dev/null; then
+
+    echo "PASSWORDLESS_SUDO"
+    reboot_output="$(sudo shutdown -r +1 2>&1)"
+    reboot_status=$?
+
+####################
+else 
+    echo "SUDO_PASSWORD_REQUIRED_SPOT"
+    if ! IFS= read -r -t 30 SUDO_PASSWORD; then
+        echo "ERROR: Timed out waiting for sudo password." >&2
+        exit 1
+    fi
+    reboot_output="$(printf '%s\n' "$SUDO_PASSWORD" | sudo -S -p '' shutdown -r +1 2>&1)"
+    reboot_status=$?
+fi
+
+####################
+if [ "$reboot_status" -eq 0 ]; then
+
+    echo "REBOOT_REQUESTED_SUCCESSFULLY"
+    echo "REBOOT_COMMAND_OUTPUT=$reboot_output"
+    exit 0
+
+fi
+
+echo "REBOOT_REQUESTED_ERROR" >&2
+echo "REBOOT_COMMAND_OUTPUT=$reboot_output"
+echo "REBOOT_EXIT_CODE=$reboot_status"
+
+exit "$reboot_status"
+
+'@ -replace "`r`n", "`n"
+    
+    ################
+    $RemoteStartupScript = @'
+#!/bin/bash
+
+# Maximum time to wait for boot completion, in seconds.
+BOOT_TIMEOUT="${1:-300}"
+
+wait_for_boot_complete() {
+    local start_time=$SECONDS
+
+    # systemd
+    if [ -d /run/systemd/system ] &&
+       [ "$(ps -p 1 -o comm= 2>/dev/null)" = "systemd" ]; then
+
+        echo "Waiting for systemd..."
+
+        while :; do
+            case "$(systemctl is-system-running 2>/dev/null)" in
+                running|degraded)
+                    echo "systemd startup complete"
+                    return 0
+                    ;;
+            esac
+
+            if (( SECONDS - start_time >= BOOT_TIMEOUT )); then
+                echo "ERROR: Timed out waiting for systemd startup" >&2
+                return 1
+            fi
+
+            sleep 1
+        done
+
+    # SysV init
+    else
+        echo "Waiting for SysV runlevel..."
+
+        while :; do
+            rl="$(runlevel 2>/dev/null | awk '{print $2}')"
+
+            case "$rl" in
+                2|3|4|5)
+                    echo "Runlevel $rl reached"
+                    return 0
+                    ;;
+            esac
+
+            if (( SECONDS - start_time >= BOOT_TIMEOUT )); then
+                echo "ERROR: Timed out waiting for SysV runlevel" >&2
+                return 1
+            fi
+
+            sleep 1
+        done
+    fi
+}
+
+if ! wait_for_boot_complete; then
+    echo "ERROR: OS_STARTUP_INCOMPLETE" >&2
+    exit 1
+fi
+
+echo "OS_STARTUP_COMPLETE"
+'@ -replace "`r`n", "`n"
+
+    #endregion: bash scripts
+
+    #################################
+    # set te deadline
+    $Deadline = [DateTime]::UtcNow.AddSeconds($Timeout)
+
+    #################################
+    # create a SSH Session to the target IP
+    $SSHSession = New-SPOTSSHSession -TargetIP $TargetComputer -Port $Port -Credential $Credential
+    Write-SPOTLog "Connected over SSH to the target Linux computer." -DBG $true
+
+    #################################
+    # create a SSH Shell Stream suitable for advanced output processing
+    try {
+        $SSHStream = $SSHSession.CreateShellStream('dumb', '250', '24', '800', '600', '32768')
+    }
+    catch {
+        Write-SPOTLog "ERROR: while creating the SSH Shell Stream: $_."
+        $SSHSession.Disconnect()
+        $SSHSession.Dispose()
+        throw "Reboot-LinuxComputer: error creating the SSHStream!"
+    }
+
+    #################################
+    # execution code
+    $_spot_OutputBeforeReboot = ""
+    $_spot_OutputAfterReboot = ""
+    $_spot_FullOutput = @()
+    # initialize the session by clearing the stream buffer from the initial prompt
+    Start-Sleep -Seconds 5
+    # saving initial prompt, so not adding it to the COO
+    while ($SSHStream.DataAvailable) {
+        $_spot_OutputBeforeReboot += $SSHStream.Read()
+    }
+
+    ##################
+    # get the initial boot id output
+    $SSHStream.WriteLine('initial_boot_id=$(cat /proc/sys/kernel/random/boot_id); echo "InitialBoodId=$initial_boot_id"')
+    $SSHStream.Flush()
+    Start-Sleep -Seconds 1
+    while ($SSHStream.DataAvailable) {
+        $_spot_OutputBeforeReboot += $SSHStream.Read()
+    }
+    # put the initial boot id into a local powershell variable
+    foreach ($i in ($_spot_OutputBeforeReboot -split '\r?\n')) {
+        if ($i -like "InitialBoodId=*") {
+            $InitialBootID = ($i -split "=")[1]
+            break
+        }
+    }
+    # check for empty boot id value
+    if (!$InitialBootID) {
+        Write-SPOTLog "ERROR: unexpected empty value for the initial boot id! Cannot continue!"
+        $SSHStream.Close()
+        $SSHStream.Dispose()
+        $SSHSession.Disconnect()
+        $SSHSession.Dispose()
+        throw "Reboot-LinuxComputer: Unexpected empty initial boot id from target linux computer!"
+    }
+    Write-SPOTLog "The initial BootID detected is: $InitialBootID" -DBG $true
+
+    ##################
+    # upload the reboot script
+    $SSHStream.WriteLine("rm -f /tmp/spot_reboot.sh")
+    $SSHStream.Flush()
+    Start-Sleep -Milliseconds 200
+    while ($SSHStream.DataAvailable) {
+        $_spot_OutputBeforeReboot += $SSHStream.Read()
+    }
+    Write-SPOTLog "Uploading the reboot script to the target Linux computer." -DBG $true
+    $encodedRebootScript = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($RebootScript))
+    $SSHStream.WriteLine("echo '$encodedRebootScript' | base64 -d > /tmp/spot_reboot.sh")
+    $SSHStream.Flush()
+    $SSHStream.Expect("base64 -d > /tmp/spot_reboot.sh",(New-TimeSpan -Seconds 5)) | Out-Null
+    Start-Sleep -Milliseconds 200
+    while ($SSHStream.DataAvailable) {
+        $_spot_OutputBeforeReboot += $SSHStream.Read()
+    }
+
+    ##################
+    # make the reboot script executable
+    $SSHStream.WriteLine("chmod +x /tmp/spot_reboot.sh")
+    $SSHStream.Flush()
+    Start-Sleep -Milliseconds 300
+    while ($SSHStream.DataAvailable) {
+        $_spot_OutputBeforeReboot += $SSHStream.Read()
+    }
+    
+    ##################
+    # execute the reboot script
+    Write-SPOTLog "Trigger the reboot script on the target Linux computer." -DBG $true
+    $SSHStream.WriteLine("bash '/tmp/spot_reboot.sh'")
+    $SSHStream.Flush()
+    $buffer = ""
+    $rebootSucceeded = $false
+    $passwordSent = $false
+
+    ##################
+    # manage the reboot script output
+    while (!$rebootSucceeded) {
+        if ($SSHStream.DataAvailable) {
+            $text = $SSHStream.Read()
+            if (![string]::IsNullOrEmpty($text)) {
+                #Write-SPOTLog "INFO: read text output: $text."
+                $buffer += $text
+
+                ########################################
+                # sudo password request
+                if (!$passwordSent) {
+                    if ($buffer.Contains("SUDO_PASSWORD_REQUIRED_SPOT")) {
+                        Write-SPOTLog "Sending sudo password." -DBG $true
+                        $SSHStream.WriteLine($Credential.GetNetworkCredential().Password)
+                        $SSHStream.Flush()
+                        $passwordSent = $true
+                        # avoid capturing the password in the log
+                        $SSHStream.ReadLine() | Out-Null
+                    }
+                }
+            
+                ########################################
+                # Successful reboot request
+                if ($buffer.Contains("REBOOT_REQUESTED_SUCCESSFULLY")) {
+                    $rebootSucceeded = $true
+                    Write-SPOTLog "The reboot request was successfull." -DBG $true
+                }
+
+                ########################################
+                # Reboot request failure
+                if ($buffer.Contains("REBOOT_REQUESTED_ERROR")) {
+                    Write-SPOTLog "ERROR: during reboot script execution."
+                    break
+                }
+
+                ########################################
+                # No reboot command available
+                if ($buffer.Contains("ERROR: Expected reboot command not found")) {
+                    Write-SPOTLog "ERROR: expected reboot command not found."
+                    break
+                }
+
+                ########################################
+                # Target computer is not Linux
+                if ($buffer.Contains("ERROR: This script is only supported on Linux")) {
+                    Write-SPOTLog "ERROR: target computer is not Linux."
+                    break
+                }
+            }
+        }
+        else {
+            Start-Sleep -Milliseconds 50
+        }
+    }
+
+    ##################
+    # capture all remaining output
+    Start-Sleep -Milliseconds 500
+    while ($SSHStream.DataAvailable) {
+        $text = $SSHStream.Read()
+        if (![string]::IsNullOrEmpty($text)) {
+            #Write-SPOTLog "INFO: read extra text output: $text."
+            $buffer += $text
+        }
+    }
+    
+    ##################
+    # add the buffer to the main before output variable
+    $_spot_OutputBeforeReboot += $buffer
+    
+    #################################
+    # delete the reboot script
+    $SSHStream.WriteLine("rm -f /tmp/spot_reboot.sh")
+    $SSHStream.Flush()
+    Start-Sleep -Milliseconds 200
+    while ($SSHStream.DataAvailable) {
+        $_spot_OutputBeforeReboot += $SSHStream.Read()
+    }
+
+    ##################
+    # at this point, either the reboot follows, either there was an error; in both cases close the existing sessions now
+    $SSHStream.Dispose()
+    $SSHSession.Disconnect()
+    $SSHSession.Dispose()
+
+    ##################
+    # handle the reboot error case
+    if (!$rebootSucceeded) {
+        Write-SPOTLog "The entire captured output so far: $_spot_OutputBeforeReboot" -DBG $true
+        throw "Reboot-LinuxComputer: failed to trigger computer reboot"
+    }
+
+    ######################
+    # if ping was available...
+    if ($PingAvailable) {
+        ##################
+        # continue by pinging the target until reboot
+        while ($true) {
+            Start-Sleep -Seconds 5
+            if (Ping-SPOTHostWMI -ip $TargetComputer) {
+                Write-SPOTLog "The target Linux computer is still reachable." -DBG $true
+                if ([DateTime]::UtcNow -gt $Deadline) {
+                    Write-SPOTLog "ERROR: Timed out waiting for the target Linux computer to reboot."
+                    throw "Reboot-LinuxComputer: Timed out trying to restart the target Linux computer"
+                }
+            }
+            else {
+                Write-SPOTLog "The target Linux computer is not reachable anymore. Reboot on-going." -DBG $true
+                break
+            }
+        }
+        Start-Sleep -Seconds 10
+
+        ##################
+        # continue by pinging the target until reachable
+        while ($true) {
+            Start-Sleep -Seconds 5
+            if (Ping-SPOTHostWMI -ip $TargetComputer) {
+                Write-SPOTLog "The target Linux computer is reachable again." -DBG $true
+                break
+            }
+            else {
+                Write-SPOTLog "The target Linux computer is not yet reachable again. Reboot on-going." -DBG $true
+                if ([DateTime]::UtcNow -gt $Deadline) {
+                    Write-SPOTLog "ERROR: Timed out waiting for the target Linux computer to be reachable after reboot."
+                    throw "Reboot-LinuxComputer: Timed out trying to restart the target Linux computer"
+                }
+            }
+        }
+    }
+    else {
+        Write-SPOTLog "Ping was not available, so waiting 30 seconds before trying the TCP port availability." -DBG $true
+        Start-Sleep -Seconds 30
+    }
+
+    ##################
+    # test the SSH port availability
+    while ($true) {
+        Start-Sleep -Seconds 5
+        if ((Test-SPOTTCPPort -TargetIP $TargetComputer -TCPPort $Port).TcpTestSucceeded) {
+            Write-SPOTLog "The target Linux computer has the SSH TCP port available now." -DBG $true
+            break
+        }
+        else {
+            Write-SPOTLog "The target Linux computer does not have the SSH TCP port available yet." -DBG $true
+            if ([DateTime]::UtcNow -gt $Deadline) {
+                Write-SPOTLog "ERROR: Timed out waiting for the target Linux computer to have the SSH TCP port available."
+                throw "Reboot-LinuxComputer: Timed out trying to restart the target Linux computer"
+            }
+        }
+    }
+    Start-Sleep -Seconds 5
+
+    #################################
+    # try to establish the SSH Session again
+    while ($true) {
+        Start-Sleep -Seconds 5
+        try {
+            $SSHSession = New-SPOTSSHSession -TargetIP $TargetComputer -Port $Port -Credential $Credential
+        }
+        catch {
+            Write-SPOTLog "Attempt failed to connect over SSH: $_." -DBG $true
+        }
+        if ($SSHSession.IsConnected) {
+            Write-SPOTLog "Connection over SSH succeeded." -DBG $true
+            break
+        }
+        if ([DateTime]::UtcNow -gt $Deadline) {
+            Write-SPOTLog "ERROR: Timed out trying to establish SSH Session to the target Linux computer."
+            throw "Reboot-LinuxComputer: Timed out trying to restart the target Linux computer"
+        }
+    }
+
+    #################################
+    # create a SSH Shell Stream suitable for advanced output processing
+    try {
+        $SSHStream = $SSHSession.CreateShellStream('dumb', '250', '24', '800', '600', '32768')
+    }
+    catch {
+        Write-SPOTLog "ERROR: while creating the SSH Shell Stream: $_."
+        $SSHSession.Disconnect()
+        $SSHSession.Dispose()
+        throw "Reboot-LinuxComputer: error creating the SSHStream after reboot!"
+    }
+
+    #################################
+    # initialize the session by clearing the stream buffer from the initial prompt
+    Start-Sleep -Seconds 5
+    # saving initial prompt, so not adding it to the COO
+    while ($SSHStream.DataAvailable) {
+        $_spot_OutputAfterReboot += $SSHStream.Read()
+    } 
+
+    ##################
+    # get the boot id after the reboot
+    $SSHStream.WriteLine('boot_id=$(cat /proc/sys/kernel/random/boot_id); echo "BoodId=$boot_id"')
+    $SSHStream.Flush()
+    Start-Sleep -Seconds 1
+    while ($SSHStream.DataAvailable) {
+        $_spot_OutputBeforeReboot += $SSHStream.Read()
+    }
+    # put the boot id into a local powershell variable
+    foreach ($i in ($_spot_OutputBeforeReboot -split '\r?\n')) {
+        if ($i -like "BoodId=*") {
+            $BootID = ($i -split "=")[1]
+            break
+        }
+    }
+    # check for empty boot id value
+    if (!$BootID) {
+        Write-SPOTLog "ERROR: unexpected empty value for the boot id after reboot! Cannot continue!"
+        $SSHStream.Close()
+        $SSHStream.Dispose()
+        $SSHSession.Disconnect()
+        $SSHSession.Dispose()
+        throw "Reboot-LinuxComputer: Unexpected empty boot id from target linux computer after reboot!"
+    }
+    Write-SPOTLog "The BootID detected detected after reboot is: $BootID" -DBG $true
+
+    ##################
+    # compare the initial and current boot IDs
+    if ($InitialBootID.Trim() -eq $BootID.Trim()) {
+        Write-SPOTLog "ERROR: the boot id did not change after reboot."
+        $SSHStream.Close()
+        $SSHStream.Dispose()
+        $SSHSession.Disconnect()
+        $SSHSession.Dispose()
+        throw "Reboot-LinuxComputer: the boot id did not change after reboot!"
+    }
+
+    ##################
+    # upload the startup check script
+    $SSHStream.WriteLine("rm -f /tmp/spot_startup-readiness.sh")
+    $SSHStream.Flush()
+    Start-Sleep -Milliseconds 200
+    while ($SSHStream.DataAvailable) {
+        $_spot_OutputAfterReboot += $SSHStream.Read()
+    }
+    Write-SPOTLog "Uploading the startup script to the target Linux computer." -DBG $true
+    $encodedStartupScript = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($RemoteStartupScript))
+    $SSHStream.WriteLine("echo '$encodedStartupScript' | base64 -d > /tmp/spot_startup-readiness.sh")
+    $SSHStream.Flush()
+    $SSHStream.Expect("base64 -d > /tmp/spot_startup-readiness.sh",(New-TimeSpan -Seconds 5)) | Out-Null
+    Start-Sleep -Milliseconds 200
+    while ($SSHStream.DataAvailable) {
+        $_spot_OutputAfterReboot += $SSHStream.Read()
+    }
+
+    ##################
+    # make the startup script executable
+    $SSHStream.WriteLine("chmod +x /tmp/spot_startup-readiness.sh")
+    $SSHStream.Flush()
+    Start-Sleep -Milliseconds 300
+    while ($SSHStream.DataAvailable) {
+        $_spot_OutputAfterReboot += $SSHStream.Read()
+    }
+    
+    ##################
+    # check for the remaining timeout, to be used by the startup script
+    $RemainingTimeout = [Math]::Ceiling(($Deadline - [DateTime]::UtcNow).TotalSeconds)
+    if (!($RemainingTimeout -gt 5)) {
+        Write-SPOTLog "ERROR: timeout reached before properly checking the startup."
+        $SSHStream.Dispose()
+        $SSHSession.Disconnect()
+        $SSHSession.Dispose()
+        throw "Reboot-LinuxComputer: timeout reached before properly checking the startup"
+    }
+
+    ##################
+    # execute the startup script
+    Write-SPOTLog "Triggering the startup script on the target Linux computer with the timeout $RemainingTimeout." -DBG $true
+    $SSHStream.WriteLine("bash /tmp/spot_startup-readiness.sh $RemainingTimeout")
+    $SSHStream.Flush()
+    $buffer = ""
+    $startupSucceeded = $false
+
+    ##################
+    # manage the startup script output
+    while (!$startupSucceeded) {
+        if ($SSHStream.DataAvailable) {
+            $text = $SSHStream.Read()
+            if (![string]::IsNullOrEmpty($text)) {
+                #Write-SPOTLog "INFO: read text output: $text."
+                $buffer += $text
+
+                ########################################
+                # Successful startup
+                if ($buffer.Contains("OS_STARTUP_COMPLETE")) {
+                    $startupSucceeded = $true
+                    Write-SPOTLog "The startup was successfull." -DBG $true
+                }
+
+                ########################################
+                # Startup failure 
+                if ($buffer.Contains("ERROR: OS_STARTUP_INCOMPLETE")) {
+                    Write-SPOTLog "ERROR: during startup script execution."
+                    break
+                }
+            }
+        }
+        else {
+            Start-Sleep -Milliseconds 50
+        }
+    }
+
+    ##################
+    # capture all remaining output
+    Start-Sleep -Milliseconds 500
+    while ($SSHStream.DataAvailable) {
+        $text = $SSHStream.Read()
+        if (![string]::IsNullOrEmpty($text)) {
+            $buffer += $text
+        }
+    }
+
+    #################################
+    # delete the startup script after usage
+    $SSHStream.WriteLine("rm -f /tmp/spot_startup-readiness.sh")
+    $SSHStream.Flush()
+    Start-Sleep -Milliseconds 200
+    while ($SSHStream.DataAvailable) {
+        $buffer += $SSHStream.Read()
+    }
+
+    ##################
+    # add the buffer to the main after output variable
+    $_spot_OutputAfterReboot += $buffer
+    
+    ##################
+    # at this point, in all cases, close the existing sessions now
+    $SSHStream.Dispose()
+    $SSHSession.Disconnect()
+    $SSHSession.Dispose()
+
+    ##################
+    # compose the full output variable
+    $_spot_FullOutput += $_spot_OutputBeforeReboot -split '\r?\n'
+    $_spot_FullOutput += $_spot_OutputAfterReboot -split '\r?\n'
+
+    ##################
+    # handle the startup error case
+    if (!$startupSucceeded) {
+        Write-SPOTLog "The entire captured bash script output so far: $buffer"
+        throw "Reboot-LinuxComputer: failed to startup after computer reboot"
+    }
+
+    ######################
+    Write-SPOTLog "Finished function Reboot-LinuxComputer for TargetComputer $TargetComputer."
+
+} # end of Reboot-LinuxComputer function
+
+######################################################################################################################
+function Reboot-WindowsComputer {
+<#
+.SYNOPSIS
+Triggers remotely a restart of a Windows computer and waits for the startup to finish afterwards.
+
+.DESCRIPTION
+The target Windows remote computer is restarted using a PSSession and then it is checked for completion of the restart
+using the LastBootTime value from WMI as well as either the presence of the LogonUI process or of an authenticated user.
+This method should support scenarios when multiple reboots in a sequence take place. (e.g. after complex updates or new 
+features are installed)
+
+.PARAMETER TargetComputer
+The IP Address or hostname of the target Windows computer.
+
+.PARAMETER UseSSL
+The PSSession type to be used (WinRM over HTTP or HTTPS).
+
+.PARAMETER Credential
+Specifies the Win credential to be used for remote authentication.
+
+.PARAMETER Timeout
+Specifies the number of seconds to test for the completion of the restart before giving up and considering the restart a failure.
+
+.INPUTS
+None. You can't pipe objects to Reboot-WindowsComputer.
+
+.OUTPUTS
+System.String. Reboot-WindowsComputer may return only logging output. 
+
+.EXAMPLE
+PS> Reboot-WindowsComputer -TargetComputer "192.168.0.2" -UseSSL -Timeout 300 -Credential $Credential
+In this example the target computer with the IP Address "192.168.0.2" is restarted using WinRM over HTTPS, with a timeout of 5 minutes.
+
+.EXAMPLE
+PS> Reboot-WindowsComputer -TargetComputer "192.168.0.2" -Timeout 300 -Credential $Credential
+In this example the target computer with the IP Address "192.168.0.2" is restarted using WinRM over HTTP, with a timeout of 5 minutes.
+#>
+
+    Param (
+        [Parameter(Mandatory=$true)]
+        [ValidateNotNullOrEmpty()]
+        [string]
+        # the target IP Address or hostname of the target Windows computer
+        $TargetComputer,
+        [Parameter(Mandatory=$false)]
+        [switch]
+        # signals the usage of the WinRM over HTTPS protocol
+        $UseSSL,
+        [Parameter(Mandatory=$false)]
+        [ValidateNotNullOrEmpty()]
+        [int]
+        # the number of seconds to wait for the entire reboot to complete
+        $Timeout = 300, 
+        [Parameter(Mandatory=$true)]
+        [ValidateNotNullOrEmpty()]
+        [System.Management.Automation.PSCredential]
+        # the Credential to be used for remote authentication
+        $Credential
+        )
+    
+    # the TargetComputer network host should be a windows computer
+
+    ######################
+    Write-SPOTLog "Starting function Reboot-WindowsComputer with the parameters: TargetComputer $TargetComputer, UseSSL $UseSSL and Timeout $Timeout."
+
+    ######################
+    # set the target port depending on the function parameter
+    if ($UseSSL) {
+        $Port = 5986
+    }
+    else {
+        $Port = 5985
+    }
+
+    ######################
+    # testing the availability of the TCP port on the remote computer
+    $TCPTestResult = Test-SPOTTCPPort -TargetIP $TargetComputer -TCPPort $Port
+    if (!($TCPTestResult.TcpTestSucceeded)) {
+        Write-SPOTLog "ERROR: The connectivity to the WinRM port for host $TargetComputer is not successfull. Ping test result was: $($TCPTestResult.PingSucceeded)."
+        throw "Reboot-WindowsComputer: WinRM port unreachable!"
+    }
+
+    #################################
+    # set te deadline
+    $Deadline = [DateTime]::UtcNow.AddSeconds($Timeout)
+
+    ######################
+    # establish if ping will be used later for more verbosity
+    if ($TCPTestResult.PingSucceeded) {
+        $PingAvailable = $true
+    }
+    else {
+        $PingAvailable = $false
+    }
+
+    ######################
+    # connect to the target Windows computer by PSSession
+    Write-SPOTLog "Connecting to the target Windows computer over PSSession." -DBG $true
+    try {
+        if ($UseSSL) {
+            $session = New-PSSession -ComputerName $TargetComputer -Credential $Credential -SessionOption (New-PSSessionOption -OpenTimeout 30000) -UseSSL -ErrorAction Stop
+        }
+        else {
+            $session = New-PSSession -ComputerName $TargetComputer -Credential $Credential -SessionOption (New-PSSessionOption -OpenTimeout 30000) -ErrorAction Stop
+        }
+    }
+    catch {
+        Write-SPOTLog "ERROR: while creating the PSSession to the ""$TargetComputer"" remote computer: $_."
+        throw "Reboot-WindowsComputer: error connecting to the target computer!"
+    }
+
+    ######################
+    # get the initial boot time into a variable
+    Write-SPOTLog "Getting the initial boot time from the target Windows computer." -DBG $true
+    $InitialBootTime = Invoke-Command -Session $session -ScriptBlock {"$(([DateTimeOffset](Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue).LastBootUpTime).ToUniversalTime().ToString("o"))"} -ErrorAction SilentlyContinue
+    if (!$InitialBootTime) {
+        Write-SPOTLog "ERROR: could not get the initial boot time of the target computer."
+        throw "Reboot-WindowsComputer: could not get the initial boot time!"
+    }
+    
+    ######################
+    # trigger the reboot
+    Write-SPOTLog "Triggering the reboot on the target Windows computer." -DBG $true
+    $RebootCommandOutput = Invoke-Command -Session $session -ScriptBlock {shutdown /r /t 10 /f}
+    Remove-PSSession -Session $session -Confirm:$false
+    if ($RebootCommandOutput) {
+        Write-SPOTLog "WARNING: there was some unexpected output to the shutdown command: ""$RebootCommandOutput""."
+    }
+    
+    ######################
+    # if ping was available...
+    if ($PingAvailable) {
+        ##################
+        # continue by pinging the target until reboot
+        while ($true) {
+            Start-Sleep -Seconds 5
+            if (Ping-SPOTHostWMI -ip $TargetComputer) {
+                Write-SPOTLog "The target Windows computer is still reachable." -DBG $true
+                if ([DateTime]::UtcNow -gt $Deadline) {
+                    Write-SPOTLog "ERROR: Timed out waiting for the target Windows computer to reboot."
+                    throw "Reboot-WindowsComputer: Timed out trying to restart the target Windows computer"
+                }
+            }
+            else {
+                Write-SPOTLog "The target Windows computer is not reachable anymore. Reboot on-going." -DBG $true
+                break
+            }
+        }
+        Start-Sleep -Seconds 10
+
+        ##################
+        # continue by pinging the target until reachable
+        while ($true) {
+            Start-Sleep -Seconds 5
+            if (Ping-SPOTHostWMI -ip $TargetComputer) {
+                Write-SPOTLog "The target Windows computer is reachable again." -DBG $true
+                break
+            }
+            else {
+                Write-SPOTLog "The target Windows computer is not yet reachable again. Reboot on-going." -DBG $true
+                if ([DateTime]::UtcNow -gt $Deadline) {
+                    Write-SPOTLog "ERROR: Timed out waiting for the target Windows computer to be reachable after reboot."
+                    throw "Reboot-WindowsComputer: Timed out trying to restart the target Windows computer"
+                }
+            }
+        }
+    }
+    else {
+        Write-SPOTLog "Ping was not available, so waiting 30 seconds before trying the TCP port availability." -DBG $true
+        Start-Sleep -Seconds 30
+    }
+
+    ######################
+    # check for the completion of the restart
+    while ($true) {
+        Start-Sleep -Seconds 5
+        $TCPTestResult = $null
+        $session = $null
+        $CurrentBootTime = $null
+        # test the tcp port
+        $TCPTestResult = Test-SPOTTCPPort -TargetIP $TargetComputer -TCPPort $Port
+        if ($TCPTestResult.TcpTestSucceeded) {
+            Write-SPOTLog "WinRM TCP port is available. Trying to connect." -DBG $true
+            # try to connect over PSSession
+            try {
+                if ($UseSSL) {
+                    $session = New-PSSession -ComputerName $TargetComputer -Credential $Credential -SessionOption (New-PSSessionOption -OpenTimeout 30000) -UseSSL -ErrorAction Stop
+                }
+                else {
+                    $session = New-PSSession -ComputerName $TargetComputer -Credential $Credential -SessionOption (New-PSSessionOption -OpenTimeout 30000) -ErrorAction Stop
+                }
+            }
+            catch {
+                Write-SPOTLog "Attempt failed to connect over PSSession: $_." -DBG $true
+            }
+            if ($session.State -eq "Opened") {
+                Write-SPOTLog "PSSession to the target Windows computer was opened." -DBG $true
+                # check for the LogonUI or Interactive user
+                $CurrentBootTime = Invoke-Command -Session $session -ErrorAction SilentlyContinue -ScriptBlock {
+                    $logonUI = Get-Process -Name LogonUI -ErrorAction SilentlyContinue
+                    $interactiveUser = (Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction SilentlyContinue).UserName
+                    if ($logonUI -or $interactiveUser) {
+                        # the system is ready for logins; returning the current boot time
+                        "$(([DateTimeOffset](Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue).LastBootUpTime).ToUniversalTime().ToString("o"))"
+                    }
+                }
+
+                # check the CurrentBootTime
+                if ($CurrentBootTime) {
+                    if ($CurrentBootTime -ne $InitialBootTime) {
+                        Write-SPOTLog "The startup after restart was found completed on the remote Windows computer." -DBG $true
+                        Remove-PSSession -Session $session -Confirm:$false
+                        break
+                    }
+                }
+                else {
+                    Write-SPOTLog "The startup was checked but not yet found completed." -DBG $true
+                    Remove-PSSession -Session $session -Confirm:$false
+                }
+            }
+            else {
+                Write-SPOTLog "PSSession to the target Windows computer was not yet opened properly." -DBG $true
+                Remove-PSSession -Session $session -Confirm:$false
+            }
+        }
+        else {
+            Write-SPOTLog "WinRM TCP port is not yet available." -DBG $true
+        }
+        
+        # check the timeout
+        if ([DateTime]::UtcNow -gt $Deadline) {
+            Write-SPOTLog "ERROR: Timed out trying to check the restart completion on the target Windows computer."
+            throw "Reboot-WindowsComputer: Timed out trying to restart the target Windows computer"
+        }
+    }
+
+    ######################
+    Write-SPOTLog "Finished function Reboot-WindowsComputer for TargetComputer $TargetComputer."
+} # end of Reboot-WindowsComputer function
+

@@ -22,6 +22,8 @@ StepTypeDefinitions:
                 Mandatory: True
             Credential: # the credential to be used to connect to the remote computer
                 Mandatory: True
+            UseSSL: # to create the WinRM session with SSL
+                Mandatory: False
         PowershellCommandRemoteSJ:
             CommandName: # the name of the command (script or function name) to be executed; it must be already loaded/available
                 Mandatory: True
@@ -38,6 +40,8 @@ StepTypeDefinitions:
             AsUser: # the alternative credential to be used to execute the payload on the remote computer
                 Mandatory: False
             AsSystem: # specify if the remote code is to be executed as local system on the target computer
+                Mandatory: False
+            UseSSL: # to create the WinRM session with SSL
                 Mandatory: False
         PowershellCommandRemoteWMI:
             CommandName: # the name of the command (script or function name) to be executed; it must be already loaded/available

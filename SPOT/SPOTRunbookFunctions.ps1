@@ -11,6 +11,7 @@
 #                   - added AsSystem for remote runbook execution with supporting ExecFunctions; 
 #                   - improved PowershellCommandRemote, PowershellCommandRemoteSJ and Start-SPOTRunbookJobRemote
 #                   - added support for references (including mixed strings) inside multiple VariablesToPublish entries
+# v1.3 - 31.08.2026 - added support for WinRM SSL in PowershellCommandRemote and PowershellCommandRemoteSJ step types 
 # 
 #
 #
@@ -42,7 +43,12 @@ function PowershellCommandRemote {
         [ValidateNotNullOrEmpty()]
         [string]
         # the execution path for the payload script/function
-        $ExecPath, 
+        $ExecPath,
+        [Parameter(Mandatory = $false)]
+        [ValidateNotNullOrEmpty()]
+        [bool]
+        # specify if the WinRM session should be created with SSL
+        $UseSSL = $false,
         [Parameter(Mandatory=$false)]
         [ValidateNotNullOrEmpty()]
         [string[]]
@@ -78,7 +84,7 @@ function PowershellCommandRemote {
         Credential          = $Credential
         _spot_VTPs          = Get-SPOTVTPObjects -VariablesToPublish $VariablesToPublish
         ExecPath            = $ExecPath
-        #CompKey             = $CompKey
+        UseSSL              = $UseSSL
         _spot_PublishedData = $null
     }
     ######
@@ -96,6 +102,7 @@ function PowershellCommandRemote {
         [object[]]$_spot_VTPs,
         [hashtable]$CommandParameters,
         [string]$ExecPath,
+        [bool]$UseSSL,
         [hashtable]$_spot_PublishedData
         )
 
@@ -106,6 +113,7 @@ function PowershellCommandRemote {
             _spot_VTPs          = [object[]]$_spot_VTPs
             CommandParameters   = [hashtable]$CommandParameters
             ExecPath            = [string]$ExecPath
+            UseSSL              = [bool]$UseSSL
             _spot_PublishedData = [hashtable]$_spot_PublishedData
         }
 # child scope against cross bleeding of variables inside the runspacepool
@@ -117,6 +125,7 @@ function PowershellCommandRemote {
     [object[]]$_spot_VTPs,
     [hashtable]$CommandParameters,
     [string]$ExecPath,
+    [bool]$UseSSL,
     [hashtable]$_spot_PublishedData
     )
 ######################################
@@ -129,79 +138,102 @@ foreach ($funcName in $_spot_FunctionNames) {
 }
 
 ######################################
+# set the target port depending on the UseSSL parameter
+if ($UseSSL) {
+    $Port = 5986
+}
+else {
+    $Port = 5985
+}
+
+######################################
 # testing the availability of the remote execution TCP port on the remote computer
-$TCPTestResult = Test-SPOTTCPPort -TargetIP $RemoteComputer -TCPPort "5985"
+$TCPTestResult = Test-SPOTTCPPort -TargetIP $RemoteComputer -TCPPort $Port
 if (!($TCPTestResult.TcpTestSucceeded)) {
-    Write-SPOTLog " ############# ORCHESTRATOR LOGGING: ERROR: Connecting to the WinRM port on remote computer ""$RemoteComputer"" failed! Ping test result was: $($TCPTestResult.PingSucceeded). #############"
+    Write-SPOTLog " ############# ORCHESTRATOR LOGGING: ERROR: Connecting to the WinRM port ""$Port"" on remote computer ""$RemoteComputer"" failed! Ping test result was: $($TCPTestResult.PingSucceeded). #############"
     return $false
 }
 
 ######################################
 # setup the remote PSSessionConfiguration to avoid "double hop" limitations
-try {
-    $CleanupSPOTConfig = Invoke-Command -ComputerName $RemoteComputer -Credential $Credential -ScriptBlock {
-        # get all sessions (includes the current one due to this Invoke-Command)
-        $WinRMSessions = Get-WSManInstance -ResourceURI Shell -Enumerate
-        # check SPOTConfig existence and usage
-        $SpotConfig = Get-PSSessionConfiguration -ErrorAction SilentlyContinue | Where {$_.Name -eq "SPOTConfig"}
-        if ($SpotConfig) {
-            # the SPOT PSSession Config already exists
-            ########################################
-            # check first if the existing SPOT PSSession Config is in use
-            $InUse = $false
-            if ($WinRMSessions | Where {($_.ResourceUri -like "*SPOTConfig") -and ($_.State -eq "Connected")}) {
-                $InUse = $true
-            }
-            ########################################
-            # check if the same credentials are used or not 
-            if ($SpotConfig.RunAsUser -ne $args[0].UserName) {
-                # other credentials used in the SPOT PSSession Config
-                if ($InUse) {
-                    # return error and stop the step as this may break a parent runbook
-                    throw "PowershellCommandRemote: the SPOTConfig PSSessionConfiguration is already in use with another credential!"
-                }
-                else {
-                    # before restarting the WinRM service, check if other PSSessions are connected
-                    if (($WinRMSessions | Where {($_.ResourceUri -like "*Microsoft.PowerShell") -and ($_.State -eq "Connected")}).Count -gt 1) {
-                        # return error and stop the step as this may break a parent runbook
-                        throw "PowershellCommandRemote: there is already another PSSession connected to the same target computer!"
-                    }
-                    else {
-                        Unregister-PSSessionConfiguration -Name "SPOTConfig" -Force -ErrorAction SilentlyContinue | Out-Null
-                        $true
-                        Register-PSSessionConfiguration -Name "SPOTConfig" -RunAsCredential $args[0] -Force -ErrorAction Stop | Out-Null
-                    }
-                }
+$SbSPOTConfig = {
+    # get all sessions (includes the current one due to this Invoke-Command)
+    $WinRMSessions = Get-WSManInstance -ResourceURI Shell -Enumerate
+    # check SPOTConfig existence and usage
+    $SpotConfig = Get-PSSessionConfiguration -ErrorAction SilentlyContinue | Where {$_.Name -eq "SPOTConfig"}
+    if ($SpotConfig) {
+        # the SPOT PSSession Config already exists
+        ########################################
+        # check first if the existing SPOT PSSession Config is in use
+        $InUse = $false
+        if ($WinRMSessions | Where {($_.ResourceUri -like "*SPOTConfig") -and ($_.State -eq "Connected")}) {
+            $InUse = $true
+        }
+        ########################################
+        # check if the same credentials are used or not 
+        if ($SpotConfig.RunAsUser -ne $args[0].UserName) {
+            # other credentials used in the SPOT PSSession Config
+            if ($InUse) {
+                # return error and stop the step as this may break a parent runbook
+                throw "PowershellCommandRemote: the SPOTConfig PSSessionConfiguration is already in use with another credential!"
             }
             else {
-                # the same credentials are used in the SPOT PSSession Config; it can be used as is
-                if ($InUse) {
-                    # return false to avoid deleting the already existing SPOT PSSession Config at the end
-                    return $false
+                # before restarting the WinRM service, check if other PSSessions are connected
+                if (($WinRMSessions | Where {($_.ResourceUri -like "*Microsoft.PowerShell") -and ($_.State -eq "Connected")}).Count -gt 1) {
+                    # return error and stop the step as this may break a parent runbook
+                    throw "PowershellCommandRemote: there is already another PSSession connected to the same target computer!"
                 }
                 else {
-                    # return true to delete the already existing SPOT PSSession Config at the end
-                    return $true
+                    Unregister-PSSessionConfiguration -Name "SPOTConfig" -Force -ErrorAction SilentlyContinue | Out-Null
+                    $true
+                    Register-PSSessionConfiguration -Name "SPOTConfig" -RunAsCredential $args[0] -Force -ErrorAction Stop | Out-Null
                 }
             }
         }
         else {
-            if (($WinRMSessions | Where {($_.ResourceUri -like "*Microsoft.PowerShell") -and ($_.State -eq "Connected")}).Count -gt 1) {
-                # return error and stop the step as this may break a parent runbook
-                throw "PowershellCommandRemote: there is already another PSSession connected to the same target computer!"
+            # the same credentials are used in the SPOT PSSession Config; it can be used as is
+            if ($InUse) {
+                # return false to avoid deleting the already existing SPOT PSSession Config at the end
+                return $false
             }
             else {
-                $true
-                Register-PSSessionConfiguration -Name "SPOTConfig" -RunAsCredential $args[0] -Force -ErrorAction Stop | Out-Null
+                # return true to delete the already existing SPOT PSSession Config at the end
+                return $true
             }
         }
-    } -ArgumentList $Credential
+    }
+    else {
+        if (($WinRMSessions | Where {($_.ResourceUri -like "*Microsoft.PowerShell") -and ($_.State -eq "Connected")}).Count -gt 1) {
+            # return error and stop the step as this may break a parent runbook
+            throw "PowershellCommandRemote: there is already another PSSession connected to the same target computer!"
+        }
+        else {
+            $true
+            Register-PSSessionConfiguration -Name "SPOTConfig" -RunAsCredential $args[0] -Force -ErrorAction Stop | Out-Null
+        }
+    }
+}
+
+try {
+    if ($UseSSL) {
+        $CleanupSPOTConfig = Invoke-Command -ComputerName $RemoteComputer -Credential $Credential -ScriptBlock $SbSPOTConfig -ArgumentList $Credential -UseSSL
+    }
+    else {
+        $CleanupSPOTConfig = Invoke-Command -ComputerName $RemoteComputer -Credential $Credential -ScriptBlock $SbSPOTConfig -ArgumentList $Credential
+    }
 }
 catch {
     Write-SPOTLog ">>> ERROR while creating the SPOT PSSession Admin Config on the ""$RemoteComputer"" remote computer: $_."
     # cleanup in case of error
-    Invoke-Command -ComputerName $RemoteComputer -Credential $Credential -ScriptBlock {
-        Get-PSSessionConfiguration -ErrorAction SilentlyContinue | Where {$_.Name -eq "SPOTConfig"} | Unregister-PSSessionConfiguration -Force -ErrorAction SilentlyContinue
+    if ($UseSSL) {
+        Invoke-Command -ComputerName $RemoteComputer -Credential $Credential -ScriptBlock {
+            Get-PSSessionConfiguration -ErrorAction SilentlyContinue | Where {$_.Name -eq "SPOTConfig"} | Unregister-PSSessionConfiguration -Force -ErrorAction SilentlyContinue
+        } -UseSSL
+    }
+    else {
+        Invoke-Command -ComputerName $RemoteComputer -Credential $Credential -ScriptBlock {
+            Get-PSSessionConfiguration -ErrorAction SilentlyContinue | Where {$_.Name -eq "SPOTConfig"} | Unregister-PSSessionConfiguration -Force -ErrorAction SilentlyContinue
+        }
     }
     return $false
 }
@@ -210,14 +242,26 @@ Start-Sleep -Seconds 1
 ######################################
 # create the PSSession for the current step, with connection timeout of 30 seconds
 try {
-    $session = New-PSSession -ComputerName $RemoteComputer -Credential $Credential -ConfigurationName "SPOTConfig" -SessionOption (New-PSSessionOption -OpenTimeout 30000) -ErrorAction Stop
+    if ($UseSSL) {
+        $session = New-PSSession -ComputerName $RemoteComputer -Credential $Credential -ConfigurationName "SPOTConfig" -SessionOption (New-PSSessionOption -OpenTimeout 30000) -ErrorAction Stop -UseSSL
+    }
+    else {
+        $session = New-PSSession -ComputerName $RemoteComputer -Credential $Credential -ConfigurationName "SPOTConfig" -SessionOption (New-PSSessionOption -OpenTimeout 30000) -ErrorAction Stop
+    }
 }
 catch {
     Write-SPOTLog ">>> ERROR while creating the PSSession to the ""$RemoteComputer"" remote computer: $_."
     # cleanup in case of error
     if ($CleanupSPOTConfig) {
-        Invoke-Command -ComputerName $RemoteComputer -Credential $Credential -ScriptBlock {
-            Get-PSSessionConfiguration -ErrorAction SilentlyContinue | Where {$_.Name -eq "SPOTConfig"} | Unregister-PSSessionConfiguration -Force -ErrorAction SilentlyContinue
+        if ($UseSSL) {
+            Invoke-Command -ComputerName $RemoteComputer -Credential $Credential -ScriptBlock {
+                Get-PSSessionConfiguration -ErrorAction SilentlyContinue | Where {$_.Name -eq "SPOTConfig"} | Unregister-PSSessionConfiguration -Force -ErrorAction SilentlyContinue
+            } -UseSSL
+        }
+        else {
+            Invoke-Command -ComputerName $RemoteComputer -Credential $Credential -ScriptBlock {
+                Get-PSSessionConfiguration -ErrorAction SilentlyContinue | Where {$_.Name -eq "SPOTConfig"} | Unregister-PSSessionConfiguration -Force -ErrorAction SilentlyContinue
+            }
         }
     }
     return $false
@@ -234,8 +278,15 @@ if ($CommandParameters) {
         # cleanup in case of error
         Remove-PSSession -Session $session -Confirm:$false -ErrorAction SilentlyContinue
         if ($CleanupSPOTConfig) {
-            Invoke-Command -ComputerName $RemoteComputer -Credential $Credential -ScriptBlock {
-                Get-PSSessionConfiguration -ErrorAction SilentlyContinue | Where {$_.Name -eq "SPOTConfig"} | Unregister-PSSessionConfiguration -Force -ErrorAction SilentlyContinue
+            if ($UseSSL) {
+                Invoke-Command -ComputerName $RemoteComputer -Credential $Credential -ScriptBlock {
+                    Get-PSSessionConfiguration -ErrorAction SilentlyContinue | Where {$_.Name -eq "SPOTConfig"} | Unregister-PSSessionConfiguration -Force -ErrorAction SilentlyContinue
+                } -UseSSL
+            }
+            else {
+                Invoke-Command -ComputerName $RemoteComputer -Credential $Credential -ScriptBlock {
+                    Get-PSSessionConfiguration -ErrorAction SilentlyContinue | Where {$_.Name -eq "SPOTConfig"} | Unregister-PSSessionConfiguration -Force -ErrorAction SilentlyContinue
+                }
             }
         }
         return $false
@@ -303,8 +354,15 @@ catch {
     # cleanup in case of error
     Remove-PSSession -Session $session -Confirm:$false -ErrorAction SilentlyContinue
     if ($CleanupSPOTConfig) {
-        Invoke-Command -ComputerName $RemoteComputer -Credential $Credential -ScriptBlock {
-            Get-PSSessionConfiguration -ErrorAction SilentlyContinue | Where {$_.Name -eq "SPOTConfig"} | Unregister-PSSessionConfiguration -Force -ErrorAction SilentlyContinue
+        if ($UseSSL) {
+            Invoke-Command -ComputerName $RemoteComputer -Credential $Credential -ScriptBlock {
+                Get-PSSessionConfiguration -ErrorAction SilentlyContinue | Where {$_.Name -eq "SPOTConfig"} | Unregister-PSSessionConfiguration -Force -ErrorAction SilentlyContinue
+            } -UseSSL
+        }
+        else {
+            Invoke-Command -ComputerName $RemoteComputer -Credential $Credential -ScriptBlock {
+                Get-PSSessionConfiguration -ErrorAction SilentlyContinue | Where {$_.Name -eq "SPOTConfig"} | Unregister-PSSessionConfiguration -Force -ErrorAction SilentlyContinue
+            }
         }
     }
     return $false
@@ -403,8 +461,15 @@ foreach ($rf in $RemoteTempFolders) {
 }
 Remove-PSSession -Session $session -Confirm:$false
 if ($CleanupSPOTConfig) {
-    Invoke-Command -ComputerName $RemoteComputer -Credential $Credential -ScriptBlock {
-        Get-PSSessionConfiguration -ErrorAction SilentlyContinue | Where {$_.Name -eq "SPOTConfig"} | Unregister-PSSessionConfiguration -Force -ErrorAction SilentlyContinue
+    if ($UseSSL) {
+        Invoke-Command -ComputerName $RemoteComputer -Credential $Credential -ScriptBlock {
+            Get-PSSessionConfiguration -ErrorAction SilentlyContinue | Where {$_.Name -eq "SPOTConfig"} | Unregister-PSSessionConfiguration -Force -ErrorAction SilentlyContinue
+        } -UseSSL
+    }
+    else {
+        Invoke-Command -ComputerName $RemoteComputer -Credential $Credential -ScriptBlock {
+            Get-PSSessionConfiguration -ErrorAction SilentlyContinue | Where {$_.Name -eq "SPOTConfig"} | Unregister-PSSessionConfiguration -Force -ErrorAction SilentlyContinue
+        }
     }
 }
 
@@ -419,6 +484,7 @@ $CommandName         = $null
 $_spot_VTPs          = $null
 $CommandParameters   = $null
 $ExecPath            = $null
+$UseSSL              = $null
 $_spot_PublishedData = $null
 $innerParams         = $null
 $Error.Clear()
@@ -687,9 +753,14 @@ function PowershellCommandRemoteSJ {
         $AsUser, 
         [Parameter(Mandatory = $false)]
         [ValidateNotNullOrEmpty()]
-        [string]
+        [bool]
         # specify if the payload script/function is to be executed as local system on the target computer
-        $AsSystem = $false, 
+        $AsSystem = $false,
+        [Parameter(Mandatory = $false)]
+        [ValidateNotNullOrEmpty()]
+        [bool]
+        # specify if the WinRM session should be created with SSL
+        $UseSSL = $false,
         [Parameter(Mandatory=$false)]
         [ValidateNotNullOrEmpty()]
         [string[]]
@@ -866,7 +937,7 @@ function PowershellCommandRemoteSJ {
         ScriptBlock = $ScriptBlock
         ArgumentList = $ArgumentList
     }
-    if ($AsSystem -eq $true) {
+    if ($AsSystem) {
         $STParameters += @{
             AsSystem = $true
         }
@@ -880,6 +951,7 @@ function PowershellCommandRemoteSJ {
     # preparing the ParamList to be passed to the runspace and then to the remote PSSession
     $ParamList = @{
         RemoteComputer      = $RemoteComputer
+        UseSSL              = $UseSSL
         Credential          = $Credential
         CompKey             = $CompKey
         STParameters        = $STParameters
@@ -899,6 +971,7 @@ function PowershellCommandRemoteSJ {
         [System.Management.Automation.PSCredential]$Credential,
         [hashtable]$STParameters,
         [string]$CompKey,
+        [bool]$UseSSL,
         [hashtable]$_spot_PublishedData
         )
 
@@ -907,6 +980,7 @@ function PowershellCommandRemoteSJ {
             Credential          = [System.Management.Automation.PSCredential]$Credential
             STParameters        = [hashtable]$STParameters
             CompKey             = [string]$CompKey
+            UseSSL              = [bool]$UseSSL
             _spot_PublishedData = [hashtable]$_spot_PublishedData
         }
 # child scope against cross bleeding of variables inside the runspacepool
@@ -916,6 +990,7 @@ function PowershellCommandRemoteSJ {
     [System.Management.Automation.PSCredential]$Credential,
     [hashtable]$STParameters,
     [string]$CompKey,
+    [bool]$UseSSL,
     [hashtable]$_spot_PublishedData
     )
 
@@ -929,17 +1004,31 @@ foreach ($funcName in $_spot_FunctionNames) {
 }
 
 ######################################
+# set the target port depending on the UseSSL parameter
+if ($UseSSL) {
+    $Port = 5986
+}
+else {
+    $Port = 5985
+}
+
+######################################
 # testing the availability of the remote execution TCP port on the remote computer
-$TCPTestResult = Test-SPOTTCPPort -TargetIP $RemoteComputer -TCPPort "5985"
+$TCPTestResult = Test-SPOTTCPPort -TargetIP $RemoteComputer -TCPPort $Port
 if (!($TCPTestResult.TcpTestSucceeded)) {
-    Write-SPOTLog " ############# ORCHESTRATOR LOGGING: ERROR: Connecting to the WinRM port on remote computer ""$RemoteComputer"" failed! Ping test result was: $($TCPTestResult.PingSucceeded). #############"
+    Write-SPOTLog " ############# ORCHESTRATOR LOGGING: ERROR: Connecting to the WinRM port ""$Port"" on remote computer ""$RemoteComputer"" failed! Ping test result was: $($TCPTestResult.PingSucceeded). #############"
     return $false
 }
 
 ######################################
 # open the normal PSSession, with a connection timeout of 30 seconds
 try {
-    $session = New-PSSession -ComputerName $RemoteComputer -Credential $Credential -SessionOption (New-PSSessionOption -OpenTimeout 30000) -ErrorAction Stop
+    if ($UseSSL) {
+        $session = New-PSSession -ComputerName $RemoteComputer -Credential $Credential -SessionOption (New-PSSessionOption -OpenTimeout 30000) -ErrorAction Stop -UseSSL
+    }
+    else {
+        $session = New-PSSession -ComputerName $RemoteComputer -Credential $Credential -SessionOption (New-PSSessionOption -OpenTimeout 30000) -ErrorAction Stop
+    }
 }
 catch {
     Write-SPOTLog " >>> T.ERROR while creating PSSession to the ""$RemoteComputer"" remote computer: $_."
@@ -1076,6 +1165,7 @@ $RemoteComputer      = $null
 $Credential          = $null
 $STParameters        = $null
 $CompKey             = $null
+$UseSSL              = $null
 $_spot_PublishedData = $null
 $innerParams         = $null
 $Error.Clear()
@@ -3036,6 +3126,11 @@ function Start-SPOTRunbookJobRemote {
     if ($Runbook.RemoteParameters.AsSystem) {
         $FunctionParams += @{
             AsSystem = $true
+        }
+    }
+    if ($Runbook.RemoteParameters.UseSSL) {
+        $FunctionParams += @{
+            UseSSL = $true
         }
     }
 
@@ -5474,7 +5569,7 @@ public class HostKeyHandler
 
     #########################
     # put the SSH key details into a variable into the parent scope
-    New-Variable -Name _spot_SSH_Key -Scope 1 -Value @{
+    New-Variable -Name _spot_SSH_Key -Scope 1 -Force -Confirm:$false -Value @{
         TargetHost  = (($handlerObj.Logs -split ',')[0] -split '=>')[1]
         Port        = (($handlerObj.Logs -split ',')[1] -split '=>')[1]
         KeyType     = (($handlerObj.Logs -split ',')[2] -split '=>')[1]
@@ -5740,7 +5835,7 @@ public class HostKeyHandler
 
     #########################
     # put the SSH key details into a variable into the parent scope
-    New-Variable -Name _spot_SSH_Key -Scope 1 -Value @{
+    New-Variable -Name _spot_SSH_Key -Scope 1 -Force -Confirm:$false -Value @{
         TargetHost  = (($handlerObj.Logs -split ',')[0] -split '=>')[1]
         Port        = (($handlerObj.Logs -split ',')[1] -split '=>')[1]
         KeyType     = (($handlerObj.Logs -split ',')[2] -split '=>')[1]
@@ -6438,7 +6533,6 @@ function Get-SPOTVTPObjects {
         # the array of variable names to publish, from inside the payload script/function
         $VariablesToPublish 
         )
-# $VariablesToPublish = "var1=variable1","var2","var=variable-192.168.0.20"
     
     if (!$VariablesToPublish) {
         $_spot_VTPs = $null
@@ -6524,7 +6618,6 @@ $ast.FindAll({
 $result = $code
 $replacements | Sort-Object Start -Descending | ForEach-Object {
     $result = $result.Substring(0,$_.Start) + $_.Text + $result.Substring($_.Start+4)
-    #$result = $result.Substring(0,$_.Start) + $_.Text + $result.Substring($_.End)
 }
 # return the modified code
 $result

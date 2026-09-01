@@ -38,3 +38,13 @@
 ### Fixed
 - the Finalize-SPOTRemoteExecution function to restore the initial state of the remote computer
 - the Process-SPOTCommandParamsRF function 
+
+## [1.1.2] - 31.08.2026
+
+### Added
+- two new SPOT Built-in step function: Reboot-LinuxComputer and Reboot-WindowsComputer
+- support for WinRM over HTTPS in the type functions PowershellCommandRemote and PowershellCommandRemoteSJ (and implicitly in Runbook Remote Parameters)
+
+### Changed
+- small error handling correction in all SPOT Built-in step functions
+

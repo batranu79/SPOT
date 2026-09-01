@@ -34,7 +34,8 @@ RunbookSteps:
             RemoteComputer: 
             Credential: 
             ExecPath: 
-            VariablesToPublish:
+            VariablesToPublish: 
+            # UseSSL: true
         Disabled: false
 
     Step3:
@@ -52,6 +53,7 @@ RunbookSteps:
             Credential: 
             ExecPath: 
             VariablesToPublish: 
+            # UseSSL: true
             # AsUser: 
             # AsSystem: true
         Disabled: false
@@ -119,6 +121,8 @@ RunbookSteps:
         #     ExecFunction: 
         #     RemoteComputer: 
         #     Credential: 
+        #     UseSSL: 
+        #     AsSystem: 
         # RunbookParameters:
         #     Par1: one
         #     Par2: two

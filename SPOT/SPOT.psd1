@@ -2,7 +2,7 @@
 # v1.0 - 26.04.2026 - initial version
 # v1.1 - 17.05.2026 - new released version
 # v1.2 - 03.07.2026 - new released version; new public functions added
-#
+# v1.3 - 31.08.2026 - new release version
 #
 #
 ######################################################################################################################
@@ -13,10 +13,10 @@
     RootModule = 'SPOT.psm1'
 
     # Version number of this module.
-    ModuleVersion = '1.1.1'
+    ModuleVersion = '1.1.2'
 
     # ID used to uniquely identify this module
-    GUID = '1fba18ac-d6a5-4291-aebc-c9466e6fa253'
+    GUID = 'cf79bffe-e71e-4ab5-95a3-02e5451dd576'
 
     # Author of this module
     Author = 'Narcis-Ionel Mircea'

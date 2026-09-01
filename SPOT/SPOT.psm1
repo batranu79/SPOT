@@ -10,6 +10,7 @@
 #                   - Improved overall GUI and non-GUI SecretStore handling in various functions; improved Validate-SPOTRunbookRemoteParameters
 #                   - removed some unnecessary functions and improved Runbook loading and validations
 #                   - added support for references (including mixed strings) inside VariablesToPublish entries
+# v1.3 - 31.08.2026 - added support for UseSSL in PSSession based remote steps and runbooks
 #
 #
 #
@@ -1487,7 +1488,7 @@ function Validate-SPOTRunbookRemoteParameters {
 
     if ($Runbook.RemoteParameters) {
         Write-SPOTLog "INFO: The RemoteParameters are defined for Runbook ""$($Runbook.Name)"". Checking them." -Output $false -DBG $true
-        # make sure all remote parameters are present (they are mandatory only if this parent parameter is present)
+        # make sure all mandatory remote parameters are present (they are mandatory only if this parent parameter is present)
         if ($Runbook.RemoteParameters.ExecFunction -notin ("PowershellCommandRemote","PowershellCommandRemoteSJ","PowershellCommandRemoteWMI","PowershellCommandRemotePsExec","PowershellCommandRemoteOWMI")) {
             Write-SPOTLog "ERROR: for the Runbook ""$($Runbook.Name)"" the ExecFunction remote parameter is not defined or wrong value!" -Output $false
             return $false
@@ -1510,6 +1511,10 @@ function Validate-SPOTRunbookRemoteParameters {
         }
         if (($Runbook.RemoteParameters.AsSystem) -and ($Runbook.RemoteParameters.ExecFunction -notin ("PowershellCommandRemoteSJ","PowershellCommandRemotePsExec"))) {
             Write-SPOTLog "ERROR: for the Runbook ""$($Runbook.Name)"" the AsSystem remote parameter is defined but not applicable to the ExecFunction!" -Output $false
+            return $false
+        }
+        if (($Runbook.RemoteParameters.UseSSL) -and ($Runbook.RemoteParameters.ExecFunction -notin ("PowershellCommandRemote","PowershellCommandRemoteSJ"))) {
+            Write-SPOTLog "ERROR: for the Runbook ""$($Runbook.Name)"" the UseSSL remote parameter is defined but not applicable to the ExecFunction!" -Output $false
             return $false
         }
     }
@@ -3322,6 +3327,12 @@ function Show-SPOTRunbookStepDetails ( $GUID ) {
         if ($Type -like "*Remote*") {
             $StepDetailsData += [PSCustomObject]@{ Name = "RemoteComputer" ; Value = $RunbookStep.StepParameters.RemoteComputer -join ','; Type = "Step Parameters" }
             $StepDetailsData += [PSCustomObject]@{ Name = "Credential" ;     Value = $RunbookStep.StepParameters.Credential.UserName ;     Type = "Step Parameters" }
+        }
+        if ($RunbookStep.StepParameters.UseSSL) {
+            $StepDetailsData += [PSCustomObject]@{ Name = "UseSSL" ; Value = $RunbookStep.StepParameters.UseSSL; Type = "Step Parameters" }
+        }
+        if ($RunbookStep.StepParameters.AsSystem) {
+            $StepDetailsData += [PSCustomObject]@{ Name = "AsSystem" ; Value = $RunbookStep.StepParameters.AsSystem; Type = "Step Parameters" }
         }
         if ($RunbookStep.StepParameters.CommandParameters) {
             foreach ($fParam in $RunbookStep.StepParameters.CommandParameters.GetEnumerator() ) {
