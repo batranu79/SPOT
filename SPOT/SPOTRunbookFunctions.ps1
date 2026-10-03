@@ -12,6 +12,9 @@
 #                   - improved PowershellCommandRemote, PowershellCommandRemoteSJ and Start-SPOTRunbookJobRemote
 #                   - added support for references (including mixed strings) inside multiple VariablesToPublish entries
 # v1.3 - 31.08.2026 - added support for WinRM SSL in PowershellCommandRemote and PowershellCommandRemoteSJ step types 
+# v1.4 - 27.09.2026 - improved JIT variable replacement function to validate Credential parameters for type
+#                   - adapted the Start-SPOTRunbookJob and Execute-SPOTRunbook functions to step execution
+#                   - added a safe keepalive setting in New-SPOTSFTPSession and New-SPOTSSHSession functions
 # 
 #
 #
@@ -2647,7 +2650,12 @@ function Execute-SPOTRunbook {
         [ValidateNotNullOrEmpty()]
         [bool]
         # if true, the runbook steps will execute only the steps that are not already in state Completed
-        $Resume = $false, 
+        $Resume = $false,
+        [Parameter(Mandatory=$false)]
+        [ValidateNotNullOrEmpty()]
+        [bool]
+        # if true, the runbook execution will only last for one next step (or one next step for each paralel runbook, if the execution reached a situation like that)
+        $StepMode = $false,
         [Parameter(Mandatory=$false)]
         [ValidateNotNullOrEmpty()]
         [bool]
@@ -2933,6 +2941,12 @@ function Execute-SPOTRunbook {
             continue
         }
 
+        if ($StepMode) {
+            # for step execution, stop after the first executing step set
+            Write-SPOTLog "__##__STEP EXECUTION DETECTED, so setting the stop flag after the first step set execution.__##__" -DBG $true
+            $OrchVars._StopFlag = $true
+        }
+
         # check all steps with the current sequence number until they are all processes (finished one way or another)
         Write-SPOTLog "__##__Current Jobs in sequence $Seq : $($CurrentJbs.Name) and count: $($CurrentJbs.Count).__##__" -DBG $true
         while ($false -in $CurrentJbs.Processed) {
@@ -3003,7 +3017,12 @@ function Start-SPOTRunbookJob {
         [ValidateNotNullOrEmpty()]
         [bool]
         # if true, the runbook steps will execute only the steps that are not already in state Completed
-        $Resume = $false 
+        $Resume = $false,
+        [Parameter(Mandatory=$false)]
+        [ValidateNotNullOrEmpty()]
+        [bool]
+        # if true, the runbook execution will only last for one next step (or one next step for each paralel runbook, if the execution reached a situation like that)
+        $StepMode = $false 
     )
 
     ########
@@ -3024,6 +3043,11 @@ function Start-SPOTRunbookJob {
     if ($Resume) {
         $FunctionParameters += @{
             Resume = $true
+        }
+    }
+    if ($StepMode) {
+        $FunctionParameters += @{
+            StepMode = $true
         }
     }
     $FunctionParams = @{
@@ -4073,6 +4097,19 @@ Param (
                 }
             }
         }
+        # make sure that the Credential parameter always has a PSCredential object at the end of last replace function
+        if ($i -eq "Credential") {
+            if ($RunbookStep.StepParameters.$i) {
+                if (($RunbookStep.StepParameters.$i).GetType().Name -ne "PSCredential") {
+                    Write-SPOTLog " >> ERROR: missing PSCredential object just before execution. Current Credential step parameter value: $($RunbookStep.StepParameters.$i | Out-String -Width 250)." -Output $false
+                    throw "Replace-SPOTVarsInRunbookStepJIT: missing PSCredential object before execution!"
+                }
+            }
+            else {
+                Write-SPOTLog " >> ERROR: missing PSCredential object just before execution. Current Credential step parameter is empty." -Output $false
+                throw "Replace-SPOTVarsInRunbookStepJIT: missing PSCredential object before execution!"
+            }
+        }
     }
 
     # VariablesToPublish
@@ -4287,6 +4324,19 @@ Param (
                             
                         }
                     }
+                }
+            }
+            # make sure that the Credential parameter always has a PSCredential object at the end of last replace function
+            if ($i -eq "Credential") {
+                if ($Runbook.RemoteParameters.$i) {
+                    if (($Runbook.RemoteParameters.$i).GetType().Name -ne "PSCredential") {
+                        Write-SPOTLog " >> ERROR: missing PSCredential object just before execution. Current Credential remote parameter value: $($RunbookStep.StepParameters.$i | Out-String -Width 250)." -Output $false
+                        throw "Replace-SPOTVarsInRunbookJIT: missing PSCredential object before execution!"
+                    }
+                }
+                else {
+                    Write-SPOTLog " >> ERROR: missing PSCredential object just before execution. Current Credential remote parameter is empty." -Output $false
+                    throw "Replace-SPOTVarsInRunbookJIT: missing PSCredential object before execution!"
                 }
             }
         }
@@ -5579,6 +5629,9 @@ public class HostKeyHandler
     #########################
     if ($sftp.GetType().Name -eq "SftpClient" -and $sftp.IsConnected -eq $true) {
         #########################
+        # set a safe keepalive interval
+        $sftp.KeepAliveInterval = [timespan]::FromSeconds(60)
+        #########################
         # return the session object
         Write-SPOTLog "===== Function New-SPOTSFTPSession for the target ""$TargetIP"" successfull and returning the session object =====" -Output $false -DBG $true
         return $sftp
@@ -5844,6 +5897,9 @@ public class HostKeyHandler
 
     #########################
     if ($sshClient.GetType().Name -eq "SshClient" -and $sshClient.IsConnected -eq $true) {
+        #########################
+        # set a safe keepalive interval
+        $sshClient.KeepAliveInterval = [timespan]::FromSeconds(60)
         #########################
         # return the session object
         Write-SPOTLog "===== Function New-SPOTSSHSession for the target ""$TargetIP"" successfull and returning the session object =====" -Output $false -DBG $true

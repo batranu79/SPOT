@@ -3,6 +3,9 @@
 # v1.1 - 17.05.2026 - fixed the Upload-FolderSFTP recursive call; 
 #                   - updated the Execute-SSHScript and Execute-TelnetScript to work with the updated Replace-SPOTLineVars
 # v1.2 - 31.08.2026 - small correction in all functions; added functions Reboot-LinuxComputer and Reboot-WindowsComputer
+# v1.3 - 03.10.2026 - added elevation support for the Execute-BashScript and Execute-SSHScript functions
+#                   - added SysV parameter in the Reboot-LinuxComputer function and corrected TrustedHostsFilePath handling
+#                   - improved output processing in Execute-SSHScript and Execute-BashScript
 #
 #
 #
@@ -1629,6 +1632,16 @@ Specifies the overall timeout of the bash script execution, in seconds.
 .PARAMETER Credential
 Specifies the credential to connect to the remote system.
 
+.PARAMETER ElevationCommand
+Specifies the command to be used to obtain elevation for the user specified in the Credential parameter
+If this parameter is specified, the elevation will be attempted.
+
+.PARAMETER ElevationPassword
+Specifies the password needed for the elevation. It is only used if the ElevationCommand parameter is set.
+If the ElevationPassword is not specified, the password of the user from the Credential parameter will be attempted.
+If the ElevationPassword parameter is specified, it will be used for elevation.
+If a null ElevationPassword is specified, no password will be sent after the elevation command.
+
 .PARAMETER TrustedHostsFilePath
 Specifies the file path for a SPOT Trusted Hosts csv file to be used for SSH key validation.
 If this parameter is not specified or empty, the SSH key validation is not enabled.
@@ -1680,7 +1693,7 @@ The overall script execution stops if more than 60 seconds pass.
         [ValidateNotNullOrEmpty()]
         [string[]]
         # the input data to be used for the bash script input requests (on each array element split input prompt match string and value to be provided by %_%)
-        $InputData, 
+        $InputData,
         [Parameter(Mandatory=$false)]
         [ValidateNotNullOrEmpty()]
         [string]
@@ -1701,6 +1714,16 @@ The overall script execution stops if more than 60 seconds pass.
         [string]
         # the path to the TrustedHosts file
         $TrustedHostsFilePath,
+        [Parameter(Mandatory=$false)]
+        [ValidateNotNullOrEmpty()]
+        [string]
+        # the elevation command required by the user specified in the Credential parameter
+        $ElevationCommand,
+        [Parameter(Mandatory=$false)]
+        [AllowNull()]
+        [SecureString]
+        # the elevation password required by the user specified in the Credential parameter; needed only if different from the current user password 
+        $ElevationPassword,
         [Parameter(Mandatory=$false)]
         [string]
         # the local path to the Renci.SSHNet.dll file
@@ -1799,6 +1822,35 @@ The overall script execution stops if more than 60 seconds pass.
     $_spot_BashOutput += $_spot_InitialOutput
 
     ################################################
+    # perform the elevation, if set in the parameters
+    if ($ElevationCommand) {
+        # elevation requested; attempting it
+        Write-SPOTLog "INFO: Elevation requested by parameter. Attempting it!" -DBG $true
+        $_spot_SSHStream.WriteLine($ElevationCommand)
+        Start-Sleep -Seconds 1
+        $_spot_BashOutput += $_spot_SSHStream.Read()
+        # manage the elevation password
+        if ($PSBoundParameters.ContainsKey('ElevationPassword')) {
+            if ($ElevationPassword) {
+                # use the elevation password provided in the parameter
+                Write-SPOTLog "INFO: Elevation password provided. Using it." -DBG $true
+                $_spot_SSHStream.WriteLine([Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($ElevationPassword)))
+            }
+            else {
+                # the elevation password was explicitly set to null
+                Write-SPOTLog "INFO: Elevation password set explicitly to null >> no elevation password should be needed." -DBG $true
+            }
+        }
+        else {
+            # the elevation password was not set; using the current user password
+            Write-SPOTLog "INFO: Elevation password not provided. Using the current user password." -DBG $true
+            $_spot_SSHStream.WriteLine($Credential.GetNetworkCredential().Password)
+        }
+        Start-Sleep -Seconds 1
+        $_spot_BashOutput += $_spot_SSHStream.Read()
+    }
+
+    ################################################
     # set the script as executable
     $_spot_SSHStream.WriteLine("cd $_spot_RemotePath; chmod +x ./$_spot_RemoteName && echo true || echo false")
     Start-Sleep -Milliseconds 200
@@ -1849,7 +1901,7 @@ The overall script execution stops if more than 60 seconds pass.
         $_spot_LastLine = $null
         $_spot_LastLine2 = $null
         $_spot_StopTime = $null
-        $_spot_found = $_spot_SSHStream.Expect($_spot_ExpectString,(New-TimeSpan -Seconds $_spot_ScriptTimeout))
+        $_spot_found = $_spot_SSHStream.Expect($_spot_ExpectString,(New-TimeSpan -Seconds $_spot_ScriptTimeout), 8192)
         if ($_spot_found) {
             $_spot_StopTime = Get-Date
             # get any extra output after the 2 second threshold to make sure this is not a false positive (read meanwhile in order not to loose potential content from the buffer)
@@ -2112,6 +2164,16 @@ Specifies the collection of Published Variables, for replacement inside script p
 .PARAMETER RPars
 Specifies the collection of Runbook Parameters, for replacement inside script purposes.
 
+.PARAMETER ElevationCommand
+Specifies the command to be used to obtain elevation for the user specified in the Credential parameter
+If this parameter is specified, the elevation will be attempted.
+
+.PARAMETER ElevationPassword
+Specifies the password needed for the elevation. It is only used if the ElevationCommand parameter is set.
+If the ElevationPassword is not specified, the password of the user from the Credential parameter will be attempted.
+If the ElevationPassword parameter is specified, it will be used for elevation.
+If a null ElevationPassword is specified, no password will be sent after the elevation command.
+
 .INPUTS
 None. You can't pipe objects to Execute-SSHScript.
 
@@ -2186,7 +2248,17 @@ The path to the SshNet tool and the $SecVars are not specified, as it should whe
         [Parameter(Mandatory=$false)]
         [hashtable]
         # the collection of Runbook Parameters, for replacement inside script purposes
-        $RPars
+        $RPars,
+        [Parameter(Mandatory=$false)]
+        [ValidateNotNullOrEmpty()]
+        [string]
+        # the elevation command required by the user specified in the Credential parameter
+        $ElevationCommand,
+        [Parameter(Mandatory=$false)]
+        [AllowNull()]
+        [SecureString]
+        # the elevation password required by the user specified in the Credential parameter; needed only if different from the current user password 
+        $ElevationPassword
         )
     
     # the scripts called by this function should contain on each line to be executed with prompt expect the separation string %_% followed by the expected prompt, or relevant part of the prompt
@@ -2269,25 +2341,62 @@ The path to the SshNet tool and the $SecVars are not specified, as it should whe
         $_spot_FullOutput += $SSHStream.Read() -split '\r?\n'
     }
 
+    ################################################
+    # perform the elevation, if set in the parameters
+    if ($ElevationCommand) {
+        # elevation requested; attempting it
+        Write-SPOTLog "INFO: Elevation requested by parameter. Attempting it!" -DBG $true
+        $SSHStream.WriteLine($ElevationCommand)
+        Start-Sleep -Seconds 1
+        $_spot_FullOutput += $SSHStream.Read() -split '\r?\n'
+        # manage the elevation password
+        if ($PSBoundParameters.ContainsKey('ElevationPassword')) {
+            if ($ElevationPassword) {
+                # use the elevation password provided in the parameter
+                Write-SPOTLog "INFO: Elevation password provided. Using it." -DBG $true
+                $SSHStream.WriteLine([Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($ElevationPassword)))
+            }
+            else {
+                # the elevation password was explicitly set to null
+                Write-SPOTLog "INFO: Elevation password set explicitly to null >> no elevation password should be needed." -DBG $true
+            }
+        }
+        else {
+            # the elevation password was not set; using the current user password
+            Write-SPOTLog "INFO: Elevation password not provided. Using the current user password." -DBG $true
+            $SSHStream.WriteLine($Credential.GetNetworkCredential().Password)
+        }
+        Start-Sleep -Seconds 1
+        $_spot_FullOutput += $SSHStream.Read() -split '\r?\n'
+    }
+
     ######################
     # starting to process the script lines
     foreach ($i in $NewScript) {
         $LineOutput = $null
         $found = $null
         $CommandSet = $i -split "%_%"
+        ###########
+        # periodic check after each line that the ssh session is still connected
+        if (!$SSHSession.IsConnected) {
+            Write-SPOTLog "ERROR: SSH session found disconnected after the last command line!"
+            throw "Execute-SSHScript: SSH session found disconnected!"
+        }
         if ($CommandSet.Count -eq 1) {
             #### WARNING!!! #### the current line may contain secrets and if the Debug setting is on, they will appear in the logs.
             Write-SPOTLog "Executing current command line ""$i"" with timeout ""$Timeout""." -DBG $true
             $SSHStream.WriteLine($i)
             # get the command itself (one line) and put it in the full output
             $_spot_FullOutput += $SSHStream.ReadLine()+"`n"
-            # wait the timeout
-            Start-Sleep -Seconds $Timeout
-            # get the command output
-            while ($SSHStream.DataAvailable) {
-                $LineOutput += $SSHStream.Read()
+            # process output data until timeout
+            $Deadline = (Get-Date) + (New-TimeSpan -Seconds $Timeout)
+            while ((Get-Date) -le $Deadline) {
+                Start-Sleep -Seconds 3
+                while ($SSHStream.DataAvailable) {
+                    $LineOutput += $SSHStream.Read()
+                }
             }
-            # wait a little then get the output again, just in case of a small output pause
+            # wait a little then get the output again, in case the deadline was smaller than the 3 seconds iteration above
             Start-Sleep -Milliseconds 200
             while ($SSHStream.DataAvailable) {
                 $LineOutput += $SSHStream.Read()
@@ -2306,7 +2415,7 @@ The path to the SshNet tool and the $SecVars are not specified, as it should whe
             # get the command itself (one line) and put it in the full output (not also in COO as this is the command)
             $_spot_FullOutput += $SSHStream.ReadLine()+"`n"
             # start with the expect 
-            $found = $SSHStream.Expect($CommandSet[0],(New-TimeSpan -Seconds $ExpectTimeout))
+            $found = $SSHStream.Expect($CommandSet[0],(New-TimeSpan -Seconds $ExpectTimeout), 8192)
 	
             if ($found) {
                 Write-SPOTLog "Expect string ""$($CommandSet[0])"" found." -DBG $true
@@ -2725,6 +2834,7 @@ Triggers remotely a restart of a Linux computer and waits for the startup to fin
 .DESCRIPTION
 The target Linux remote computer is restarted over SSH and then it is checked for completion of the restart
 using the "systemctl is-system-running" command or testing the "runlevel", depending on the type of Linux.
+The used user must be configured for sudo.
 
 .PARAMETER TargetComputer
 Specifies the IP Address or hostname of the target Linux computer.
@@ -2734,6 +2844,10 @@ Specifies the SSH Port to be used, in case it is not the standard one.
 
 .PARAMETER Credential
 Specifies the SSH credential to be used for remote authentication.
+
+.PARAMETER SysV
+Specifies that the target linux system is using the old style sysvinit.
+The default value is $false, meaning that the target system is using the newer systemd init.
 
 .PARAMETER TrustedHostsFilePath
 Specifies the file path for a SPOT Trusted Hosts csv file to be used for SSH key validation.
@@ -2780,6 +2894,11 @@ In this example the target computer "192.168.0.2" is restarted using the custom 
         [System.Management.Automation.PSCredential]
         # the SSH credential to be used for remote authentication
         $Credential,
+        [Parameter(Mandatory=$false)]
+        [ValidateNotNullOrEmpty()]
+        [bool]
+        # specify that the target linux system is using the old style sysvinit
+        $SysV = $false,
         [Parameter(Mandatory=$false)]
         [AllowNull()]
         [string]
@@ -2884,7 +3003,8 @@ exit "$reboot_status"
 '@ -replace "`r`n", "`n"
     
     ################
-    $RemoteStartupScript = @'
+    if ($SysV) {
+        $RemoteStartupScript = @'
 #!/bin/bash
 
 # Maximum time to wait for boot completion, in seconds.
@@ -2893,50 +3013,26 @@ BOOT_TIMEOUT="${1:-300}"
 wait_for_boot_complete() {
     local start_time=$SECONDS
 
-    # systemd
-    if [ -d /run/systemd/system ] &&
-       [ "$(ps -p 1 -o comm= 2>/dev/null)" = "systemd" ]; then
+    echo "Waiting for SysV runlevel..."
 
-        echo "Waiting for systemd..."
+    while :; do
+        rl="$(runlevel 2>/dev/null | awk '{print $2}')"
 
-        while :; do
-            case "$(systemctl is-system-running 2>/dev/null)" in
-                running|degraded)
-                    echo "systemd startup complete"
-                    return 0
-                    ;;
-            esac
+        case "$rl" in
+            2|3|4|5)
+                echo "Runlevel $rl reached"
+                return 0
+                ;;
+        esac
 
-            if (( SECONDS - start_time >= BOOT_TIMEOUT )); then
-                echo "ERROR: Timed out waiting for systemd startup" >&2
-                return 1
-            fi
+        if (( SECONDS - start_time >= BOOT_TIMEOUT )); then
+            echo "ERROR: Timed out waiting for SysV runlevel" >&2
+            return 1
+        fi
 
-            sleep 1
-        done
+        sleep 1
+    done
 
-    # SysV init
-    else
-        echo "Waiting for SysV runlevel..."
-
-        while :; do
-            rl="$(runlevel 2>/dev/null | awk '{print $2}')"
-
-            case "$rl" in
-                2|3|4|5)
-                    echo "Runlevel $rl reached"
-                    return 0
-                    ;;
-            esac
-
-            if (( SECONDS - start_time >= BOOT_TIMEOUT )); then
-                echo "ERROR: Timed out waiting for SysV runlevel" >&2
-                return 1
-            fi
-
-            sleep 1
-        done
-    fi
 }
 
 if ! wait_for_boot_complete; then
@@ -2946,6 +3042,45 @@ fi
 
 echo "OS_STARTUP_COMPLETE"
 '@ -replace "`r`n", "`n"
+    }
+    else {
+        $RemoteStartupScript = @'
+#!/bin/bash
+
+# Maximum time to wait for boot completion, in seconds.
+BOOT_TIMEOUT="${1:-300}"
+
+wait_for_boot_complete() {
+    local start_time=$SECONDS
+
+    echo "Waiting for systemd..."
+
+    while :; do
+        case "$(systemctl is-system-running 2>/dev/null)" in
+            running|degraded)
+                echo "systemd startup complete"
+                return 0
+                ;;
+        esac
+
+        if (( SECONDS - start_time >= BOOT_TIMEOUT )); then
+            echo "ERROR: Timed out waiting for systemd startup" >&2
+            return 1
+        fi
+
+        sleep 1
+    done
+
+}
+
+if ! wait_for_boot_complete; then
+    echo "ERROR: OS_STARTUP_INCOMPLETE" >&2
+    exit 1
+fi
+
+echo "OS_STARTUP_COMPLETE"
+'@ -replace "`r`n", "`n"
+    }
 
     #endregion: bash scripts
 
@@ -2955,7 +3090,7 @@ echo "OS_STARTUP_COMPLETE"
 
     #################################
     # create a SSH Session to the target IP
-    $SSHSession = New-SPOTSSHSession -TargetIP $TargetComputer -Port $Port -Credential $Credential
+    $SSHSession = New-SPOTSSHSession -TargetIP $TargetComputer -Port $Port -Credential $Credential -TrustedHostsFilePath $TrustedHostsFilePath
     Write-SPOTLog "Connected over SSH to the target Linux computer." -DBG $true
 
     #################################
@@ -3203,7 +3338,7 @@ echo "OS_STARTUP_COMPLETE"
     while ($true) {
         Start-Sleep -Seconds 5
         try {
-            $SSHSession = New-SPOTSSHSession -TargetIP $TargetComputer -Port $Port -Credential $Credential
+            $SSHSession = New-SPOTSSHSession -TargetIP $TargetComputer -Port $Port -Credential $Credential -TrustedHostsFilePath $TrustedHostsFilePath
         }
         catch {
             Write-SPOTLog "Attempt failed to connect over SSH: $_." -DBG $true

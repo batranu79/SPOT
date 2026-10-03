@@ -48,3 +48,19 @@
 ### Changed
 - small error handling correction in all SPOT Built-in step functions
 
+## [1.1.3] - 03.10.2026
+
+### Added
+- added support for Step Mode execution in the GUI function
+- added unblock of the source files for Extend-SPOTCapability function and the SPOT-Installer script
+- added a safe keepalive setting in New-SPOTSFTPSession and New-SPOTSSHSession functions
+- added elevation support for the Execute-BashScript and Execute-SSHScript step functions
+- added SysV parameter in the Reboot-LinuxComputer step function
+
+### Changed
+- improved JIT variable replacement function to validate Credential parameters for type
+- improved output processing in Execute-SSHScript and Execute-BashScript step functions
+
+### Fixed
+- fixed issue when certain Published Variable objects do not display either value or object type in the GUI
+- fixed TrustedHostsFilePath handling in Reboot-LinuxComputer step function

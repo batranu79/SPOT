@@ -1,7 +1,7 @@
 # SPOT Installer Script 
 # v1.0 - 26.04.2026 - initial version
 # v1.1 - 17.05.2026 - fixed the "latest" SPOT Version detection; other minor improvements
-#
+# v1.2 - 27.09.2026 - added unblock of the source files before installation and improved error handling
 #
 #
 ######################################################################################################################
@@ -107,7 +107,7 @@ if ($PSCmdlet.ParameterSetName -in ('InstallFromInternet','CreateSPOTPackage')) 
         # validate the provided version number
         if ($SPOTVersion -notmatch '^\d+\.\d+\.\d+$') {
             Write-Output " > ERROR: the provided SPOT version is not valid ""$SPOTVersion"". It must be a 3 digit version number. Cannot continue."
-            return $false
+            throw "SPOT-Installer: invalid SPOT version number"
         }
     }
 }
@@ -119,10 +119,12 @@ function Extract-Archive {
     Param (
     [Parameter(Mandatory=$true)]
     [String]
-    $TargetFolder, # The folder which will be archived
+    # The folder which will be archived
+    $TargetFolder, 
     [Parameter(Mandatory=$true)]
     [String]
-    $ZipPath # The path to the Zip archive
+    # The path to the Zip archive
+    $ZipPath 
     )
 
     # extract the archive
@@ -135,10 +137,12 @@ function Create-Archive {
     Param (
     [Parameter(Mandatory=$true)]
     [String]
-    $TargetFolder, # The folder which will be archived
+    # The folder which will be archived
+    $TargetFolder, 
     [Parameter(Mandatory=$true)]
     [String]
-    $ZipPath # The path to the Zip archive
+    # The path to the Zip archive
+    $ZipPath 
     )
 
     # create the archive
@@ -151,7 +155,8 @@ function Download-SPOTPackages {
     Param (
     [Parameter(Mandatory=$true)]
     [String]
-    $TargetFolder # The folder where the packages will be downloaded
+    # The folder where the packages will be downloaded
+    $TargetFolder 
     )
 
     ####################
@@ -172,7 +177,7 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
     [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-    ####################
+    ################################
     # download SPOT
     Write-Output " > Downloading SPOT version ""$SPOTVersion""."
     if ($SPOTVersion -eq "latest") {
@@ -185,7 +190,7 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
             }
             catch {
                 Write-Output " >> ERROR: while parsing the HTTP response from the SPOT URL: $_"
-                return $false
+                throw "SPOT-Installer: error detecting latest SPOT version"
             }
             if ($PkgName -match "spot.(?<version>.*).nupkg") {
                 $SPOTVersion = $matches['version']
@@ -193,13 +198,13 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
             }
             else {
                 Write-Output " >> ERROR: unrecognized spot package name returned: $PkgName"
-                return $false
+                throw "SPOT-Installer: error detecting latest SPOT version"
             }
             
         }
         else {
             Write-Output " >> ERROR: could not get SPOT version data automatically. Unsuccessful status code returned: $($WebResponse.StatusCode)"
-            return $false
+            throw "SPOT-Installer: error detecting latest SPOT version"
         }
     }
     
@@ -215,10 +220,14 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
         Write-Output " >> ERROR: while downloading SPOT: $_."
         Write-Output " >> Cannot continue."
         Remove-Item -Path $TargetFolder -Recurse -Force -Confirm:$false
-        return $false
+        throw "SPOT-Installer: error downloading SPOT"
     }
 
     ####################
+    # unblock the archive file
+    Unblock-File -Path "$TargetFolder\SPOT.$SPOTVersion.zip" -Confirm:$false
+
+    ################################
     # download powershell-yaml 0.4.12
     Write-Output " > Downloading powershell-yaml version 0.4.12."
     $YamlURI = "https://www.powershellgallery.com/api/v2/package/powershell-yaml/0.4.12"
@@ -229,10 +238,14 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
         Write-Output " >> ERROR: while downloading powershell-yaml: $_."
         Write-Output " >> Cannot continue."
         Remove-Item -Path $TargetFolder -Recurse -Force -Confirm:$false
-        return $false
+        throw "SPOT-Installer: error downloading powershell-yaml"
     }
 
     ####################
+    # unblock the archive file
+    Unblock-File -Path "$TargetFolder\powershell-yaml.0.4.12.zip" -Confirm:$false
+
+    ################################
     # download secretstore 1.0.6
     Write-Output " > Downloading secretstore version 1.0.6."
     $SecStoreURI = "https://www.powershellgallery.com/api/v2/package/Microsoft.PowerShell.SecretStore/1.0.6"
@@ -243,10 +256,14 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
         Write-Output " >> ERROR: while downloading secretstore: $_."
         Write-Output " >> Cannot continue."
         Remove-Item -Path $TargetFolder -Recurse -Force -Confirm:$false
-        return $false
+        throw "SPOT-Installer: error downloading secretstore"
     }
 
     ####################
+    # unblock the archive file
+    Unblock-File -Path "$TargetFolder\microsoft.powershell.secretstore.1.0.6.zip" -Confirm:$false
+
+    ################################
     # download secretmanagement 1.1.2
     Write-Output " > Downloading secretmanagement version 1.1.2."
     $SecMgmtURI = "https://www.powershellgallery.com/api/v2/package/Microsoft.PowerShell.SecretManagement/1.1.2"
@@ -257,10 +274,14 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
         Write-Output " >> ERROR: while downloading secretmanagement: $_."
         Write-Output " >> Cannot continue."
         Remove-Item -Path $TargetFolder -Recurse -Force -Confirm:$false
-        return $false
+        throw "SPOT-Installer: error downloading secretmanagement"
     }
 
     ####################
+    # unblock the archive file
+    Unblock-File -Path "$TargetFolder\microsoft.powershell.secretmanagement.1.1.2.zip" -Confirm:$false
+
+    ################################
     # download PSTools
     Write-Output " > Downloading PSTools."
     $PSToolsURI = "https://download.sysinternals.com/files/PSTools.zip"
@@ -271,10 +292,14 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
         Write-Output " >> ERROR: while downloading PSTools: $_."
         Write-Output " >> Cannot continue."
         Remove-Item -Path $TargetFolder -Recurse -Force -Confirm:$false
-        return $false
+        throw "SPOT-Installer: error downloading PSTools"
     }
 
     ####################
+    # unblock the archive file
+    Unblock-File -Path "$TargetFolder\PSTools.zip" -Confirm:$false
+
+    ################################
     # download Posh-SSH 3.2.7
     Write-Output " > Downloading Posh-SSH version 3.2.7."
     $PoshSSHURI = "https://www.powershellgallery.com/api/v2/package/Posh-SSH/3.2.7"
@@ -285,10 +310,14 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
         Write-Output " >> ERROR: while downloading Posh-SSH: $_."
         Write-Output " >> Cannot continue."
         Remove-Item -Path $TargetFolder -Recurse -Force -Confirm:$false
-        return $false
+        throw "SPOT-Installer: error downloading Posh-SSH"
     }
 
     ####################
+    # unblock the archive file
+    Unblock-File -Path "$TargetFolder\posh-ssh.3.2.7.zip" -Confirm:$false
+
+    ################################
     # Notepad++
     Write-Output " > Downloading Notepad++ version 8.7.5."
     $NppURI = "https://github.com/notepad-plus-plus/notepad-plus-plus/releases/download/v8.7.5/npp.8.7.5.Installer.x64.exe"
@@ -299,15 +328,20 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
         Write-Output " >> ERROR: while downloading Notepad++: $_."
         Write-Output " >> Cannot continue."
         Remove-Item -Path $TargetFolder -Recurse -Force -Confirm:$false
-        return $false
+        throw "SPOT-Installer: error downloading Notepad++"
     }
+
+    ####################
+    # unblock the package file
+    Unblock-File -Path "$TargetFolder\npp.8.7.5.Installer.x64.exe" -Confirm:$false
 }
 
 function Install-SPOTPackages {
     Param (
     [Parameter(Mandatory=$true)]
     [String]
-    $SourceFolder # The folder from where the packages will be installed
+    # The folder from where the packages will be installed
+    $SourceFolder 
     )
 
     #########################################
@@ -321,7 +355,7 @@ function Install-SPOTPackages {
     }
     else {
         Write-Output " >> The Source Folder ""$SourceFolder"" was not detected. Cannot continue."
-        return $false
+        throw "SPOT-Installer: source folder not detected"
     }
 
     ####################
@@ -332,7 +366,19 @@ function Install-SPOTPackages {
     }
     else {
         Write-Output " >> No SPOT Package was detected inside the Source Folder ""$SourceFolder"". Cannot continue."
-        return $false
+        throw "SPOT-Installer: SPOT package not detected"
+    }
+
+    ####################
+    # check if all other expected archive files are present
+    if (!(Test-Path -Path "$SourceFolder\powershell-yaml.0.4.12.zip" -PathType Leaf) -or `
+        !(Test-Path -Path "$SourceFolder\microsoft.powershell.secretstore.1.0.6.zip" -PathType Leaf) -or `
+        !(Test-Path -Path "$SourceFolder\microsoft.powershell.secretmanagement.1.1.2.zip" -PathType Leaf) -or `
+        !(Test-Path -Path "$SourceFolder\PSTools.zip" -PathType Leaf) -or `
+        !(Test-Path -Path "$SourceFolder\posh-ssh.3.2.7.zip" -PathType Leaf) -or `
+        !(Get-ChildItem -Path $SourceFolder -Filter "*npp*Installer*.exe")) {
+        Write-Output " >> ERROR: not all source files were detected in the source folder. Cannot continue."
+        throw "SPOT-Installer: missing source files"
     }
 
     ####################
@@ -357,6 +403,7 @@ function Install-SPOTPackages {
         if (Test-Path -Path "$env:ProgramFiles\WindowsPowerShell\Modules\SPOT\$SPOTVersion" -PathType Container) {
             Remove-Item -Path "$env:ProgramFiles\WindowsPowerShell\Modules\SPOT\$SPOTVersion" -Recurse -Force -Confirm:$false
         }
+        Unblock-File -Path "$SourceFolder\SPOT.$SPOTVersion.zip" -Confirm:$false
         Extract-Archive -ZipPath "$SourceFolder\SPOT.$SPOTVersion.zip" -TargetFolder "$env:ProgramFiles\WindowsPowerShell\Modules\SPOT\$SPOTVersion"
         Write-Output " >> The PowerShell module ""SPOT"" version ""$SPOTVersion"" was installed."
     }
@@ -383,6 +430,7 @@ function Install-SPOTPackages {
         if (Test-Path -Path "$env:ProgramFiles\WindowsPowerShell\Modules\powershell-yaml\0.4.12" -PathType Container) {
             Remove-Item -Path "$env:ProgramFiles\WindowsPowerShell\Modules\powershell-yaml\0.4.12" -Recurse -Force -Confirm:$false
         }
+        Unblock-File -Path "$SourceFolder\powershell-yaml.0.4.12.zip" -Confirm:$false
         Extract-Archive -ZipPath "$SourceFolder\powershell-yaml.0.4.12.zip" -TargetFolder "$env:ProgramFiles\WindowsPowerShell\Modules\powershell-yaml\0.4.12"
         Write-Output " >> The PowerShell module ""powershell-yaml"" version ""4.0.12"" was installed."
     }
@@ -410,6 +458,7 @@ function Install-SPOTPackages {
         if (Test-Path -Path "$env:ProgramFiles\WindowsPowerShell\Modules\microsoft.powershell.secretstore\1.0.6" -PathType Container) {
             Remove-Item -Path "$env:ProgramFiles\WindowsPowerShell\Modules\microsoft.powershell.secretstore\1.0.6" -Recurse -Force -Confirm:$false
         }
+        Unblock-File -Path "$SourceFolder\microsoft.powershell.secretstore.1.0.6.zip" -Confirm:$false
         Extract-Archive -ZipPath "$SourceFolder\microsoft.powershell.secretstore.1.0.6.zip" -TargetFolder "$env:ProgramFiles\WindowsPowerShell\Modules\microsoft.powershell.secretstore\1.0.6"
         Write-Output " >> The PowerShell module ""microsoft.powershell.secretstore"" version ""1.0.6"" was installed."
     }
@@ -437,6 +486,7 @@ function Install-SPOTPackages {
         if (Test-Path -Path "$env:ProgramFiles\WindowsPowerShell\Modules\microsoft.powershell.secretmanagement\1.1.2" -PathType Container) {
             Remove-Item -Path "$env:ProgramFiles\WindowsPowerShell\Modules\microsoft.powershell.secretmanagement\1.1.2" -Recurse -Force -Confirm:$false
         }
+        Unblock-File -Path "$SourceFolder\microsoft.powershell.secretmanagement.1.1.2.zip" -Confirm:$false
         Extract-Archive -ZipPath "$SourceFolder\microsoft.powershell.secretmanagement.1.1.2.zip" -TargetFolder "$env:ProgramFiles\WindowsPowerShell\Modules\microsoft.powershell.secretmanagement\1.1.2"
         Write-Output " >> The PowerShell module ""microsoft.powershell.secretmanagement"" version ""1.1.2"" was installed."
     }
@@ -458,6 +508,7 @@ function Install-SPOTPackages {
             if (Test-Path -Path "$SourceFolder\PSTools" -PathType Container) {
                 Remove-Item -Path "$SourceFolder\PSTools" -Recurse -Force -Confirm:$false
             }
+            Unblock-File -Path "$SourceFolder\PSTools.zip" -Confirm:$false
             # extract
             Extract-Archive -ZipPath "$SourceFolder\PSTools.zip" -TargetFolder "$SourceFolder\PSTools"
             # copy only the needed files
@@ -522,6 +573,7 @@ function Install-SPOTPackages {
             if (Test-Path -Path "$SourceFolder\SshNet" -PathType Container) {
                 Remove-Item -Path "$SourceFolder\SshNet" -Recurse -Force -Confirm:$false
             }
+            Unblock-File -Path "$SourceFolder\posh-ssh.3.2.7.zip" -Confirm:$false
             # extract
             Extract-Archive -ZipPath "$SourceFolder\posh-ssh.3.2.7.zip" -TargetFolder "$SourceFolder\SshNet"
             # copy only the needed files
@@ -542,6 +594,7 @@ function Install-SPOTPackages {
         Write-Output " >> The Nodepad++ not detected. Will install."
         # install notepad++
         $setup = (Get-ChildItem -Path $SourceFolder -Filter "*npp*Installer*.exe" | Select-Object -First 1).FullName
+        Unblock-File -Path $setup -Confirm:$false
         $arguments = "/S"
         $proc = Start-Process $setup -ArgumentList $arguments -NoNewWindow -PassThru -Wait
 
@@ -570,7 +623,7 @@ switch ($PSCmdlet.ParameterSetName) {
         catch {
             Write-Output "ERROR: while checking internet connectivity: $_."
             Write-Output "Cannot continue."
-            return $false
+            throw "SPOT-Installer: internet connectivity check failed"
         }
 
         ####################
@@ -585,9 +638,9 @@ switch ($PSCmdlet.ParameterSetName) {
         # check if the download was successfull
         if (!(Test-Path -Path $TempFolder.FullName -PathType Container)) {
             Write-Output " >> There was an error while downloading the packages. Cannot continue."
-            return $false
+            throw "SPOT-Installer: source folder not detected after download"
         }
-        
+
         ####################
         # call the Install function
         Install-SPOTPackages -SourceFolder $TempFolder.FullName
@@ -610,8 +663,12 @@ switch ($PSCmdlet.ParameterSetName) {
         }
         else {
             Write-Output "ERROR: the provided SPOT package path ""$SPOTPackagePath"" is not detected. Cannot continue."
-            return $false
+            throw "SPOT-Installer: source package file not detected"
         }
+
+        ####################
+        # unblock the source package archive file
+        Unblock-File -Path $SPOTPackagePath -Confirm:$false
 
         ####################
         # create temp folder
@@ -643,7 +700,7 @@ switch ($PSCmdlet.ParameterSetName) {
         # check the $SPOTPackagePath
         if (Test-Path -Path $SPOTPackagePath -PathType Leaf) {
             Write-Output "The provided SPOT package path ""$SPOTPackagePath"" already exists. Cannot continue."
-            return $false
+            throw "SPOT-Installer: target package path already exists"
         }
         if ([System.IO.Path]::GetExtension($SPOTPackagePath) -ne '.zip') {
             Write-Output " > WARNING: The provided SPOT package path ""$SPOTPackagePath"" does not have the "".zip"" extension."
@@ -662,7 +719,7 @@ switch ($PSCmdlet.ParameterSetName) {
         # check if the download was successfull
         if (!(Test-Path -Path $TempFolder.FullName -PathType Container)) {
             Write-Output " >> There was an error while downloading the packages. Cannot continue."
-            return $false
+            throw "SPOT-Installer: source folder not detected after download"
         }
 
         ####################
@@ -673,6 +730,10 @@ switch ($PSCmdlet.ParameterSetName) {
         ####################
         # delete the temp folder
         Remove-Item -Path $TempFolder.FullName -Recurse -Force -Confirm:$false
+
+        ####################
+        # unblock the source package archive file
+        Unblock-File -Path $SPOTPackagePath -Confirm:$false
 
         ####################
         Write-Output "Finished SPOT-Installer script with the action ""$($PSCmdlet.ParameterSetName)""."

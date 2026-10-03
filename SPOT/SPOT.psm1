@@ -11,6 +11,9 @@
 #                   - removed some unnecessary functions and improved Runbook loading and validations
 #                   - added support for references (including mixed strings) inside VariablesToPublish entries
 # v1.3 - 31.08.2026 - added support for UseSSL in PSSession based remote steps and runbooks
+# v1.4 - 03.10.2026 - fixed issue when certain Published Variable objects do not display either value or object type in the GUI
+#                   - added support for Step Mode execution in the GUI function
+#                   - included unblock of the source files for Extend-SPOTCapability function
 #
 #
 #
@@ -2971,7 +2974,20 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Confirm:$false -Forc
 			                <RowDefinition Height="*" />
 			                <RowDefinition Height="5" />
 		                </Grid.RowDefinitions>
-                        <Button Grid.Row="0" Name="StartStop" Height="25" Width="150" Content='Start' HorizontalAlignment="Center" Margin="3"/>
+                        <StackPanel Grid.Row="0"
+                                    Orientation="Horizontal"
+                                    HorizontalAlignment="Center">
+                            <Button Name="StartStop"
+                                    Height="25"
+                                    Width="150"
+                                    Content="Start"
+                                    Margin="3"/>
+                            <Button Name="StepButton"
+                                    Height="25"
+                                    Width="150"
+                                    Content="Step"
+                                    Margin="3"/>
+                        </StackPanel>
                         <ProgressBar Grid.Row="1" Name="ProgressBar" />    
                     </Grid>
                     
@@ -3078,6 +3094,7 @@ $window.Control_ProgressBar.Value = 0
 $window.Control_SmallProgressBar.Value = 0
 $window.Control_LoadProject.IsEnabled = $true
 $window.Control_StartStop.IsEnabled = $false
+$window.Control_StepButton.IsEnabled = $false
 $window.Control_LoadRunbook.IsEnabled = $false
 $window.Control_ComboRunbook.IsEnabled = $false
 $window.Control_LoadedRunbook.Content = 'Runbook:'
@@ -3274,7 +3291,7 @@ function Update-SPOTPublishedData {
         $sVal = $null
         # make sure the complex objects arrive deserialized, otherwise this may block the GUI
         $vValue = $PublishedData[$pvar]
-        if ($vValue -as [string]) {
+        if (($vValue -as [string]).Trim()) {
             $sVal = $vValue -as [string]
         }
         else {
@@ -3383,7 +3400,7 @@ function Show-SPOTRunbookStepDetails ( $GUID ) {
         }
         if ($RunbookStep.RunbookParameters) {
             foreach ($rbParam in $RunbookStep.RunbookParameters.GetEnumerator() ) {
-                if ($rbParam.Value -as [string]) {
+                if (($rbParam.Value -as [string]).Trim()) {
                     $StepDetailsData += [PSCustomObject]@{ 
                         Name  = $rbParam.Name; 
                         Value = $rbParam.Value -as [string];                
@@ -3805,7 +3822,7 @@ $window.Control_LoadProject.Add_Click({
             # OrchVars
             foreach ($var in $OrchVars.GetEnumerator()) {
                 if (!$var.Name.StartsWith("_") -and $var.Value.GetType().Name -ne "hashtable") {
-                    if ($var.Value -as [string]) {
+                    if (($var.Value -as [string]).Trim()) {
                         $ProjectDetailsData += [PSCustomObject]@{Name = $var.Name; Value = ($var.Value -as [string]); Type = "OrchVars Variables"}
                     }
                     else {
@@ -3908,8 +3925,8 @@ $window.Control_LoadRunbook.Add_Click({
 
     # set initial GUI status before the loading progress
     $Window.Control_SmallProgressBar.Value = 0
-    $Window.Control_LoadRunbook.Content = "Loading"
     $window.Control_LoadRunbook.IsEnabled = $false
+    $Window.Control_LoadRunbook.Content = "Loading"
     $Window.Control_LoadProject.IsEnabled = $false
     $window.Control_MainRunbook.ItemsSource = $null
     $window.Control_LoadedRunbook.Content = "Runbook:"
@@ -3917,6 +3934,7 @@ $window.Control_LoadRunbook.Add_Click({
     $window.Control_RunbookStepDetails.ItemsSource = $null
     $window.Control_PublishedData.ItemsSource = $null
     $window.Control_StartStop.IsEnabled = $false
+    $window.Control_StepButton.IsEnabled = $false
 
     # cleanup the existing runbook related objects
     $global:AllRunbooks = [hashtable]::Synchronized(@{})
@@ -3964,6 +3982,8 @@ $window.Control_LoadRunbook.Add_Click({
             $syncHash.window.Control_LoadedRunbook.Content = "Runbook: $SelectedRunbookName"
             $syncHash.window.Control_StartStop.IsEnabled = $true
             $syncHash.window.Control_StartStop.Content = "Start"
+            $syncHash.window.Control_StepButton.IsEnabled = $true
+            $syncHash.window.Control_StepButton.Content = "Step"
             $syncHash.window.Control_SmallProgressBar.Value = 100 
             $syncHash.window.Control_LoadRunbook.Content = "Load Runbook"
             $syncHash.window.Control_LoadRunbook.IsEnabled = $true
@@ -3987,8 +4007,10 @@ $window.Control_StartStop.Add_Click({
         Remove-Item -Path "$($OrchVars._ProjectPath)\__SPOT_Artefacts\*" -Recurse -ErrorAction SilentlyContinue
         # initialize related controls
         $window.Control_ProgressBar.Value = 0
-        $window.Control_StartStop.Content = "Stop"
         $window.Control_StartStop.IsEnabled = $true
+        $window.Control_StartStop.Content = "Stop"
+        $window.Control_StepButton.IsEnabled = $false
+        $window.Control_StepButton.Content = "Step(s) Executing"
         $window.Control_LoadRunbook.IsEnabled = $false
         $window.Control_LoadProject.IsEnabled = $false
         
@@ -4068,33 +4090,41 @@ $window.Control_StartStop.Add_Click({
             # if there are still steps in Initial state or steps in Error state that have the ContinueOnError disabled, rename button to Resume, else, rename the button to Start
             if (($AllRunbookSteps.Values.Where({($_.Status -eq "Initial") -and ($_.Disabled -eq $false)}).Count -ne 0) -or ($AllRunbookSteps.Values.Where({($_.Status -eq "Error") -and ($_.ContinueOnError -eq $false)}).Count -ne 0)) {
                 $syncHash.window.Control_StartStop.Dispatcher.invoke([action]{
-                    $syncHash.window.Control_StartStop.Content = "Resume" 
                     $syncHash.window.Control_StartStop.IsEnabled = $true
+                    $syncHash.window.Control_StartStop.Content = "Resume" 
+                    $syncHash.window.Control_StepButton.IsEnabled = $true
+                    $syncHash.window.Control_StepButton.Content = "Step" 
                     $syncHash.window.Control_LoadRunbook.IsEnabled = $true
                     $syncHash.window.Control_LoadProject.IsEnabled = $true
                 })
                 # interpret the main exit value
                 if ($TargetRunbook.ExitValue -eq $false) {
                     Write-SPOTConsole "Runbook ""$($TargetRunbook.Name)"" execution paused and returned failure."
+                    Write-SPOTLog "GUI: Runbook ""$($TargetRunbook.Name)"" execution paused and returned failure."
                 }
                 elseif ($TargetRunbook.ExitValue -eq $true) {
                     Write-SPOTConsole "Runbook ""$($TargetRunbook.Name)"" execution paused and returned success."
+                    Write-SPOTLog "GUI: Runbook ""$($TargetRunbook.Name)"" execution paused and returned success."
                 }
             }
             else {
                 # when completed, for a ReStart, load the runbook again to have it properly initialized; here, we stop the possible options to continue
                 $syncHash.window.Control_StartStop.Dispatcher.invoke([action]{
-                    $syncHash.window.Control_StartStop.Content = "Completed" 
                     $syncHash.window.Control_StartStop.IsEnabled = $false
+                    $syncHash.window.Control_StartStop.Content = "Completed" 
+                    $syncHash.window.Control_StepButton.IsEnabled = $false
+                    $syncHash.window.Control_StepButton.Content = "Step(s) Completed"
                     $syncHash.window.Control_LoadRunbook.IsEnabled = $true
                     $syncHash.window.Control_LoadProject.IsEnabled = $true
                     })
                 # interpret the main exit value
                 if ($TargetRunbook.ExitValue -eq $false) {
                     Write-SPOTConsole "Runbook ""$($TargetRunbook.Name)"" execution finished and returned failure."
+                    Write-SPOTLog "GUI: Runbook ""$($TargetRunbook.Name)"" execution finished and returned failure."
                 }
                 elseif ($TargetRunbook.ExitValue -eq $true) {
                     Write-SPOTConsole "Runbook ""$($TargetRunbook.Name)"" execution finished and returned success."
+                    Write-SPOTLog "GUI: Runbook ""$($TargetRunbook.Name)"" execution finished and returned success."
                 }
             }
         }
@@ -4107,8 +4137,10 @@ $window.Control_StartStop.Add_Click({
         # activate the stop flag in the OrchVars
         $OrchVars._StopFlag = $true
         # disable and change the name of the button to Stopping, while waiting for all running jobs to finish and stop runbook processing
-        $window.Control_StartStop.Content = "Stopping"
         $window.Control_StartStop.IsEnabled = $false
+        $window.Control_StartStop.Content = "Stopping"
+        $window.Control_StepButton.IsEnabled = $false
+        $window.Control_StepButton.Content = "Step(s) Stopping"
 
     }
     elseif ($Action -eq "Resume") {
@@ -4116,8 +4148,10 @@ $window.Control_StartStop.Add_Click({
         $OrchVars._StopFlag = $false
 
         # change the button label to Stop and make sure it is active
-        $window.Control_StartStop.Content = "Stop"
         $window.Control_StartStop.IsEnabled = $true
+        $window.Control_StartStop.Content = "Stop"
+        $window.Control_StepButton.IsEnabled = $false
+        $window.Control_StepButton.Content = "Step(s) Executing"
         $window.Control_LoadRunbook.IsEnabled = $false
         $window.Control_LoadProject.IsEnabled = $false
 
@@ -4185,15 +4219,277 @@ $window.Control_StartStop.Add_Click({
             # close and dispose the main worker pool
             $_spot_MainWorkerPool.Dispose()
 
-            # interpret the main exit value
-            if ($TargetRunbook.ExitValue -eq $false) {
-                Write-SPOTConsole "Runbook ""$($TargetRunbook.Name)"" execution finished and returned failure."
-                Write-SPOTLog "GUI: Runbook ""$($TargetRunbook.Name)"" execution finished and returned failure."
+            #######################
+            # finished executing runbook
+            # set actual progress here
+            $CurrentStatus = [math]::floor(($AllRunbookSteps.Values.Where({($_.Status -eq "Completed") -or (($_.Status -eq "Error") -and ($_.ContinueOnError -eq $true))}).Count/$AllRunbookSteps.Values.Where({$_.Disabled -eq $false}).Count)*100)
+            if ($CurrentStatus -ne $GUIStatus) {
+                $GUIStatus = $CurrentStatus
+                Set-SPOTMainPG -percent $GUIStatus
             }
-            elseif ($TargetRunbook.ExitValue -eq $true) {
-                Write-SPOTConsole "Runbook ""$($TargetRunbook.Name)"" execution finished and returned success."
-                Write-SPOTLog "GUI: Runbook ""$($TargetRunbook.Name)"" execution finished and returned success."
+
+            # if there are still steps in Initial state or steps in Error state that have the CoontinueOnError disabled, rename button to Resume, else, rename the button to Start
+            if (($AllRunbookSteps.Values.Where({$_.Status -eq "Initial"}).Count -ne 0) -or ($AllRunbookSteps.Values.Where({($_.Status -eq "Error") -and ($_.ContinueOnError -eq $false)}).Count -ne 0)) {
+                $syncHash.window.Control_StartStop.Dispatcher.invoke([action]{
+                    $syncHash.window.Control_StartStop.IsEnabled = $true
+                    $syncHash.window.Control_StartStop.Content = "Resume" 
+                    $syncHash.window.Control_StepButton.IsEnabled = $true
+                    $syncHash.window.Control_StepButton.Content = "Step" 
+                    $syncHash.window.Control_LoadRunbook.IsEnabled = $true
+                    $syncHash.window.Control_LoadProject.IsEnabled = $true
+                })
+                # interpret the main exit value
+                if ($TargetRunbook.ExitValue -eq $false) {
+                    Write-SPOTConsole "Runbook ""$($TargetRunbook.Name)"" execution paused and returned failure."
+                    Write-SPOTLog "GUI: Runbook ""$($TargetRunbook.Name)"" execution paused and returned failure."
+                }
+                elseif ($TargetRunbook.ExitValue -eq $true) {
+                    Write-SPOTConsole "Runbook ""$($TargetRunbook.Name)"" execution paused and returned success."
+                    Write-SPOTLog "GUI: Runbook ""$($TargetRunbook.Name)"" execution paused and returned success."
+                }
             }
+            else {
+                # when completed, for a ReStart, load teh runbook again to have it properly initialized; here, we stop the possible options to continue
+                $syncHash.window.Control_StartStop.Dispatcher.invoke([action]{
+                    $syncHash.window.Control_StartStop.IsEnabled = $false
+                    $syncHash.window.Control_StartStop.Content = "Completed" 
+                    $syncHash.window.Control_StepButton.IsEnabled = $false
+                    $syncHash.window.Control_StepButton.Content = "Step(s) Completed"
+                    $syncHash.window.Control_LoadRunbook.IsEnabled = $true
+                    $syncHash.window.Control_LoadProject.IsEnabled = $true
+                })
+                # interpret the main exit value
+                if ($TargetRunbook.ExitValue -eq $false) {
+                    Write-SPOTConsole "Runbook ""$($TargetRunbook.Name)"" execution finished and returned failure."
+                    Write-SPOTLog "GUI: Runbook ""$($TargetRunbook.Name)"" execution finished and returned failure."
+                }
+                elseif ($TargetRunbook.ExitValue -eq $true) {
+                    Write-SPOTConsole "Runbook ""$($TargetRunbook.Name)"" execution finished and returned success."
+                    Write-SPOTLog "GUI: Runbook ""$($TargetRunbook.Name)"" execution finished and returned success."
+                }
+            }
+        }
+
+        # launch runbook offload
+        Offload-SPOTRunspace -RunspaceScriptBlockParameters $RunspaceScriptBlockParameters -RunspaceScriptBlock $RunspaceScriptBlock -SessionState $syncHash.SessionState
+    }
+    else {
+        Write-Host "WARNING: In this state: ""$Action"", the button should be disabled!!"
+    }
+})
+
+###################
+# Event handler for the StepButton button
+$window.Control_StepButton.Add_Click({
+    $Action = $window.Control_StartStop.Content
+    if ($Action -eq "Start") {
+        ## FRESH RUNBOOK, STARTING RUNBOOK EXECUTION FROM SCRATCH
+        ###############
+        # remove previous logs to start logging from scratch
+        Remove-Item -Path "$($OrchVars._ProjectPath)\__SPOT_Artefacts\*" -Recurse -ErrorAction SilentlyContinue
+        # initialize related controls
+        $window.Control_ProgressBar.Value = 0
+        $window.Control_StartStop.IsEnabled = $false
+        $window.Control_StartStop.Content = "Executing"
+        $window.Control_StepButton.IsEnabled = $false
+        $window.Control_StepButton.Content = "Step(s) Executing"
+        $window.Control_LoadRunbook.IsEnabled = $false
+        $window.Control_LoadProject.IsEnabled = $false
+        
+        # get the loaded runbook 
+        $TargetRunbookName = ($window.Control_LoadedRunbook.Content -split ":")[1].Trim()
+
+        # prepare runbook offload
+        $RunspaceScriptBlockParameters = @{
+            TargetRunbookName = $TargetRunbookName
+        }
+        $RunspaceScriptBlock = {
+            Param ($TargetRunbookName)
+            
+            # stamp all SPOT functions
+            foreach ($funcName in $SFunctionNames) {
+                (Get-Command -Name $funcName -CommandType Function -ErrorAction Stop).Description = "#SPOT"
+            }
+
+            # validate the SPOT path is available
+            if (!$SPOTPath) {
+                Write-SPOTConsole "ERROR: The SPOT path was not detected properly: $SPOTPath. Cannot continue."
+                # disable the Load Project button since there is no SPOT module path available
+                $syncHash.window.Control_LoadProject.Dispatcher.invoke([action]{$syncHash.window.Control_LoadProject.IsEnabled = $false })
+                return
+            }
+
+            # get target runbook object
+            $TargetRunbook = Get-SPOTRunbookByName -Name $TargetRunbookName
+
+            # just before starting the main Runbook Job, start also the SPOT RunspacePool
+            $global:_spot_MainWorkerPool = Create-SPOTRsPool -MaxNumber $OrchVars._SPOTRsPoolMax
+
+            # log the beginnig of the execution
+            Write-SPOTConsole "Starting runbook ""$($TargetRunbook.Name)"" execution."
+
+            # launch runbook execution in a separate job
+            $MainJob = Start-SPOTRunbookJob -GUID $TargetRunbook.GUID -StepMode $true
+
+            # wait a little for the dedicated runspace to start
+            Start-Sleep -Seconds 4
+
+            # check the status in a loop, until the orchestration is finished
+            while ($true) {
+                Start-Sleep -Seconds 5
+
+                # progress report
+                $CurrentStatus = [math]::floor(($AllRunbookSteps.Values.Where({($_.Status -eq "Completed") -or (($_.Status -eq "Error") -and ($_.ContinueOnError -eq $true))}).Count/$AllRunbookSteps.Values.Where({$_.Disabled -eq $false}).Count)*100)
+                if ($CurrentStatus -ne $GUIStatus) {
+                    $GUIStatus = $CurrentStatus
+                    Set-SPOTMainPG -percent $GUIStatus
+                }
+                $syncHash.window.Control_MainRunbook.Dispatcher.invoke([action]{ Update-SPOTRunbookNodeObjects -NodeObjects $syncHash.window.Control_MainRunbook.Items })
+                Update-SPOTPublishedData
+
+                if ($MainJob.handle.IsCompleted) {break}
+            } 
+
+            # manage the runbook job
+            Get-SPOTRunbookJobResult -RunbookJob $MainJob
+            
+            # one last cycle, to make sure there is no status missed
+            $syncHash.window.Control_MainRunbook.Dispatcher.invoke([action]{ Update-SPOTRunbookNodeObjects -NodeObjects $syncHash.window.Control_MainRunbook.Items })
+            Update-SPOTPublishedData
+
+            # close and dispose the main worker pool
+            $_spot_MainWorkerPool.Dispose()
+
+            #######################
+            # finished executing runbook
+            # set actual progress here
+            $CurrentStatus = [math]::floor(($AllRunbookSteps.Values.Where({($_.Status -eq "Completed") -or (($_.Status -eq "Error") -and ($_.ContinueOnError -eq $true))}).Count/$AllRunbookSteps.Values.Where({$_.Disabled -eq $false}).Count)*100)
+            if ($CurrentStatus -ne $GUIStatus) {
+                $GUIStatus = $CurrentStatus
+                Set-SPOTMainPG -percent $GUIStatus
+            }
+
+            # if there are still steps in Initial state or steps in Error state that have the ContinueOnError disabled, rename button to Resume, else, rename the button to Start
+            if (($AllRunbookSteps.Values.Where({($_.Status -eq "Initial") -and ($_.Disabled -eq $false)}).Count -ne 0) -or ($AllRunbookSteps.Values.Where({($_.Status -eq "Error") -and ($_.ContinueOnError -eq $false)}).Count -ne 0)) {
+                $syncHash.window.Control_StartStop.Dispatcher.invoke([action]{
+                    $syncHash.window.Control_StartStop.IsEnabled = $true
+                    $syncHash.window.Control_StartStop.Content = "Resume" 
+                    $syncHash.window.Control_StepButton.IsEnabled = $true
+                    $syncHash.window.Control_StepButton.Content = "Step" 
+                    $syncHash.window.Control_LoadRunbook.IsEnabled = $true
+                    $syncHash.window.Control_LoadProject.IsEnabled = $true
+                })
+                # interpret the main exit value
+                if ($TargetRunbook.ExitValue -eq $false) {
+                    Write-SPOTConsole "Runbook ""$($TargetRunbook.Name)"" execution paused and returned failure."
+                    Write-SPOTLog "GUI: Runbook ""$($TargetRunbook.Name)"" execution paused and returned failure."
+                }
+                elseif ($TargetRunbook.ExitValue -eq $true) {
+                    Write-SPOTConsole "Runbook ""$($TargetRunbook.Name)"" execution paused and returned success."
+                    Write-SPOTLog "GUI: Runbook ""$($TargetRunbook.Name)"" execution paused and returned success."
+                }
+            }
+            else {
+                # when completed, for a ReStart, load the runbook again to have it properly initialized; here, we stop the possible options to continue
+                $syncHash.window.Control_StartStop.Dispatcher.invoke([action]{
+                    $syncHash.window.Control_StartStop.IsEnabled = $false
+                    $syncHash.window.Control_StartStop.Content = "Completed" 
+                    $syncHash.window.Control_StepButton.IsEnabled = $false
+                    $syncHash.window.Control_StepButton.Content = "Step(s) Completed"
+                    $syncHash.window.Control_LoadRunbook.IsEnabled = $true
+                    $syncHash.window.Control_LoadProject.IsEnabled = $true
+                    })
+                # interpret the main exit value
+                if ($TargetRunbook.ExitValue -eq $false) {
+                    Write-SPOTConsole "Runbook ""$($TargetRunbook.Name)"" execution finished and returned failure."
+                    Write-SPOTLog "GUI: Runbook ""$($TargetRunbook.Name)"" execution finished and returned failure."
+                }
+                elseif ($TargetRunbook.ExitValue -eq $true) {
+                    Write-SPOTConsole "Runbook ""$($TargetRunbook.Name)"" execution finished and returned success."
+                    Write-SPOTLog "GUI: Runbook ""$($TargetRunbook.Name)"" execution finished and returned success."
+                }
+            }
+        }
+
+        # launch runbook offload
+        Offload-SPOTRunspace -RunspaceScriptBlockParameters $RunspaceScriptBlockParameters -RunspaceScriptBlock $RunspaceScriptBlock -SessionState $syncHash.SessionState
+    
+    }
+    elseif ($Action -eq "Resume") {
+        # deactivate the stop flag in the OrchVars
+        $OrchVars._StopFlag = $false
+
+        # change the button label to Stop and make sure it is active
+        $window.Control_StartStop.IsEnabled = $false
+        $window.Control_StartStop.Content = "Executing"
+        $window.Control_StepButton.IsEnabled = $false
+        $window.Control_StepButton.Content = "Step(s) Executing"
+        $window.Control_LoadRunbook.IsEnabled = $false
+        $window.Control_LoadProject.IsEnabled = $false
+
+        # resume target runbook
+        $TargetRunbookName = ($window.Control_LoadedRunbook.Content -split ":")[1].Trim()
+
+        $RunspaceScriptBlockParameters = @{
+            TargetRunbookName = $TargetRunbookName
+        }
+        $RunspaceScriptBlock = {
+            Param ($TargetRunbookName)
+            
+            # stamp all SPOT functions
+            foreach ($funcName in $SFunctionNames) {
+                (Get-Command -Name $funcName -CommandType Function -ErrorAction Stop).Description = "#SPOT"
+            }
+
+            # validate the SPOT path is available
+            if (!$SPOTPath) {
+                Write-SPOTConsole "ERROR: The SPOT path was not detected properly: $SPOTPath. Cannot continue."
+                # disable the Load Project button since there is no SPOT module path available
+                $syncHash.window.Control_LoadProject.Dispatcher.invoke([action]{$syncHash.window.Control_LoadProject.IsEnabled = $false })
+                return
+            }
+            
+            # get target runbook object
+            $TargetRunbook = Get-SPOTRunbookByName -Name $TargetRunbookName
+
+            # just before starting the main Runbook Job, start also the SPOT RunspacePool
+            $global:_spot_MainWorkerPool = Create-SPOTRsPool -MaxNumber $OrchVars._SPOTRsPoolMax
+
+            # log the beginnig of the execution
+            Write-SPOTConsole "Resuming runbook ""$($TargetRunbook.Name)"" execution."
+
+            # resume runbook execution in a separate job
+            $MainJob = Start-SPOTRunbookJob -GUID $TargetRunbook.GUID -Resume $true -StepMode $true
+
+            # wait a little for the dedicated runspace to start
+            Start-Sleep -Seconds 4
+
+            # check the status in a loop, until the orchestration is finished
+            while ($true) {
+                Start-Sleep -Seconds 5
+                # progress report
+                $CurrentStatus = [math]::floor(($AllRunbookSteps.Values.Where({($_.Status -eq "Completed") -or (($_.Status -eq "Error") -and ($_.ContinueOnError -eq $true))}).Count/$AllRunbookSteps.Values.Where({$_.Disabled -eq $false}).Count)*100)
+                if ($CurrentStatus -ne $GUIStatus) {
+                    $GUIStatus = $CurrentStatus
+                    Set-SPOTMainPG -percent $GUIStatus
+                }
+
+                # load the relevant data to the treeview, via the dispatcher, if it has changed
+                $syncHash.window.Control_MainRunbook.Dispatcher.invoke([action]{ Update-SPOTRunbookNodeObjects -NodeObjects $syncHash.window.Control_MainRunbook.Items })
+                Update-SPOTPublishedData
+
+                if ($MainJob.handle.IsCompleted) {break}
+            } 
+
+            # manage the runbook job
+            Get-SPOTRunbookJobResult -RunbookJob $MainJob
+            
+            # one last cycle, to make sure there is no status missed
+            $syncHash.window.Control_MainRunbook.Dispatcher.invoke([action]{ Update-SPOTRunbookNodeObjects -NodeObjects $syncHash.window.Control_MainRunbook.Items })
+            Update-SPOTPublishedData
+
+            # close and dispose the main worker pool
+            $_spot_MainWorkerPool.Dispose()
 
             #######################
             # finished executing runbook
@@ -4207,20 +4503,42 @@ $window.Control_StartStop.Add_Click({
             # if there are still steps in Initial state or steps in Error state that have the CoontinueOnError disabled, rename button to Resume, else, rename the button to Start
             if (($AllRunbookSteps.Values.Where({$_.Status -eq "Initial"}).Count -ne 0) -or ($AllRunbookSteps.Values.Where({($_.Status -eq "Error") -and ($_.ContinueOnError -eq $false)}).Count -ne 0)) {
                 $syncHash.window.Control_StartStop.Dispatcher.invoke([action]{
-                    $syncHash.window.Control_StartStop.Content = "Resume" 
                     $syncHash.window.Control_StartStop.IsEnabled = $true
+                    $syncHash.window.Control_StartStop.Content = "Resume" 
+                    $syncHash.window.Control_StepButton.IsEnabled = $true
+                    $syncHash.window.Control_StepButton.Content = "Step" 
                     $syncHash.window.Control_LoadRunbook.IsEnabled = $true
                     $syncHash.window.Control_LoadProject.IsEnabled = $true
                 })
+                # interpret the main exit value
+                if ($TargetRunbook.ExitValue -eq $false) {
+                    Write-SPOTConsole "Runbook ""$($TargetRunbook.Name)"" execution paused and returned failure."
+                    Write-SPOTLog "GUI: Runbook ""$($TargetRunbook.Name)"" execution paused and returned failure."
+                }
+                elseif ($TargetRunbook.ExitValue -eq $true) {
+                    Write-SPOTConsole "Runbook ""$($TargetRunbook.Name)"" execution paused and returned success."
+                    Write-SPOTLog "GUI: Runbook ""$($TargetRunbook.Name)"" execution paused and returned success."
+                }
             }
             else {
                 # when completed, for a ReStart, load teh runbook again to have it properly initialized; here, we stop the possible options to continue
                 $syncHash.window.Control_StartStop.Dispatcher.invoke([action]{
-                    $syncHash.window.Control_StartStop.Content = "Completed" 
                     $syncHash.window.Control_StartStop.IsEnabled = $false
+                    $syncHash.window.Control_StartStop.Content = "Completed" 
+                    $syncHash.window.Control_StepButton.IsEnabled = $false
+                    $syncHash.window.Control_StepButton.Content = "Step(s) Completed"
                     $syncHash.window.Control_LoadRunbook.IsEnabled = $true
                     $syncHash.window.Control_LoadProject.IsEnabled = $true
-                    })
+                })
+                # interpret the main exit value
+                if ($TargetRunbook.ExitValue -eq $false) {
+                    Write-SPOTConsole "Runbook ""$($TargetRunbook.Name)"" execution finished and returned failure."
+                    Write-SPOTLog "GUI: Runbook ""$($TargetRunbook.Name)"" execution finished and returned failure."
+                }
+                elseif ($TargetRunbook.ExitValue -eq $true) {
+                    Write-SPOTConsole "Runbook ""$($TargetRunbook.Name)"" execution finished and returned success."
+                    Write-SPOTLog "GUI: Runbook ""$($TargetRunbook.Name)"" execution finished and returned success."
+                }
             }
         }
 
@@ -4228,7 +4546,7 @@ $window.Control_StartStop.Add_Click({
         Offload-SPOTRunspace -RunspaceScriptBlockParameters $RunspaceScriptBlockParameters -RunspaceScriptBlock $RunspaceScriptBlock -SessionState $syncHash.SessionState
     }
     else {
-        Write-Host "WARNING: In this state: ""$Action"", the button should be disabled!!"
+        Write-Host "WARNING: In this StartStop state: ""$Action"", the Step Button should be disabled!!"
     }
 })
 
@@ -4464,6 +4782,7 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
                         # some content has been downloaded; moving on
                         $continue = $true
                         Write-SPOTLog ">>> Setting the SshNet tool."
+                        Unblock-File -Path $TFP -Confirm:$false
                         $TempFolder = New-Item -ItemType Directory -Path ([System.IO.Path]::GetTempPath() + [System.IO.Path]::GetRandomFileName())
                         [io.compression.zipfile]::ExtractToDirectory($TFP,$TempFolder.FullName)
                         Remove-Item -Path $TFP -Confirm:$false -Force
@@ -4497,6 +4816,7 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
                     if ((Get-Item -Path $TFP -ErrorAction SilentlyContinue).Length -gt 0) {
                         # some content has been downloaded; moving on
                         Write-SPOTLog ">>> Setting the PsExec tool."
+                        Unblock-File -Path $TFP -Confirm:$false
                         $TempFolder = New-Item -ItemType Directory -Path ([System.IO.Path]::GetTempPath() + [System.IO.Path]::GetRandomFileName())
                         [io.compression.zipfile]::ExtractToDirectory($TFP,$TempFolder.FullName)
                         Remove-Item -Path $TFP -Confirm:$false -Force
@@ -4558,6 +4878,7 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
                         ############################################
                         # SshNet
                         Write-SPOTLog ">>> Setting the SshNet tool."
+                        Unblock-File -Path $PoshSSHZipPath -Confirm:$false
                         $TempFolder = New-Item -ItemType Directory -Path ([System.IO.Path]::GetTempPath() + [System.IO.Path]::GetRandomFileName())
                         [io.compression.zipfile]::ExtractToDirectory($PoshSSHZipPath,$TempFolder.FullName)
                         try {
@@ -4574,6 +4895,7 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
                         ############################################
                         # PSExec
                         Write-SPOTLog ">>> Setting the PsExec tool."
+                        Unblock-File -Path $PsToolsZipPath -Confirm:$false
                         $TempFolder = New-Item -ItemType Directory -Path ([System.IO.Path]::GetTempPath() + [System.IO.Path]::GetRandomFileName())
                         [io.compression.zipfile]::ExtractToDirectory($PsToolsZipPath,$TempFolder.FullName)
                         Get-ChildItem -Path $TempFolder.FullName -Recurse -File | Where {$_.Name -eq "psexec64.exe"} | `
