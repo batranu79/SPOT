@@ -6,6 +6,8 @@
 # v1.3 - 03.10.2026 - added elevation support for the Execute-BashScript and Execute-SSHScript functions
 #                   - added SysV parameter in the Reboot-LinuxComputer function and corrected TrustedHostsFilePath handling
 #                   - improved output processing in Execute-SSHScript and Execute-BashScript
+# v1.4 - 30.10.2026 - removed the SysV parameter from the Reboot-LinuxComputer function and implemented a more robust detection
+#                   - improved the Reboot-WindowsComputer function
 #
 #
 #
@@ -2845,10 +2847,6 @@ Specifies the SSH Port to be used, in case it is not the standard one.
 .PARAMETER Credential
 Specifies the SSH credential to be used for remote authentication.
 
-.PARAMETER SysV
-Specifies that the target linux system is using the old style sysvinit.
-The default value is $false, meaning that the target system is using the newer systemd init.
-
 .PARAMETER TrustedHostsFilePath
 Specifies the file path for a SPOT Trusted Hosts csv file to be used for SSH key validation.
 If this parameter is not specified or empty, the SSH key validation is not enabled.
@@ -2895,11 +2893,6 @@ In this example the target computer "192.168.0.2" is restarted using the custom 
         # the SSH credential to be used for remote authentication
         $Credential,
         [Parameter(Mandatory=$false)]
-        [ValidateNotNullOrEmpty()]
-        [bool]
-        # specify that the target linux system is using the old style sysvinit
-        $SysV = $false,
-        [Parameter(Mandatory=$false)]
         [AllowNull()]
         [string]
         # the path to the TrustedHosts file
@@ -2942,9 +2935,9 @@ In this example the target computer "192.168.0.2" is restarted using the custom 
 
     #################################
     #region: bash scripts
-
+    
     ################
-    $RebootScript = @'
+    $DetectScript = @'
 #!/bin/bash
 
 ####################
@@ -2953,6 +2946,24 @@ if [[ "$OSTYPE" != "linux"* ]]; then
     echo "Detected OS: $OSTYPE"
     exit 1
 fi
+
+####################
+if [ -d /run/systemd/system ] && { [ -S /run/systemd/private ] || [ -d /sys/fs/cgroup/systemd ]; }; then
+    echo STARTUP_TYPE: SYSTEMD
+
+####################
+elif [ -f /etc/inittab ] && [ -d /etc/rc.d/init.d ]; then
+    echo STARTUP_TYPE: SYSV
+
+####################
+else
+    echo STARTUP_TYPE: UNKNOWN
+fi
+'@ -replace "`r`n", "`n"
+
+    ################
+    $RebootScript = @'
+#!/bin/bash
 
 ####################
 command -v shutdown >/dev/null 2>&1 || {
@@ -3003,8 +3014,7 @@ exit "$reboot_status"
 '@ -replace "`r`n", "`n"
     
     ################
-    if ($SysV) {
-        $RemoteStartupScript = @'
+    $SysVRemoteStartupScript = @'
 #!/bin/bash
 
 # Maximum time to wait for boot completion, in seconds.
@@ -3042,9 +3052,9 @@ fi
 
 echo "OS_STARTUP_COMPLETE"
 '@ -replace "`r`n", "`n"
-    }
-    else {
-        $RemoteStartupScript = @'
+    
+    ################
+    $SystemdRemoteStartupScript = @'
 #!/bin/bash
 
 # Maximum time to wait for boot completion, in seconds.
@@ -3080,8 +3090,7 @@ fi
 
 echo "OS_STARTUP_COMPLETE"
 '@ -replace "`r`n", "`n"
-    }
-
+    
     #endregion: bash scripts
 
     #################################
@@ -3117,7 +3126,7 @@ echo "OS_STARTUP_COMPLETE"
         $_spot_OutputBeforeReboot += $SSHStream.Read()
     }
 
-    ##################
+    ######################################################################################################################
     # get the initial boot id output
     $SSHStream.WriteLine('initial_boot_id=$(cat /proc/sys/kernel/random/boot_id); echo "InitialBoodId=$initial_boot_id"')
     $SSHStream.Flush()
@@ -3143,7 +3152,162 @@ echo "OS_STARTUP_COMPLETE"
     }
     Write-SPOTLog "The initial BootID detected is: $InitialBootID" -DBG $true
 
+    ######################################################################################################################
+    # upload the detect script
+    $SSHStream.WriteLine("rm -f /tmp/spot_detect.sh")
+    $SSHStream.Flush()
+    Start-Sleep -Milliseconds 200
+    while ($SSHStream.DataAvailable) {
+        $_spot_OutputBeforeReboot += $SSHStream.Read()
+    }
+    Write-SPOTLog "Uploading the detect script to the target Linux computer." -DBG $true
+    $encodedDetectScript = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($DetectScript))
+    $SSHStream.WriteLine("echo '$encodedDetectScript' | base64 -d > /tmp/spot_detect.sh")
+    $SSHStream.Flush()
+    $SSHStream.Expect("base64 -d > /tmp/spot_detect.sh",(New-TimeSpan -Seconds 5)) | Out-Null
+    Start-Sleep -Milliseconds 200
+    while ($SSHStream.DataAvailable) {
+        $_spot_OutputBeforeReboot += $SSHStream.Read()
+    }
+
     ##################
+    # make the detect script executable
+    $SSHStream.WriteLine("chmod +x /tmp/spot_detect.sh")
+    $SSHStream.Flush()
+    Start-Sleep -Milliseconds 300
+    while ($SSHStream.DataAvailable) {
+        $_spot_OutputBeforeReboot += $SSHStream.Read()
+    }
+    
+    ##################
+    # execute the detect script
+    Write-SPOTLog "Trigger the detect script on the target Linux computer." -DBG $true
+    $SSHStream.WriteLine("bash '/tmp/spot_detect.sh'")
+    $SSHStream.Flush()
+    $buffer = ""
+    $detectSucceeded = $false
+    $StartupType = ""
+
+    ##################
+    # manage the detect script output
+    while (!$detectSucceeded) {
+        $text = $null
+        if ($SSHStream.DataAvailable) {
+            $text = $SSHStream.Read()
+            if (![string]::IsNullOrEmpty($text)) {
+                # Write-SPOTLog "INFO: read text output: $text."
+                $buffer += $text
+
+                ########################################
+                # Target computer is not Linux
+                if ($buffer.Contains("ERROR: This script is only supported on Linux")) {
+                    $detectSucceeded = $true
+                    $StartupType = "NON-LINUX"
+                    Write-SPOTLog " > The target host is not detected as a Linux system."
+                    break
+                }
+
+                ########################################
+                # startup type SYSTEMD
+                if ($buffer.Contains("STARTUP_TYPE: SYSTEMD")) {
+                    $detectSucceeded = $true
+                    $StartupType = "SYSTEMD"
+                    Write-SPOTLog " > The startup type is detected as SYSTEMD."
+                    break
+                }
+
+                ########################################
+                # startup type SYSV 
+                if ($buffer.Contains("STARTUP_TYPE: SYSV")) {
+                    $detectSucceeded = $true
+                    $StartupType = "SYSV"
+                    Write-SPOTLog " > The startup type is detected as SYSV."
+                    break
+                }
+
+                ########################################
+                # startup type UNKNOWN
+                if ($buffer.Contains("STARTUP_TYPE: UNKNOWN")) {
+                    $detectSucceeded = $true
+                    $StartupType = "UNKNOWN"
+                    Write-SPOTLog " > The startup type is detected as UNKNOWN."
+                    break
+                }
+            }
+        }
+        else {
+            Start-Sleep -Milliseconds 50
+        }
+    }
+
+    ##################
+    # capture all remaining output
+    Start-Sleep -Milliseconds 500
+    while ($SSHStream.DataAvailable) {
+        $text = $SSHStream.Read()
+        if (![string]::IsNullOrEmpty($text)) {
+            #Write-SPOTLog "INFO: read extra text output: $text."
+            $buffer += $text
+        }
+    }
+    
+    ##################
+    # add the buffer to the main before output variable
+    $_spot_OutputBeforeReboot += $buffer
+    
+    #################################
+    # delete the detect script
+    $SSHStream.WriteLine("rm -f /tmp/spot_detect.sh")
+    $SSHStream.Flush()
+    Start-Sleep -Milliseconds 200
+    while ($SSHStream.DataAvailable) {
+        $_spot_OutputBeforeReboot += $SSHStream.Read()
+    }
+
+    ##################
+    # handle the detection cases
+    switch ($StartupType) {
+        "NON-LINUX" {
+            ##################
+            # compose the full output variable
+            $_spot_FullOutput += $_spot_OutputBeforeReboot -split '\r?\n'
+
+            ##################
+            # manage logging and session closing then throw
+            Write-SPOTLog "ERROR: Non-Linux target host detected. Cannot continue."
+            Write-SPOTLog "The entire captured bash script output so far: $_spot_FullOutput"
+            $SSHStream.Dispose()
+            $SSHSession.Disconnect()
+            $SSHSession.Dispose()
+            throw "Reboot-LinuxComputer: non-linux target host"
+        }
+        "SYSV" {
+            ##################
+            # set the SysV startup script
+            $RemoteStartupScript = $SysVRemoteStartupScript
+        }
+        "SYSTEMD" {
+            ##################
+            # set the SystemD startup script
+            $RemoteStartupScript = $SystemdRemoteStartupScript
+        }
+        default {
+            ##################
+            # compose the full output variable
+            $_spot_FullOutput += $_spot_OutputBeforeReboot -split '\r?\n'
+
+            ##################
+            # manage logging and session closing then throw
+            Write-SPOTLog "ERROR: Detection result ""$StartupType"". Cannot continue."
+            Write-SPOTLog "The entire captured bash script output so far: $_spot_FullOutput"
+            $SSHStream.Dispose()
+            $SSHSession.Disconnect()
+            $SSHSession.Dispose()
+            throw "Reboot-LinuxComputer: unexpected detection result"
+        }
+    }
+
+    ######################################################################################################################
     # upload the reboot script
     $SSHStream.WriteLine("rm -f /tmp/spot_reboot.sh")
     $SSHStream.Flush()
@@ -3272,7 +3436,7 @@ echo "OS_STARTUP_COMPLETE"
         throw "Reboot-LinuxComputer: failed to trigger computer reboot"
     }
 
-    ######################
+    ######################################################################################################################
     # if ping was available...
     if ($PingAvailable) {
         ##################
@@ -3373,7 +3537,7 @@ echo "OS_STARTUP_COMPLETE"
         $_spot_OutputAfterReboot += $SSHStream.Read()
     } 
 
-    ##################
+    ######################################################################################################################
     # get the boot id after the reboot
     $SSHStream.WriteLine('boot_id=$(cat /proc/sys/kernel/random/boot_id); echo "BoodId=$boot_id"')
     $SSHStream.Flush()
@@ -3410,7 +3574,7 @@ echo "OS_STARTUP_COMPLETE"
         throw "Reboot-LinuxComputer: the boot id did not change after reboot!"
     }
 
-    ##################
+    ######################################################################################################################
     # upload the startup check script
     $SSHStream.WriteLine("rm -f /tmp/spot_startup-readiness.sh")
     $SSHStream.Flush()
@@ -3514,7 +3678,7 @@ echo "OS_STARTUP_COMPLETE"
     $SSHSession.Disconnect()
     $SSHSession.Dispose()
 
-    ##################
+    ######################################################################################################################
     # compose the full output variable
     $_spot_FullOutput += $_spot_OutputBeforeReboot -split '\r?\n'
     $_spot_FullOutput += $_spot_OutputAfterReboot -split '\r?\n'
@@ -3743,24 +3907,24 @@ In this example the target computer with the IP Address "192.168.0.2" is restart
                 if ($CurrentBootTime) {
                     if ($CurrentBootTime -ne $InitialBootTime) {
                         Write-SPOTLog "The startup after restart was found completed on the remote Windows computer." -DBG $true
-                        Remove-PSSession -Session $session -Confirm:$false
+                        Get-PSSession | Where {$_.Id -eq $session.Id} | Remove-PSSession -Confirm:$false -ErrorAction SilentlyContinue
                         break
                     }
                 }
                 else {
                     Write-SPOTLog "The startup was checked but not yet found completed." -DBG $true
-                    Remove-PSSession -Session $session -Confirm:$false
+                    Get-PSSession | Where {$_.Id -eq $session.Id} | Remove-PSSession -Confirm:$false -ErrorAction SilentlyContinue
                 }
             }
             else {
                 Write-SPOTLog "PSSession to the target Windows computer was not yet opened properly." -DBG $true
-                Remove-PSSession -Session $session -Confirm:$false
+                Get-PSSession | Where {$_.Id -eq $session.Id} | Remove-PSSession -Confirm:$false -ErrorAction SilentlyContinue
             }
         }
         else {
             Write-SPOTLog "WinRM TCP port is not yet available." -DBG $true
         }
-        
+
         # check the timeout
         if ([DateTime]::UtcNow -gt $Deadline) {
             Write-SPOTLog "ERROR: Timed out trying to check the restart completion on the target Windows computer."

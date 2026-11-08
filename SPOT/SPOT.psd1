@@ -13,10 +13,10 @@
     RootModule = 'SPOT.psm1'
 
     # Version number of this module.
-    ModuleVersion = '1.1.3'
+    ModuleVersion = '1.1.4'
 
     # ID used to uniquely identify this module
-    GUID = 'b1ee693e-6048-470e-9475-6269b91307d7'
+    GUID = '7d5a980e-65b6-4d5a-9939-ba9e148c9d59'
 
     # Author of this module
     Author = 'Narcis-Ionel Mircea'

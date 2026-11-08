@@ -14,6 +14,10 @@
 # v1.4 - 03.10.2026 - fixed issue when certain Published Variable objects do not display either value or object type in the GUI
 #                   - added support for Step Mode execution in the GUI function
 #                   - included unblock of the source files for Extend-SPOTCapability function
+# v1.5 - 08.11.2026 - added the ExecPath to the details shown in the GUI; other small corrections in the Start-SPOTGUI function
+#                   - added IncludeSecrets parameter to the Export-SPOTDevHelperFile function and changed the output file encoding to UTF-8
+#                   - added internal function Test-SPOTIsUtf8 for checking the file encoding of all project scripts and helperfiles
+#                   - changed behavior of the Start-SPOTGUI not to delete previous log files anymore since this is not an unattended execution
 #
 #
 #
@@ -433,6 +437,9 @@ function Load-SPOTProject {
     ###########################################
     # load all project FunctionFiles
     foreach ($FunctionsFile in (Get-ChildItem -Path "$($OrchVars._ProjectPath)\_HelperFunctions" -Recurse -File -Include *.ps1)) {
+        if (!(Test-SPOTIsUtf8 -FilePath $FunctionsFile.FullName)) {
+            Write-SPOTLog "WARNING: The current HelperFunctions file ""$($FunctionsFile.FullName)"" is not UTF-8 encoded." -Output $false
+        }
         . $FunctionsFile.FullName
     }
 
@@ -1884,6 +1891,9 @@ function Convert-SPOTProjectScriptsToFunctions {
     $ProjectScriptFiles = Get-ChildItem -Path "$($OrchVars._ProjectPath)\_Scripts" -Recurse | Where-Object {$_.Extension -eq ".ps1"}
     $ProjectScripts = @()
     foreach ($PSFile in $ProjectScriptFiles) {
+        if (!(Test-SPOTIsUtf8 -FilePath $PSFile.FullName)) {
+            Write-SPOTLog "WARNING: The current script file ""$($PSFile.FullName)"" is not UTF-8 encoded." -Output $false
+        }
         $ProjectScripts += Get-Command -Name $PSFile.FullName
     }
     foreach ($i in $ProjectScripts) {
@@ -1989,6 +1999,44 @@ function Validate-SPOTProjectFolder {
     
 } # end of Validate-SPOTProjectFolder function
 
+######################################################################################################################
+function Test-SPOTIsUtf8 {
+    param (
+        [Parameter(Mandatory=$true)]
+        [string]
+        # path of the target file to be tested
+        $FilePath
+    )
+
+    try {
+        # Create a UTF8 encoder that throws an error if it hits invalid byte sequences
+        $throwOnInvalid = [System.Text.UTF8Encoding]::new($false, $true)
+        
+        # Open and read the entire file using this strict encoder
+        $stream = [System.IO.File]::OpenRead($FilePath)
+        $reader = [System.IO.StreamReader]::new($stream, $throwOnInvalid)
+        
+        # If it reads to the end without throwing an exception, it is valid UTF-8/ASCII
+        $null = $reader.ReadToEnd()
+        $reader.Close()
+        $stream.Close()
+
+        return $true
+    }
+    catch [System.Text.DecoderFallbackException] {
+        # An invalid UTF-8 byte sequence was hit (e.g. legacy ANSI or ISO-8859-1)
+        if ($null -ne $reader) { $reader.Close() }
+        if ($null -ne $stream) { $stream.Close() }
+        return $false
+    }
+    catch {
+        # Handle file locking, missing files, or other unexpected errors
+        if ($null -ne $reader) { $reader.Close() }
+        if ($null -ne $stream) { $stream.Close() }
+        throw $_
+    }
+} # end of Test-SPOTIsUtf8 function
+
 # Exported Functions
 ################################################################################################################################################################
 ######################################################################################################################
@@ -2038,6 +2086,10 @@ When loaded, all functions and OrchVars inside are declared in the global scope.
 .PARAMETER ProjectPath
 Specifies the path to the Project folder.
 
+.PARAMETER IncludeSecrets
+Specifies if the secrets from the SVars hashtable are to be included in the DevHelper file or not.
+Warning: all secrets hosted in the SecretVault of the target project would then be exposed in the DevHelper file.
+
 .PARAMETER MasterPassword
 Specifies the password to be used for unlocking the secret store, if it is not registered.
 
@@ -2066,7 +2118,12 @@ The MasterPassword is not specified because, probably, it is registered locally 
         [ValidateNotNullOrEmpty()]
         [string]
         # the path to the Project folder
-        $ProjectPath, 
+        $ProjectPath,
+        [Parameter(Mandatory=$false)]
+        [ValidateNotNullOrEmpty()]
+        [bool]
+        # the setting for including the SVars inside the DevHelper file
+        $IncludeSecrets = $false,
         [Parameter(Mandatory=$false)]
         [ValidateNotNullOrEmpty()]
         [string]
@@ -2150,32 +2207,45 @@ The MasterPassword is not specified because, probably, it is registered locally 
     # prepare the json 
     $CompKey = $([guid]::NewGuid().ToString()).Substring(0,32)
     $Orchvars._CompKey = $CompKey
-    $OrchVarsJson = Decompose-SPOTHashTableVariable -InputVariable $Orchvars -Key $Orchvars._CompKey | ConvertTo-Json -Depth 4 
 
     # initialize the file
-    "##########################################" | Out-File -FilePath $FilePath -Encoding ascii
-    "## DEVHELPER FILE FOR PROJECT: $ProjectPath." | Out-File -FilePath $FilePath -Encoding ascii -Append
-    "" | Out-File -FilePath $FilePath -Encoding ascii -Append
-    "##########################################" | Out-File -FilePath $FilePath -Encoding ascii -Append
-    "## FUNCTIONS" | Out-File -FilePath $FilePath -Encoding ascii -Append
-    "" | Out-File -FilePath $FilePath -Encoding ascii -Append
+    "##########################################" | Out-File -FilePath $FilePath -Encoding utf8
+    "## DEVHELPER FILE FOR PROJECT: $ProjectPath." | Out-File -FilePath $FilePath -Encoding utf8 -Append
+    "" | Out-File -FilePath $FilePath -Encoding utf8 -Append
+    "##########################################" | Out-File -FilePath $FilePath -Encoding utf8 -Append
+    "## FUNCTIONS" | Out-File -FilePath $FilePath -Encoding utf8 -Append
+    "" | Out-File -FilePath $FilePath -Encoding utf8 -Append
     # add the DevHelper Functions to file
     foreach ($f in $DevHelperFunctions) {
-        "function global:$($f.Name) {" | Out-File -FilePath $FilePath -Encoding ascii -Append
-        $f.Definition | Out-File -FilePath $FilePath -Encoding ascii -Append
-        "} # enf of function $($f.Name)" | Out-File -FilePath $FilePath -Encoding ascii -Append
-        "##########################################" | Out-File -FilePath $FilePath -Encoding ascii -Append
+        "function global:$($f.Name) {" | Out-File -FilePath $FilePath -Encoding utf8 -Append
+        $f.Definition | Out-File -FilePath $FilePath -Encoding utf8 -Append
+        "} # enf of function $($f.Name)" | Out-File -FilePath $FilePath -Encoding utf8 -Append
+        "##########################################" | Out-File -FilePath $FilePath -Encoding utf8 -Append
     }
 
     # add the OrchVars to file
-    "" | Out-File -FilePath $FilePath -Encoding ascii -Append
-    "" | Out-File -FilePath $FilePath -Encoding ascii -Append
-    "## ORCHVARS" | Out-File -FilePath $FilePath -Encoding ascii -Append
-    "##########################################" | Out-File -FilePath $FilePath -Encoding ascii -Append
-    "## Orchvars definition" | Out-File -FilePath $FilePath -Encoding ascii -Append
-    '$hashtable = ' + "`'$OrchVarsJson`'" + ' | ConvertFrom-Json | ConvertTo-SPOTHashtable ' | Out-File -FilePath $FilePath -Encoding ascii -Append
-    "##########################################" | Out-File -FilePath $FilePath -Encoding ascii -Append
-    "`$global:Orchvars = Recompose-SPOTHashTableVariable -InputVariable `$hashtable -Key `$hashtable._CompKey" | Out-File -FilePath $FilePath -Encoding ascii -Append
+    $OrchVarsJson = Decompose-SPOTHashTableVariable -InputVariable $Orchvars -Key $Orchvars._CompKey | ConvertTo-Json -Depth 4 
+    "" | Out-File -FilePath $FilePath -Encoding utf8 -Append
+    "" | Out-File -FilePath $FilePath -Encoding utf8 -Append
+    "## ORCHVARS" | Out-File -FilePath $FilePath -Encoding utf8 -Append
+    "##########################################" | Out-File -FilePath $FilePath -Encoding utf8 -Append
+    "## Orchvars definition" | Out-File -FilePath $FilePath -Encoding utf8 -Append
+    '$hashtable = ' + "`'$OrchVarsJson`'" + ' | ConvertFrom-Json | ConvertTo-SPOTHashtable ' | Out-File -FilePath $FilePath -Encoding utf8 -Append
+    "##########################################" | Out-File -FilePath $FilePath -Encoding utf8 -Append
+    "`$global:Orchvars = Recompose-SPOTHashTableVariable -InputVariable `$hashtable -Key `$hashtable._CompKey" | Out-File -FilePath $FilePath -Encoding utf8 -Append
+
+    if ($IncludeSecrets) {
+        # add the SVars to file
+        $SVarsJson = Decompose-SPOTHashTableVariable -InputVariable $SVars -Key $Orchvars._CompKey | ConvertTo-Json -Depth 4 
+        "" | Out-File -FilePath $FilePath -Encoding utf8 -Append
+        "" | Out-File -FilePath $FilePath -Encoding utf8 -Append
+        "## SVARS" | Out-File -FilePath $FilePath -Encoding utf8 -Append
+        "##########################################" | Out-File -FilePath $FilePath -Encoding utf8 -Append
+        "## SVars definition" | Out-File -FilePath $FilePath -Encoding utf8 -Append
+        '$hashtableS = ' + "`'$SVarsJson`'" + ' | ConvertFrom-Json | ConvertTo-SPOTHashtable ' | Out-File -FilePath $FilePath -Encoding utf8 -Append
+        "##########################################" | Out-File -FilePath $FilePath -Encoding utf8 -Append
+        "`$global:SVars = Recompose-SPOTHashTableVariable -InputVariable `$hashtableS -Key `$hashtable._CompKey" | Out-File -FilePath $FilePath -Encoding utf8 -Append
+    }
 
     ####################################################################
     Write-SPOTLog "===== Finished function Export-SPOTDevHelperFile. ====="
@@ -3345,6 +3415,9 @@ function Show-SPOTRunbookStepDetails ( $GUID ) {
             $StepDetailsData += [PSCustomObject]@{ Name = "RemoteComputer" ; Value = $RunbookStep.StepParameters.RemoteComputer -join ','; Type = "Step Parameters" }
             $StepDetailsData += [PSCustomObject]@{ Name = "Credential" ;     Value = $RunbookStep.StepParameters.Credential.UserName ;     Type = "Step Parameters" }
         }
+        if ($RunbookStep.StepParameters.ExecPath) {
+            $StepDetailsData += [PSCustomObject]@{ Name = "ExecPath" ; Value = $RunbookStep.StepParameters.ExecPath; Type = "Step Parameters" }
+        }
         if ($RunbookStep.StepParameters.UseSSL) {
             $StepDetailsData += [PSCustomObject]@{ Name = "UseSSL" ; Value = $RunbookStep.StepParameters.UseSSL; Type = "Step Parameters" }
         }
@@ -3753,6 +3826,9 @@ $window.Control_LoadProject.Add_Click({
 
             # load all project FunctionFiles
             foreach ($FunctionsFile in (Get-ChildItem -Path "$($OrchVars._ProjectPath)\_HelperFunctions")) {
+                if (!(Test-SPOTIsUtf8 -FilePath $FunctionsFile.FullName)) {
+                    Write-SPOTLog "WARNING: The current HelperFunctions file ""$($FunctionsFile.FullName)"" is not UTF-8 encoded." -Output $false
+                }
                 . $FunctionsFile.FullName
             }
 
@@ -3804,7 +3880,7 @@ $window.Control_LoadProject.Add_Click({
             # load the project details in the GUI
             $ProjectDetailsData = @()
             $ProjectDetailsData += @( 
-            [PSCustomObject]@{ Name = "Project Path";    Value = $OrchVars._ProjectPath;     Type = "Project Details"},
+            [PSCustomObject]@{ Name = "ProjectPath";     Value = $OrchVars._ProjectPath;     Type = "Project Details"},
             [PSCustomObject]@{ Name = "SPOTPath";        Value = $OrchVars._SPOTPath;        Type = "Project Details"},
             [PSCustomObject]@{ Name = "AnyFailFail";     Value = $OrchVars._AnyFailFail;     Type = "Project Details"},
             [PSCustomObject]@{ Name = "RetryCount";      Value = $OrchVars._RetryCount;      Type = "Project Details"},
@@ -3941,6 +4017,9 @@ $window.Control_LoadRunbook.Add_Click({
     $global:AllRunbookSteps = [hashtable]::Synchronized(@{})
     $global:PublishedData = [hashtable]::Synchronized(@{})
 
+    # deactivate the stop flag in the OrchVars
+    $OrchVars._StopFlag = $false
+
     # prepare for offload
     $RunspaceScriptBlockParameters = @{
         SelectedRunbookName = $SelectedRunbookName
@@ -4004,7 +4083,7 @@ $window.Control_StartStop.Add_Click({
     $Action = $window.Control_StartStop.Content
     if ($Action -eq "Start") {
         # remove previous logs to start logging from scratch
-        Remove-Item -Path "$($OrchVars._ProjectPath)\__SPOT_Artefacts\*" -Recurse -ErrorAction SilentlyContinue
+        #Remove-Item -Path "$($OrchVars._ProjectPath)\__SPOT_Artefacts\*" -Recurse -ErrorAction SilentlyContinue
         # initialize related controls
         $window.Control_ProgressBar.Value = 0
         $window.Control_StartStop.IsEnabled = $true
@@ -4286,7 +4365,7 @@ $window.Control_StepButton.Add_Click({
         ## FRESH RUNBOOK, STARTING RUNBOOK EXECUTION FROM SCRATCH
         ###############
         # remove previous logs to start logging from scratch
-        Remove-Item -Path "$($OrchVars._ProjectPath)\__SPOT_Artefacts\*" -Recurse -ErrorAction SilentlyContinue
+        #Remove-Item -Path "$($OrchVars._ProjectPath)\__SPOT_Artefacts\*" -Recurse -ErrorAction SilentlyContinue
         # initialize related controls
         $window.Control_ProgressBar.Value = 0
         $window.Control_StartStop.IsEnabled = $false

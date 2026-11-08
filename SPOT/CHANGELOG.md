@@ -64,3 +64,15 @@
 ### Fixed
 - fixed issue when certain Published Variable objects do not display either value or object type in the GUI
 - fixed TrustedHostsFilePath handling in Reboot-LinuxComputer step function
+
+## [1.1.4] - 08.11.2026
+
+### Added
+- added IncludeSecrets parameter to the Export-SPOTDevHelperFile function and changed the output file encoding to UTF-8
+- added internal function Test-SPOTIsUtf8 for checking the file encoding of all project scripts and helperfiles
+
+### Changed
+- changed behavior of the Start-SPOTGUI not to delete previous log files anymore since this is not an unattended execution
+- changed the error handling for all Runbook Type functions to fix the different behavior from some error types
+- removed the SysV parameter from the Reboot-LinuxComputer function and implemented a more robust detection
+- improved the Reboot-WindowsComputer function

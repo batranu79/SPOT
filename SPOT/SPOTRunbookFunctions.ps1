@@ -15,6 +15,8 @@
 # v1.4 - 27.09.2026 - improved JIT variable replacement function to validate Credential parameters for type
 #                   - adapted the Start-SPOTRunbookJob and Execute-SPOTRunbook functions to step execution
 #                   - added a safe keepalive setting in New-SPOTSFTPSession and New-SPOTSSHSession functions
+# v1.5 - 01.11.2026 - changed the error handling for all Runbook Type functions to fix the different behavior from some error types
+#                   - added step parameters to the calling line only when they are not null/empty in all Runbook Type functions
 # 
 #
 #
@@ -279,7 +281,7 @@ if ($CommandParameters) {
     catch {
         Write-SPOTLog ">>> T.ERROR while processing Referenced Files/Folders on the ""$RemoteComputer"" remote computer: $_."
         # cleanup in case of error
-        Remove-PSSession -Session $session -Confirm:$false -ErrorAction SilentlyContinue
+        Get-PSSession | Where {$_.Id -eq $session.Id} | Remove-PSSession -Confirm:$false -ErrorAction SilentlyContinue
         if ($CleanupSPOTConfig) {
             if ($UseSSL) {
                 Invoke-Command -ComputerName $RemoteComputer -Credential $Credential -ScriptBlock {
@@ -355,7 +357,7 @@ try {
 catch {
     Write-SPOTLog ">>> T.ERROR while preparing the PSSession to the ""$RemoteComputer"" remote computer: $_."
     # cleanup in case of error
-    Remove-PSSession -Session $session -Confirm:$false -ErrorAction SilentlyContinue
+    Get-PSSession | Where {$_.Id -eq $session.Id} | Remove-PSSession -Confirm:$false -ErrorAction SilentlyContinue
     if ($CleanupSPOTConfig) {
         if ($UseSSL) {
             Invoke-Command -ComputerName $RemoteComputer -Credential $Credential -ScriptBlock {
@@ -376,7 +378,12 @@ $PCROutput = Invoke-Command -Session $session -ScriptBlock {
     $_spot_TWOE = $true
     $_spot_Output = @()
     try {
-        $_spot_Output += . $_spot_Cmd @_spot_CmdP *>&1 | Out-String -Stream -OutVariable _spot_SO
+        if ($_spot_CmdP) {
+            $_spot_Output += . $_spot_Cmd @_spot_CmdP *>&1 | Out-String -Stream -OutVariable _spot_SO
+        }
+        else {
+            $_spot_Output += . $_spot_Cmd *>&1 | Out-String -Stream -OutVariable _spot_SO
+        }
     }
     catch {
         $_spot_SO = @($_spot_SO)
@@ -385,9 +392,18 @@ $PCROutput = Invoke-Command -Session $session -ScriptBlock {
         if (($_.ScriptStackTrace -split "`n").Count -eq 1) {
             # error encountered inside the SPOT tool (this case should not appear since the try is for the step function only)
             $_spot_SO += " >>>>>> ERROR encountered inside the SPOT tool function ""PowershellCommandRemote""."
+            $_spot_SO += " >>>>>> ERROR InvocationInfo.Line:"
+            $_spot_SO += "$($_.InvocationInfo.Line)"
+            $_spot_SO += " >>>>>> ERROR InvocationInfo.PositionMessage:"
+            $_spot_SO += "$($_.InvocationInfo.PositionMessage)"
         }
         elseif (($_.ScriptStackTrace -split "`n").Count -eq 2) {
             $_spot_SO += " >>>>>> ERROR encountered inside the step function ""$_spot_Cmd""."
+            # get the number of the line from the step function where the error occured
+            $_spot_ln = (($_.ScriptStackTrace -split "`n")[0] -split "line")[1].Trim()
+            # use the line number from above to show the actual step function line
+            $_spot_SO += " >>>>>> ERROR Line in the step function $($_spot_ln):"
+            $_spot_SO += "$(((Get-Command -Name $_spot_Cmd | Select-Object -ExpandProperty Definition | Out-String -Width 250) -split '\r?\n')[$_spot_ln-1])"
         }
         else {
             $_spot_SO += " >>>>>> ERROR encountered inside a script/function called in the step function ""$_spot_Cmd""."
@@ -396,18 +412,13 @@ $PCROutput = Invoke-Command -Session $session -ScriptBlock {
             # get the number of the line from the step function where the error occured
             $_spot_ln = (($_.ScriptStackTrace -split "`n")[($_.ScriptStackTrace -split "`n").Count-2] -split "line")[1].Trim()
             # use the line number from above to show the actual step function line
-            $_spot_SO += " >>>>>> ERROR Line in the step function:"
+            $_spot_SO += " >>>>>> ERROR Line in the step function $($_spot_ln):"
             $_spot_SO += "$(((Get-Command -Name $_spot_Cmd | Select-Object -ExpandProperty Definition | Out-String -Width 250) -split '\r?\n')[$_spot_ln-1])"
         }
         # common error details
         $_spot_SO += " >>>>>> ERROR Exception:"
         $_spot_SO += "$($_.Exception)"
-        $_spot_SO += " >>>>>> ERROR Exception Type:"
-        $_spot_SO += "$($_.Exception.GetType().FullName)"
-        $_spot_SO += " >>>>>> ERROR InvocationInfo.Line:"
-        $_spot_SO += "$($_.InvocationInfo.Line)"
-        $_spot_SO += " >>>>>> ERROR InvocationInfo.PositionMessage:"
-        $_spot_SO += "$($_.InvocationInfo.PositionMessage)"
+        $_spot_SO += "############# ORCHESTRATOR LOGGING: END OF ERROR DETAILS. #############"
         # in case of exception, the normal output is empty, so we use the stream output in its place
         $_spot_Output = $_spot_SO
         $_spot_TWOE = $false
@@ -634,7 +645,12 @@ $_spot_Output = @()
 Set-Item "Function:$_spot_CommandName" "$(Replace-SPOTExitInCode -code (Get-Command -Name $_spot_CommandName | Select-Object -ExpandProperty Definition))"
 try {
     # calling the function with dot source, to be able to get variables from inside the function
-    $_spot_Output += . $_spot_CommandName @_spot_CmdP *>&1 | Out-String -Stream -OutVariable _spot_SO    
+    if ($_spot_CmdP) {
+        $_spot_Output += . $_spot_CommandName @_spot_CmdP *>&1 | Out-String -Stream -OutVariable _spot_SO   
+    }
+    else {
+        $_spot_Output += . $_spot_CommandName *>&1 | Out-String -Stream -OutVariable _spot_SO   
+    }
 }
 catch {
     $_spot_SO = @($_spot_SO)
@@ -643,9 +659,18 @@ catch {
     if (($_.ScriptStackTrace -split "`n").Count -le 2) {
         # error encountered inside the SPOT tool (this case should not appear since the try is for the step function only)
         $_spot_SO += " >>>>>> ERROR encountered inside the SPOT tool function ""PowershellCommandLocal""."
+        $_spot_SO += " >>>>>> ERROR InvocationInfo.Line:"
+        $_spot_SO += "$($_.InvocationInfo.Line)"
+        $_spot_SO += " >>>>>> ERROR InvocationInfo.PositionMessage:"
+        $_spot_SO += "$($_.InvocationInfo.PositionMessage)"
     }
     elseif (($_.ScriptStackTrace -split "`n").Count -eq 3) {
         $_spot_SO += " >>>>>> ERROR encountered inside the step function ""$_spot_CommandName""."
+        # get the number of the line from the step function where the error occured
+        $_spot_ln = (($_.ScriptStackTrace -split "`n")[0] -split "line")[1].Trim()
+        # use the line number from above to show the actual step function line
+        $_spot_SO += " >>>>>> ERROR Line in the step function $($_spot_ln):"
+        $_spot_SO += "$(((Get-Command -Name $_spot_CommandName | Select-Object -ExpandProperty Definition | Out-String -Width 250) -split '\r?\n')[$_spot_ln-1])"
     }
     else {
         $_spot_SO += " >>>>>> ERROR encountered inside a script/function called in the step function ""$_spot_CommandName""."
@@ -654,18 +679,13 @@ catch {
         # get the number of the line from the step function where the error occured
         $_spot_ln = (($_.ScriptStackTrace -split "`n")[($_.ScriptStackTrace -split "`n").Count-3] -split "line")[1].Trim()
         # use the line number from above to show the actual step function line
-        $_spot_SO += " >>>>>> ERROR Line in the step function:"
+        $_spot_SO += " >>>>>> ERROR Line in the step function $($_spot_ln):"
         $_spot_SO += "$(((Get-Command -Name $_spot_CommandName | Select-Object -ExpandProperty Definition | Out-String -Width 250) -split '\r?\n')[$_spot_ln-1])"
     }
     # common error details
     $_spot_SO += " >>>>>> ERROR Exception:"
     $_spot_SO += "$($_.Exception)"
-    $_spot_SO += " >>>>>> ERROR Exception Type:"
-    $_spot_SO += "$($_.Exception.GetType().FullName)"
-    $_spot_SO += " >>>>>> ERROR InvocationInfo.Line:"
-    $_spot_SO += "$($_.InvocationInfo.Line)"
-    $_spot_SO += " >>>>>> ERROR InvocationInfo.PositionMessage:"
-    $_spot_SO += "$($_.InvocationInfo.PositionMessage)"
+    $_spot_SO += "############# ORCHESTRATOR LOGGING: END OF ERROR DETAILS. #############"
     # in case of exception, the normal output is empty, so we use the stream output in its place
     $_spot_Output = $_spot_SO
     $_spot_TWOE = $false
@@ -867,7 +887,12 @@ function PowershellCommandRemoteSJ {
         $_spot_Output = @()
         Set-Item "Function:$($args.Command)" "$(Replace-SPOTExitInCode -code (Get-Command -Name $args.Command | Select-Object -ExpandProperty Definition))"
         try {
-            $_spot_Output += . $args.Command @_spot_cmdP *>&1 | Out-String -Stream -OutVariable _spot_SO 
+            if ($_spot_cmdP) {
+                $_spot_Output += . $args.Command @_spot_cmdP *>&1 | Out-String -Stream -OutVariable _spot_SO 
+            }
+            else {
+                $_spot_Output += . $args.Command *>&1 | Out-String -Stream -OutVariable _spot_SO
+            }
         }
         catch {
             $_spot_SO = @($_spot_SO)
@@ -876,9 +901,18 @@ function PowershellCommandRemoteSJ {
             if (($_.ScriptStackTrace -split "`n").Count -le 2) {
                 # error encountered inside the SPOT tool (this case should not appear since the try is for the step function only)
                 $_spot_SO += " >>>>>> ERROR encountered inside the SPOT tool function ""PowershellCommandRemoteSJ""."
+                $_spot_SO += " >>>>>> ERROR InvocationInfo.Line:"
+                $_spot_SO += "$($_.InvocationInfo.Line)"
+                $_spot_SO += " >>>>>> ERROR InvocationInfo.PositionMessage:"
+                $_spot_SO += "$($_.InvocationInfo.PositionMessage)"
             }
             elseif (($_.ScriptStackTrace -split "`n").Count -eq 3) {
                 $_spot_SO += " >>>>>> ERROR encountered inside the step function ""$($args.Command)""."
+                # get the number of the line from the step function where the error occured
+                $_spot_ln = (($_.ScriptStackTrace -split "`n")[0] -split "line")[1].Trim()
+                # use the line number from above to show the actual step function line
+                $_spot_SO += " >>>>>> ERROR Line in the step function $($_spot_ln):"
+                $_spot_SO += "$(((Get-Command -Name $args.Command | Select-Object -ExpandProperty Definition | Out-String -Width 250) -split '\r?\n')[$_spot_ln-1])"
             }
             else {
                 $_spot_SO += " >>>>>> ERROR encountered inside a script/function called in the step function ""$($args.Command)""."
@@ -887,18 +921,13 @@ function PowershellCommandRemoteSJ {
                 # get the number of the line from the step function where the error occured
                 $_spot_ln = (($_.ScriptStackTrace -split "`n")[($_.ScriptStackTrace -split "`n").Count-3] -split "line")[1].Trim()
                 # use the line number from above to show the actual step function line
-                $_spot_SO += " >>>>>> ERROR Line in the step function:"
+                $_spot_SO += " >>>>>> ERROR Line in the step function $($_spot_ln):"
                 $_spot_SO += "$(((Get-Command -Name $args.Command | Select-Object -ExpandProperty Definition | Out-String -Width 250) -split '\r?\n')[$_spot_ln-1])"
             }
             # common error details
             $_spot_SO += " >>>>>> ERROR Exception:"
             $_spot_SO += "$($_.Exception)"
-            $_spot_SO += " >>>>>> ERROR Exception Type:"
-            $_spot_SO += "$($_.Exception.GetType().FullName)"
-            $_spot_SO += " >>>>>> ERROR InvocationInfo.Line:"
-            $_spot_SO += "$($_.InvocationInfo.Line)"
-            $_spot_SO += " >>>>>> ERROR InvocationInfo.PositionMessage:"
-            $_spot_SO += "$($_.InvocationInfo.PositionMessage)"
+            $_spot_SO += "############# ORCHESTRATOR LOGGING: END OF ERROR DETAILS. #############"
             # in case of exception, the normal output is empty, so we use the stream output in its place
             $_spot_Output = $_spot_SO
             $_spot_TWOE = $false
@@ -1053,7 +1082,7 @@ try {
 catch {
     Write-SPOTLog ">>> T.ERROR while loading PSSession functions to the ""$RemoteComputer"" remote computer: $_."
     # cleanup
-    Remove-PSSession -Session $session -Confirm:$false
+    Get-PSSession | Where {$_.Id -eq $session.Id} | Remove-PSSession -Confirm:$false -ErrorAction SilentlyContinue
     return $false
 }
 
@@ -1072,7 +1101,7 @@ if ($STParameters.ArgumentList.CommandParameters) {
     catch {
         Write-SPOTLog ">>> T.ERROR while processing Referenced Files/Folders on the ""$RemoteComputer"" remote computer: $_."
         # cleanup
-        Remove-PSSession -Session $session -Confirm:$false
+        Get-PSSession | Where {$_.Id -eq $session.Id} | Remove-PSSession -Confirm:$false -ErrorAction SilentlyContinue
         return $false
     }
     $RemoteTempFiles   = $CmdParametersRF.RemoteTempFiles
@@ -1358,33 +1387,40 @@ function PowershellCommandRemoteWMI {
             $_spot_Output = @()
             Set-Item "Function:$($_spot_AH.Command)" "$(Replace-SPOTExitInCode -code (Get-Command -Name $_spot_AH.Command | Select-Object -ExpandProperty Definition))"
             try {
-                $_spot_Output += . $_spot_AH.Command @_spot_cmdP *>&1 | Out-String -Stream -OutVariable _spot_SO
+                if ($_spot_cmdP) {
+                    $_spot_Output += . $_spot_AH.Command @_spot_cmdP *>&1 | Out-String -Stream -OutVariable _spot_SO
+                }
+                else {
+                    $_spot_Output += . $_spot_AH.Command *>&1 | Out-String -Stream -OutVariable _spot_SO
+                }
             }
             catch {
                 $_spot_SO = @($_spot_SO)
                 $_spot_SO += "############# ORCHESTRATOR LOGGING: TERMINATING ERROR while trying to execute the step function ""$($_spot_AH.Command)"" over WMI. #############"
                 if (($_.ScriptStackTrace -split "`n").Count -eq 1) {
                     $_spot_SO += " >>>>>> ERROR encountered inside the SPOT tool function ""PowershellCommandRemoteWMI""."
+                    $_spot_SO += " >>>>>> ERROR InvocationInfo.Line:"
+                    $_spot_SO += "$($_.InvocationInfo.Line)"
+                    $_spot_SO += " >>>>>> ERROR InvocationInfo.PositionMessage:"
+                    $_spot_SO += "$($_.InvocationInfo.PositionMessage)"
                 }
                 elseif (($_.ScriptStackTrace -split "`n").Count -eq 2) {
                     $_spot_SO += " >>>>>> ERROR encountered inside the step function ""$($_spot_AH.Command)""."
+                    $_spot_ln = (($_.ScriptStackTrace -split "`n")[0] -split "line")[1].Trim()
+                    $_spot_SO += " >>>>>> ERROR Line in the step function $($_spot_ln):"
+                    $_spot_SO += "$(((Get-Command -Name $_spot_AH.Command | Select-Object -ExpandProperty Definition | Out-String -Width 250) -split '\r?\n')[$_spot_ln-1])"
                 }
                 else {
                     $_spot_SO += " >>>>>> ERROR encountered inside a script/function called in the step function ""$($_spot_AH.Command)""."
                     $_spot_SO += " >>>>>> ERROR ScriptStackTrace from the step function inward:"
                     $_spot_SO += ($_.ScriptStackTrace -split "`n")[0..(($_.ScriptStackTrace -split "`n").Count-2)]
                     $_spot_ln = (($_.ScriptStackTrace -split "`n")[($_.ScriptStackTrace -split "`n").Count-2] -split "line")[1].Trim()
-                    $_spot_SO += " >>>>>> ERROR Line in the step function:"
+                    $_spot_SO += " >>>>>> ERROR Line in the step function $($_spot_ln):"
                     $_spot_SO += "$(((Get-Command -Name $_spot_AH.Command | Select-Object -ExpandProperty Definition | Out-String -Width 250) -split '\r?\n')[$_spot_ln-1])"
                 }
                 $_spot_SO += " >>>>>> ERROR Exception:"
                 $_spot_SO += "$($_.Exception)"
-                $_spot_SO += " >>>>>> ERROR Exception Type:"
-                $_spot_SO += "$($_.Exception.GetType().FullName)"
-                $_spot_SO += " >>>>>> ERROR InvocationInfo.Line:"
-                $_spot_SO += "$($_.InvocationInfo.Line)"
-                $_spot_SO += " >>>>>> ERROR InvocationInfo.PositionMessage:"
-                $_spot_SO += "$($_.InvocationInfo.PositionMessage)"
+                $_spot_SO += "############# ORCHESTRATOR LOGGING: END OF ERROR DETAILS. #############"
                 $_spot_Output = $_spot_SO
                 $_spot_TWOE = $false
             }
@@ -1825,33 +1861,40 @@ function PowershellCommandRemotePsExec {
             $_spot_Output = @()
             Set-Item "Function:$($_spot_AH.Command)" "$(Replace-SPOTExitInCode -code (Get-Command -Name $_spot_AH.Command | Select-Object -ExpandProperty Definition))"
             try {
-                $_spot_Output += . $_spot_AH.Command @_spot_CmdP *>&1 | Out-String -Stream -OutVariable _spot_SO
+                if ($_spot_CmdP) {
+                    $_spot_Output += . $_spot_AH.Command @_spot_CmdP *>&1 | Out-String -Stream -OutVariable _spot_SO
+                }
+                else {
+                    $_spot_Output += . $_spot_AH.Command *>&1 | Out-String -Stream -OutVariable _spot_SO
+                }
             }
             catch {
                 $_spot_SO = @($_spot_SO)
                 $_spot_SO += "############# ORCHESTRATOR LOGGING: TERMINATING ERROR while trying to execute the step function ""$($_spot_AH.Command)"" over PsExec. #############"
                 if (($_.ScriptStackTrace -split "`n").Count -le 1) {
                     $_spot_SO += " >>>>>> ERROR encountered inside the SPOT tool function ""PowershellCommandRemotePsExec""."
+                    $_spot_SO += " >>>>>> ERROR InvocationInfo.Line:"
+                    $_spot_SO += "$($_.InvocationInfo.Line)"
+                    $_spot_SO += " >>>>>> ERROR InvocationInfo.PositionMessage:"
+                    $_spot_SO += "$($_.InvocationInfo.PositionMessage)"
                 }
                 elseif (($_.ScriptStackTrace -split "`n").Count -eq 2) {
                     $_spot_SO += " >>>>>> ERROR encountered inside the step function ""$($_spot_AH.Command)""."
+                    $_spot_ln = (($_.ScriptStackTrace -split "`n")[0] -split "line")[1].Trim()
+                    $_spot_SO += " >>>>>> ERROR Line in the step function $($_spot_ln):"
+                    $_spot_SO += "$(((Get-Command -Name $_spot_AH.Command | Select-Object -ExpandProperty Definition | Out-String -Width 250) -split '\r?\n')[$_spot_ln-1])"
                 }
                 else {
                     $_spot_SO += " >>>>>> ERROR encountered inside a script/function called in the step function ""$($_spot_AH.Command)""."
                     $_spot_SO += " >>>>>> ERROR ScriptStackTrace from the step function inward:"
                     $_spot_SO += ($_.ScriptStackTrace -split "`n")[0..(($_.ScriptStackTrace -split "`n").Count-2)]
                     $_spot_ln = (($_.ScriptStackTrace -split "`n")[($_.ScriptStackTrace -split "`n").Count-2] -split "line")[1].Trim()
-                    $_spot_SO += " >>>>>> ERROR Line in the step function:"
+                    $_spot_SO += " >>>>>> ERROR Line in the step function $($_spot_ln):"
                     $_spot_SO += "$(((Get-Command -Name $_spot_AH.Command | Select-Object -ExpandProperty Definition | Out-String -Width 250) -split '\r?\n')[$_spot_ln-1])"
                 }
                 $_spot_SO += " >>>>>> ERROR Exception:"
                 $_spot_SO += "$($_.Exception)"
-                $_spot_SO += " >>>>>> ERROR Exception Type:"
-                $_spot_SO += "$($_.Exception.GetType().FullName)"
-                $_spot_SO += " >>>>>> ERROR InvocationInfo.Line:"
-                $_spot_SO += "$($_.InvocationInfo.Line)"
-                $_spot_SO += " >>>>>> ERROR InvocationInfo.PositionMessage:"
-                $_spot_SO += "$($_.InvocationInfo.PositionMessage)"
+                $_spot_SO += "############# ORCHESTRATOR LOGGING: END OF ERROR DETAILS. #############"
                 $_spot_Output = $_spot_SO
                 $_spot_TWOE = $false
             }
@@ -2306,33 +2349,40 @@ function PowershellCommandRemoteOWMI {
             $_spot_Output = @()
             Set-Item "Function:$($_spot_AH.Command)" "$(Replace-SPOTExitInCode -code (Get-Command -Name $_spot_AH.Command | Select-Object -ExpandProperty Definition))"
             try {
-                $_spot_Output += . $_spot_AH.Command @_spot_cmdP *>&1 | Out-String -Stream -OutVariable _spot_SO
+                if ($_spot_cmdP) {
+                    $_spot_Output += . $_spot_AH.Command @_spot_cmdP *>&1 | Out-String -Stream -OutVariable _spot_SO
+                }
+                else {
+                    $_spot_Output += . $_spot_AH.Command *>&1 | Out-String -Stream -OutVariable _spot_SO
+                }
             }
             catch {
                 $_spot_SO = @($_spot_SO)
                 $_spot_SO += "############# ORCHESTRATOR LOGGING: TERMINATING ERROR while trying to execute the step function ""$($_spot_AH.Command)"" over OWMI. #############"
                 if (($_.ScriptStackTrace -split "`n").Count -eq 1) {
                     $_spot_SO += " >>>>>> ERROR encountered inside the SPOT tool function ""PowershellCommandRemoteOWMI""."
+                    $_spot_SO += " >>>>>> ERROR InvocationInfo.Line:"
+                    $_spot_SO += "$($_.InvocationInfo.Line)"
+                    $_spot_SO += " >>>>>> ERROR InvocationInfo.PositionMessage:"
+                    $_spot_SO += "$($_.InvocationInfo.PositionMessage)"
                 }
                 elseif (($_.ScriptStackTrace -split "`n").Count -eq 2) {
                     $_spot_SO += " >>>>>> ERROR encountered inside the step function ""$($_spot_AH.Command)""."
+                    $_spot_ln = (($_.ScriptStackTrace -split "`n")[0] -split "line")[1].Trim()
+                    $_spot_SO += " >>>>>> ERROR Line in the step function $($_spot_ln):"
+                    $_spot_SO += "$(((Get-Command -Name $_spot_AH.Command | Select-Object -ExpandProperty Definition | Out-String -Width 250) -split '\r?\n')[$_spot_ln-1])"
                 }
                 else {
                     $_spot_SO += " >>>>>> ERROR encountered inside a script/function called in the step function ""$($_spot_AH.Command)""."
                     $_spot_SO += " >>>>>> ERROR ScriptStackTrace from the step function inward:"
                     $_spot_SO += ($_.ScriptStackTrace -split "`n")[0..(($_.ScriptStackTrace -split "`n").Count-2)]
                     $_spot_ln = (($_.ScriptStackTrace -split "`n")[($_.ScriptStackTrace -split "`n").Count-2] -split "line")[1].Trim()
-                    $_spot_SO += " >>>>>> ERROR Line in the step function:"
-                    $_spot_SO += "$((((Get-Command -Name $_spot_AH.Command).Definition | Out-String -Width 250) -split '\r?\n')[$_spot_ln-1])"
+                    $_spot_SO += " >>>>>> ERROR Line in the step function $($_spot_ln):"
+                    $_spot_SO += "$(((Get-Command -Name $_spot_AH.Command | Select-Object -ExpandProperty Definition | Out-String -Width 250) -split '\r?\n')[$_spot_ln-1])"
                 }
                 $_spot_SO += " >>>>>> ERROR Exception:"
                 $_spot_SO += "$($_.Exception)"
-                $_spot_SO += " >>>>>> ERROR Exception Type:"
-                $_spot_SO += "$($_.Exception.GetType().FullName)"
-                $_spot_SO += " >>>>>> ERROR InvocationInfo.Line:"
-                $_spot_SO += "$($_.InvocationInfo.Line)"
-                $_spot_SO += " >>>>>> ERROR InvocationInfo.PositionMessage:"
-                $_spot_SO += "$($_.InvocationInfo.PositionMessage)"
+                $_spot_SO += "############# ORCHESTRATOR LOGGING: END OF ERROR DETAILS. #############"
                 $_spot_Output = $_spot_SO
                 $_spot_TWOE = $false
             }
